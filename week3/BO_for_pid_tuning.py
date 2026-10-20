@@ -6,8 +6,15 @@ from skopt import gp_minimize
 from skopt.space import Real
 from skopt.learning import GaussianProcessRegressor
 from skopt.learning.gaussian_process.kernels import RBF
-from gp_functions import fit_gp_model_1d, plot_gp_results_1d
+from gp_functions import fit_gp_model_1d, fit_gp_model_full, plot_gp_results_1d, plot_gp_slices, make_gp_regressor
 
+
+# Enable/disable the white-noise term in the GP kernel (used by both gp_minimize and the final fit)
+USE_WHITE_KERNEL = True
+
+# Search-space bounds for [kp (7), kd (7)]
+GAIN_LOWER = np.array([0.1] * 7 + [0.0] * 7)
+GAIN_UPPER = np.array([1000.0] * 7 + [100.0] * 7)
 
 # Configuration for the simulation
 conf_file_name = "pandaconfig.json"  # Configuration file for the robot
@@ -43,6 +50,7 @@ ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles())  # Ini
 # Global lists to store data
 kp0_values = []
 kd0_values = []
+gains_stacked = []  # each entry: [kp (7), kd (7)]
 tracking_errors = []
 
 def simulate_with_given_pid_values(sim_, kp, kd, episode_duration=10):
@@ -112,13 +120,14 @@ def simulate_with_given_pid_values(sim_, kp, kd, episode_duration=10):
 def objective(params):
     kp = np.array(params[:7])  # First 7 elements correspond to kp
     kd = np.array(params[7:])  # Last 7 elements correspond to kd
-    episode_duration = 10
+    episode_duration = 5
     
     # Call the simulation with given kp and kd values
     # TODO to remove for final version
     tracking_error = simulate_with_given_pid_values(sim, kp, kd, episode_duration)
 
     # Collect data for the first kp and kd TODO to remove for final version
+    gains_stacked.append(np.concatenate([kp, kd]))
     kp0_values.append(kp[0])
     kd0_values.append(kd[0])
     tracking_errors.append(tracking_error)
@@ -130,27 +139,20 @@ def main():
     # Define the search space for Kp and Kd
     # Define the search space as before
     space = [
-        Real(0.1, 1000, name=f'kp{i}') for i in range(7)
+        Real(GAIN_LOWER[i], GAIN_UPPER[i], name=f'kp{i}') for i in range(7)
     ] + [
-        Real(0.0, 100, name=f'kd{i}') for i in range(7)
+        Real(GAIN_LOWER[7 + i], GAIN_UPPER[7 + i], name=f'kd{i}') for i in range(7)
     ]
 
-    rbf_kernel = RBF(
-    length_scale=1.0,            # Initial length scale
-    length_scale_bounds=(1e-2, 1e2)  # Bounds for length scale
-    )
-
-    gp = GaussianProcessRegressor(
-    kernel=rbf_kernel,
-    normalize_y=True,
-    n_restarts_optimizer=10  # Optional for better hyperparameter optimization
-    )
+    # Same kernel/noise settings as the GP used for the slice plots
+    gp = make_gp_regressor(len(space), USE_WHITE_KERNEL)
 
     # Perform Bayesian optimization
     result = gp_minimize(
     objective,
     space,
-    n_calls=10,
+    n_calls=50,
+    n_initial_points=25,
     base_estimator=gp,  # Use the custom Gaussian Process Regressor
     acq_func='EI',      # LCB': Lower Confidence Bound 'EI': Expected Improvement 'PI': Probability of Improvement
     random_state=42)
@@ -160,16 +162,21 @@ def main():
     best_kd = result.x[7:]  # Optimal kd vector
 
     # Prepare data
-    kp0_values_array = np.array(kp0_values).reshape(-1, 1)
-    kd0_values_array = np.array(kd0_values).reshape(-1, 1)
+    # kp0_values_array = np.array(kp0_values).reshape(-1, 1)
+    # kd0_values_array = np.array(kd0_values).reshape(-1, 1)
     tracking_errors_array = np.array(tracking_errors)
 
     # Fit GP models
-    gp_kp0 = fit_gp_model_1d(kp0_values_array, tracking_errors_array)
-    gp_kd0 = fit_gp_model_1d(kd0_values_array, tracking_errors_array)
+    gains_array = np.array(gains_stacked)  # shape (n_samples, 14)
+    gp_full = fit_gp_model_full(gains_array, tracking_errors_array, GAIN_LOWER, GAIN_UPPER, USE_WHITE_KERNEL)
+    print("Fitted full GP kernel:", gp_full.kernel_)
+    plot_gp_slices(gp_full, best_kp, best_kd, gains_array, tracking_errors_array, GAIN_LOWER, GAIN_UPPER)
 
-    # Plot the results
-    plot_gp_results_1d(kp0_values_array, kd0_values_array, tracking_errors_array, gp_kp0, gp_kd0)
+    # gp_kp0 = fit_gp_model_1d(kp0_values_array, tracking_errors_array)
+    # gp_kd0 = fit_gp_model_1d(kd0_values_array, tracking_errors_array)
+
+    # # Plot the results
+    # plot_gp_results_1d(kp0_values_array, kd0_values_array, tracking_errors_array, gp_kp0, gp_kd0)
 
 
     print(f"Optimal Kp: {best_kp}, Optimal Kd: {best_kd}")
