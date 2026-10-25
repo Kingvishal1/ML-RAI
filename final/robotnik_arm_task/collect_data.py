@@ -190,6 +190,54 @@ LABEL_COLS = (
 META_COLS = ["trajectory_id", "time"]
 
 
+def flush_chunk(all_trajectory_data, out_dir, chunk_idx):
+    """Assemble a batch of trajectories and write to a temporary .npz chunk.
+
+    Returns the path to the chunk file, or None if no data.
+    """
+    if not all_trajectory_data:
+        return None
+    inputs, labels, metadata = assemble_dataset(all_trajectory_data)
+    os.makedirs(out_dir, exist_ok=True)
+    chunk_path = os.path.join(out_dir, f"_chunk_{chunk_idx:04d}.npz")
+    np.savez(chunk_path, inputs=inputs, labels=labels, metadata=metadata)
+    print(f"  Flushed chunk {chunk_idx} → {chunk_path}  "
+          f"({len(all_trajectory_data)} trajs, {inputs.shape[0]} rows)")
+    return chunk_path
+
+
+def merge_chunks(chunk_paths, out_dir):
+    """Load all chunk files, concatenate, save final dataset, and clean up."""
+    all_inputs, all_labels, all_meta = [], [], []
+    for p in chunk_paths:
+        d = np.load(p)
+        all_inputs.append(d["inputs"])
+        all_labels.append(d["labels"])
+        all_meta.append(d["metadata"])
+    inputs = np.concatenate(all_inputs)
+    labels = np.concatenate(all_labels)
+    metadata = np.concatenate(all_meta)
+
+    # Re-number trajectory IDs so they are globally contiguous
+    _, inverse = np.unique(metadata[:, 0], return_inverse=True)
+    # Assign new sequential IDs preserving original order of first appearance
+    first_occurrence = {}
+    new_id = 0
+    new_ids = np.empty(len(inverse), dtype=np.float64)
+    for i, old_id in enumerate(metadata[:, 0]):
+        if old_id not in first_occurrence:
+            first_occurrence[old_id] = new_id
+            new_id += 1
+        new_ids[i] = first_occurrence[old_id]
+    metadata[:, 0] = new_ids
+
+    save_dataset(inputs, labels, metadata, out_dir)
+
+    # Remove temporary chunk files
+    for p in chunk_paths:
+        os.remove(p)
+
+
 def save_dataset(inputs, labels, metadata, out_dir):
     """Save dataset as .npz and .csv with timestamped filenames."""
     os.makedirs(out_dir, exist_ok=True)
@@ -224,6 +272,8 @@ def main():
                         help="Also randomise initial base pose per trajectory")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for random targets and init perturbation")
+    parser.add_argument("--flush_every", type=int, default=100,
+                        help="Flush trajectories to disk every N runs (default: 100)")
     parser.add_argument("--out_dir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
                         help="Output directory (default: final/robotnik_arm_task/data/)")
@@ -244,8 +294,10 @@ def main():
 
     rng = np.random.default_rng(args.seed) if args.vary_init else None
 
-    # Run trajectories
+    # Run trajectories, flushing to disk periodically
     all_data = []
+    chunk_paths = []
+    chunk_idx = 0
     for idx, target in enumerate(targets):
         print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
         data = run_single_trajectory(
@@ -260,14 +312,28 @@ def main():
         else:
             print(f"  [SKIP] No data collected for target {target}")
 
-    if not all_data:
+        # Flush to disk every flush_every successful trajectories
+        if len(all_data) >= args.flush_every:
+            path = flush_chunk(all_data, args.out_dir, chunk_idx)
+            if path:
+                chunk_paths.append(path)
+                chunk_idx += 1
+            all_data = []  # free memory
+
+    # Flush any remaining trajectories
+    if all_data:
+        path = flush_chunk(all_data, args.out_dir, chunk_idx)
+        if path:
+            chunk_paths.append(path)
+        all_data = []
+
+    if not chunk_paths:
         print("No trajectories collected. Exiting.")
         sys.exit(1)
 
-    # Assemble and save
-    print(f"\nAssembling dataset from {len(all_data)} trajectories...")
-    inputs, labels, metadata = assemble_dataset(all_data)
-    save_dataset(inputs, labels, metadata, args.out_dir)
+    # Merge all chunks into final dataset
+    print(f"\nMerging {len(chunk_paths)} chunks into final dataset...")
+    merge_chunks(chunk_paths, args.out_dir)
     print("Done.")
 
 
