@@ -30,13 +30,12 @@ def generate_grid_targets(n=100):
     """Produce targets on a fixed grid over the workspace.
 
     Workspace bounds: X: [-0.8, 0.8], Y: [0.5, 1.5], Z: [0.2, 1.0].
-    Grid dimensions chosen so that nx * ny * nz ~ n.
+    Grid dimensions scale automatically so that nx * ny * nz >= n.
     """
-    # 5 x 5 x 4 = 100 by default
-    nx, ny, nz = 5, 5, 4
-    xs = np.linspace(-0.8, 0.8, nx)
-    ys = np.linspace(0.5, 1.5, ny)
-    zs = np.linspace(0.2, 1.0, nz)
+    points_per_axis = int(np.ceil(n ** (1.0 / 3.0)))
+    xs = np.linspace(-0.8, 0.8, points_per_axis)
+    ys = np.linspace(0.5, 1.5, points_per_axis)
+    zs = np.linspace(0.2, 1.0, points_per_axis)
     targets = []
     for x in xs:
         for y in ys:
@@ -217,7 +216,7 @@ def save_dataset(inputs, labels, metadata, out_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Collect expert trajectories for behaviour cloning.")
-    parser.add_argument("--mode", choices=["grid", "random"], default="grid",
+    parser.add_argument("--mode", choices=["grid", "random"], default="random",
                         help="Target generation mode (default: grid)")
     parser.add_argument("--num_targets", type=int, default=100,
                         help="Number of targets to collect (default: 100)")
