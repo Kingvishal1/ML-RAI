@@ -38,7 +38,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train BC regressor")
     parser.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument("--batch_size", type=int, default=248)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=2)
