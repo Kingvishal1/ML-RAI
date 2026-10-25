@@ -82,6 +82,11 @@ def main():
     criterion = nn.MSELoss()
     print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
 
+    # --- Label slices: wheel_cmd_1..4 (0:4), torque_arm_1..7 (4:11) ---
+    WHEEL_SLICE = slice(0, 4)
+    TORQUE_SLICE = slice(4, 11)
+    arm_names = [f"arm_{i}" for i in range(1, 8)]
+
     # --- Training ---
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -98,14 +103,27 @@ def main():
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_ds)
 
-        # Val
+        # Val — collect per-component errors
         model.eval()
         val_loss = 0.0
+        val_se_wheel = 0.0       # sum of squared errors for wheel cmds
+        val_se_torque = np.zeros(7)  # per-arm torque
+        n_val = len(val_ds)
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                val_loss += criterion(model(xb), yb).item() * xb.size(0)
-        val_loss /= len(val_ds)
+                pred = model(xb)
+                bs = xb.size(0)
+                val_loss += criterion(pred, yb).item() * bs
+                err = (pred - yb).cpu().numpy()
+                val_se_wheel += (err[:, WHEEL_SLICE] ** 2).sum()
+                for j in range(7):
+                    val_se_torque[j] += (err[:, 4 + j] ** 2).sum()
+
+        val_loss /= n_val
+        val_mse_wheel = val_se_wheel / n_val
+        val_mse_torque = val_se_torque / n_val
+        val_mse_torque_avg = val_mse_torque.mean()
 
         tag = ""
         if val_loss < best_val:
@@ -121,7 +139,13 @@ def main():
             }, args.out)
             tag = "  *saved*"
 
-        print(f"Epoch {epoch:4d}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}{tag}")
+        # Summary line
+        print(f"Epoch {epoch:4d}/{args.epochs}  "
+              f"train={train_loss:.6f}  val={val_loss:.6f}  "
+              f"wheel={val_mse_wheel:.6f}  torque_avg={val_mse_torque_avg:.6f}{tag}")
+        # Per-arm breakdown
+        arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(7))
+        print(f"         torque: {arm_str}")
 
     print(f"\nBest val loss: {best_val:.6f}  Checkpoint: {args.out}")
 
