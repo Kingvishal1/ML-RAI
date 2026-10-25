@@ -143,6 +143,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     base_pos_all, q_mes_all, qd_mes_all = [], [], []
     q_d_all, qd_d_all = [], []
     torque_arm_all, wheel_cmds_all, base_bearing_all, target_ee_pos_all = [], [], [], []
+    base_lin_vel_all, base_ang_vel_all = [], []
 
     while True:
         # ---- Sense ----
@@ -151,6 +152,9 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
         q_mes = np.array(sim.GetMotorAngles(0))
         qd_mes = np.array(sim.GetMotorVelocities(0))
+
+        base_lin_vel = np.array(sim.GetBaseLinVelocity())
+        base_ang_vel = np.array(sim.GetBaseAngVelocity())
 
         q_all = np.concatenate((base_pos, base_ori, q_mes))
         q_pin = dyn_model.ReoderJoints2PinVec(q_all, "pos")
@@ -210,6 +214,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         wheel_cmds_all.append(wheel_cmds)
         base_bearing_all.append(base_bearing)
         target_ee_pos_all.append(target_ee_pos.copy())
+        base_lin_vel_all.append(base_lin_vel)
+        base_ang_vel_all.append(base_ang_vel)
 
         if not headless:
             time.sleep(0.001)
@@ -233,6 +239,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "wheel_cmds": np.array(wheel_cmds_all),
         "base_bearing": np.array(base_bearing_all),
         "target_ee_pos": np.array(target_ee_pos_all),
+        "base_lin_vel": np.array(base_lin_vel_all),
+        "base_ang_vel": np.array(base_ang_vel_all),
         "final_base_pos": base_pos,
         "final_ee_pos": ee_pos,
         "final_q_mes": q_mes,
