@@ -110,10 +110,11 @@ def assemble_dataset(all_trajectory_data):
     """Assemble per-timestep rows from all trajectories.
 
     Returns (inputs, labels, metadata) as numpy arrays.
-      inputs:   (N, 28) — base_pos_x, base_pos_y, base_bearing,
+      inputs:   (N, 37) — base_pos_x, base_pos_y, base_bearing,
+                           base_lin_vel_x/y/z, base_ang_vel_x/y/z,
                            q_base_1..4, qd_base_1..4,
                            q_arm_1..7, qd_arm_1..7,
-                           target_x, target_y, target_z
+                           ee_pos_x/y/z, target_x, target_y, target_z
       labels:   (N, 11) — wheel_cmd_1..4, torque_arm_1..7
       metadata: (N, 2)  — trajectory_id, time
     """
@@ -126,23 +127,29 @@ def assemble_dataset(all_trajectory_data):
         for i in range(n_steps):
             base_pos_xy = data["base_pos"][i, :2]            # 2
             base_bearing = data["base_bearing"][i]            # 1
+            base_lin_vel = data["base_lin_vel"][i]            # 3
+            base_ang_vel = data["base_ang_vel"][i]            # 3
             q_mes = np.array(data["q_mes"][i])
             qd_mes = np.array(data["qd_mes"][i])
             q_base = q_mes[0:4]                               # 4
             qd_base = qd_mes[0:4]                             # 4
             q_arm = q_mes[4:11]                               # 7
             qd_arm = qd_mes[4:11]                             # 7
+            ee_pos = data["ee_pos"][i]                         # 3
             target = data["target_ee_pos"][i]                  # 3
 
             inp = np.concatenate([
                 base_pos_xy,
                 [base_bearing],
+                base_lin_vel,
+                base_ang_vel,
                 q_base,
                 qd_base,
                 q_arm,
                 qd_arm,
+                ee_pos,
                 target,
-            ])  # 28 features
+            ])  # 37 features
 
             wheel_cmds = data["wheel_cmds"][i]                 # 4
             torque_arm = data["torque_arm"][i]                  # 7
@@ -166,10 +173,13 @@ def assemble_dataset(all_trajectory_data):
 
 INPUT_COLS = (
     ["base_pos_x", "base_pos_y", "base_bearing"]
+    + ["base_lin_vel_x", "base_lin_vel_y", "base_lin_vel_z"]
+    + ["base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z"]
     + [f"q_base_{i}" for i in range(1, 5)]
     + [f"qd_base_{i}" for i in range(1, 5)]
     + [f"q_arm_{i}" for i in range(1, 8)]
     + [f"qd_arm_{i}" for i in range(1, 8)]
+    + ["ee_pos_x", "ee_pos_y", "ee_pos_z"]
     + ["target_x", "target_y", "target_z"]
 )
 
