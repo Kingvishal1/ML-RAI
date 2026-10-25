@@ -113,15 +113,18 @@ def compute_base_goal(target_ee_pos):
 
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                         init_joint_angles, target_finger_angles,
-                        lower_limits, upper_limits):
+                        lower_limits, upper_limits, target_ee_pos=None):
     """Run the main control loop: base navigation then arm reaching.
 
     Returns a dict of logged data arrays.
     """
+    if target_ee_pos is None:
+        target_ee_pos = TARGET_EE_POS
+
     time_step = sim.GetTimeStep()
     current_time = 0.0
 
-    base_goal_pos, base_goal_bearing = compute_base_goal(TARGET_EE_POS)
+    base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
     base_state = BaseNavState()
     base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT)
 
@@ -139,6 +142,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     time_all, ee_pos_all, ee_error_all = [], [], []
     base_pos_all, q_mes_all, qd_mes_all = [], [], []
     q_d_all, qd_d_all = [], []
+    torque_arm_all, wheel_cmds_all, base_bearing_all, target_ee_pos_all = [], [], [], []
 
     while True:
         # ---- Sense ----
@@ -153,7 +157,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         pin.forwardKinematics(dyn_model.pin_model, dyn_model.pin_data, q_pin)
         pin.updateFramePlacements(dyn_model.pin_model, dyn_model.pin_data)
         ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
-        ee_error = TARGET_EE_POS - ee_pos
+        ee_error = target_ee_pos - ee_pos
         ee_dist_error = np.linalg.norm(ee_error)
 
         # ---- Base control ----
@@ -164,7 +168,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
         # ---- Arm control ----
         torque_arm, q_des_arm, qd_des_arm = arm_controller(
-            dyn_model, q_pin, q_mes[4:11], qd_mes[4:11], q_des_arm, q_init_arm, TARGET_EE_POS, ee_pos,
+            dyn_model, q_pin, q_mes[4:11], qd_mes[4:11], q_des_arm, q_init_arm, target_ee_pos, ee_pos,
             ee_frame_id, shoulder_frame_id, arm_lower, arm_upper, time_step, arm_params,
             reach_active=base_navigation_done,
         )
@@ -202,6 +206,10 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         qd_mes_all.append(qd_mes)
         q_d_all.append(np.concatenate((q_mes[:4], q_des_arm, target_finger_angles)))
         qd_d_all.append(np.concatenate((wheel_cmds, qd_des_arm, np.zeros(6))))
+        torque_arm_all.append(torque_arm)
+        wheel_cmds_all.append(wheel_cmds)
+        base_bearing_all.append(base_bearing)
+        target_ee_pos_all.append(target_ee_pos.copy())
 
         if not headless:
             time.sleep(0.001)
@@ -221,6 +229,10 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "qd_mes": qd_mes_all,
         "q_d": q_d_all,
         "qd_d": qd_d_all,
+        "torque_arm": np.array(torque_arm_all),
+        "wheel_cmds": np.array(wheel_cmds_all),
+        "base_bearing": np.array(base_bearing_all),
+        "target_ee_pos": np.array(target_ee_pos_all),
         "final_base_pos": base_pos,
         "final_ee_pos": ee_pos,
         "final_q_mes": q_mes,
@@ -313,6 +325,7 @@ def main():
         init_joint_angles, target_finger_angles,
         lower_limits, upper_limits,
     )
+
 
     # Report
     print_summary(data)

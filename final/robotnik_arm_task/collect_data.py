@@ -1,0 +1,266 @@
+"""Data collection script for behaviour cloning.
+
+Runs the expert controller across many targets, logs input/output pairs
+per timestep, and saves them to disk in .npz and .csv formats.
+"""
+import argparse
+import os
+import sys
+from datetime import datetime
+
+import numpy as np
+
+# Force headless mode for batch data collection
+os.environ["ROBOENV_HEADLESS"] = "1"
+
+from robotnik_arm_task import (
+    FIXED_FINGER_ANGLES,
+    setup_simulation,
+    setup_kinematics,
+    run_simulation_loop,
+)
+from robotnik_arm_control import configure_gripper_fingers
+
+
+# ==============================================================================
+# Target generation
+# ==============================================================================
+
+def generate_grid_targets(n=100):
+    """Produce targets on a fixed grid over the workspace.
+
+    Workspace bounds: X: [-0.8, 0.8], Y: [0.5, 1.5], Z: [0.2, 1.0].
+    Grid dimensions chosen so that nx * ny * nz ~ n.
+    """
+    # 5 x 5 x 4 = 100 by default
+    nx, ny, nz = 5, 5, 4
+    xs = np.linspace(-0.8, 0.8, nx)
+    ys = np.linspace(0.5, 1.5, ny)
+    zs = np.linspace(0.2, 1.0, nz)
+    targets = []
+    for x in xs:
+        for y in ys:
+            for z in zs:
+                targets.append(np.array([x, y, z]))
+    return targets[:n]
+
+
+def generate_random_targets(n=100, seed=42):
+    """Uniform random sampling from the workspace volume."""
+    rng = np.random.default_rng(seed)
+    xs = rng.uniform(-0.8, 0.8, n)
+    ys = rng.uniform(0.5, 1.5, n)
+    zs = rng.uniform(0.2, 1.0, n)
+    return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
+
+
+# ==============================================================================
+# Simulation runner
+# ==============================================================================
+
+def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
+                          shoulder_frame_id, init_joint_angles,
+                          lower_limits, upper_limits,
+                          target_ee_pos, vary_init=False, rng=None):
+    """Reset the sim and run one trajectory for a given target.
+
+    Returns the data dict from run_simulation_loop or None on failure.
+    """
+    # Reset to default pose
+    sim.ResetPose()
+
+    # Optionally perturb initial base position/orientation
+    if vary_init and rng is not None:
+        base_pos = list(sim.GetBasePosition())
+        base_ori = list(sim.GetBaseOrientation())
+        # Small perturbations: ±0.3m in x/y, ±0.1 rad in yaw
+        base_pos[0] += rng.uniform(-0.3, 0.3)
+        base_pos[1] += rng.uniform(-0.3, 0.3)
+        import pybullet as p
+        yaw_perturb = rng.uniform(-0.1, 0.1)
+        new_ori = p.getQuaternionFromEuler([0, 0, yaw_perturb])
+        client.resetBasePositionAndOrientation(
+            sim.bot[0].bot_pybullet, base_pos, new_ori,
+        )
+
+    # Re-configure gripper fingers
+    target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
+
+    # Re-read joint angles after reset
+    init_joint_angles_now = np.array(sim.GetMotorAngles(0))
+
+    try:
+        data = run_simulation_loop(
+            sim, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles_now, target_finger_angles,
+            lower_limits, upper_limits,
+            target_ee_pos=target_ee_pos,
+        )
+        return data
+    except Exception as e:
+        print(f"  [WARN] Trajectory failed for target {target_ee_pos}: {e}")
+        return None
+
+
+# ==============================================================================
+# Data assembly
+# ==============================================================================
+
+def assemble_dataset(all_trajectory_data):
+    """Assemble per-timestep rows from all trajectories.
+
+    Returns (inputs, labels, metadata) as numpy arrays.
+      inputs:   (N, 28) — base_pos_x, base_pos_y, base_bearing,
+                           q_base_1..4, qd_base_1..4,
+                           q_arm_1..7, qd_arm_1..7,
+                           target_x, target_y, target_z
+      labels:   (N, 11) — wheel_cmd_1..4, torque_arm_1..7
+      metadata: (N, 2)  — trajectory_id, time
+    """
+    input_rows = []
+    label_rows = []
+    meta_rows = []
+
+    for traj_id, data in enumerate(all_trajectory_data):
+        n_steps = len(data["time"])
+        for i in range(n_steps):
+            base_pos_xy = data["base_pos"][i, :2]            # 2
+            base_bearing = data["base_bearing"][i]            # 1
+            q_mes = np.array(data["q_mes"][i])
+            qd_mes = np.array(data["qd_mes"][i])
+            q_base = q_mes[0:4]                               # 4
+            qd_base = qd_mes[0:4]                             # 4
+            q_arm = q_mes[4:11]                               # 7
+            qd_arm = qd_mes[4:11]                             # 7
+            target = data["target_ee_pos"][i]                  # 3
+
+            inp = np.concatenate([
+                base_pos_xy,
+                [base_bearing],
+                q_base,
+                qd_base,
+                q_arm,
+                qd_arm,
+                target,
+            ])  # 28 features
+
+            wheel_cmds = data["wheel_cmds"][i]                 # 4
+            torque_arm = data["torque_arm"][i]                  # 7
+            lbl = np.concatenate([wheel_cmds, torque_arm])     # 11 outputs
+
+            meta = np.array([traj_id, data["time"][i]])
+
+            input_rows.append(inp)
+            label_rows.append(lbl)
+            meta_rows.append(meta)
+
+    inputs = np.array(input_rows, dtype=np.float64)
+    labels = np.array(label_rows, dtype=np.float64)
+    metadata = np.array(meta_rows, dtype=np.float64)
+    return inputs, labels, metadata
+
+
+# ==============================================================================
+# Saving
+# ==============================================================================
+
+INPUT_COLS = (
+    ["base_pos_x", "base_pos_y", "base_bearing"]
+    + [f"q_base_{i}" for i in range(1, 5)]
+    + [f"qd_base_{i}" for i in range(1, 5)]
+    + [f"q_arm_{i}" for i in range(1, 8)]
+    + [f"qd_arm_{i}" for i in range(1, 8)]
+    + ["target_x", "target_y", "target_z"]
+)
+
+LABEL_COLS = (
+    [f"wheel_cmd_{i}" for i in range(1, 5)]
+    + [f"torque_arm_{i}" for i in range(1, 8)]
+)
+
+META_COLS = ["trajectory_id", "time"]
+
+
+def save_dataset(inputs, labels, metadata, out_dir):
+    """Save dataset as .npz and .csv with timestamped filenames."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # .npz
+    npz_path = os.path.join(out_dir, f"dataset_{timestamp}.npz")
+    np.savez(npz_path, inputs=inputs, labels=labels, metadata=metadata)
+    print(f"Saved {npz_path}  inputs={inputs.shape}  labels={labels.shape}  meta={metadata.shape}")
+
+    # .csv
+    csv_path = os.path.join(out_dir, f"dataset_{timestamp}.csv")
+    all_cols = META_COLS + INPUT_COLS + LABEL_COLS
+    all_data = np.hstack([metadata, inputs, labels])
+    header = ",".join(all_cols)
+    np.savetxt(csv_path, all_data, delimiter=",", header=header, comments="")
+    print(f"Saved {csv_path}  rows={all_data.shape[0]}  cols={all_data.shape[1]}")
+
+
+# ==============================================================================
+# CLI
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect expert trajectories for behaviour cloning.")
+    parser.add_argument("--mode", choices=["grid", "random"], default="grid",
+                        help="Target generation mode (default: grid)")
+    parser.add_argument("--num_targets", type=int, default=100,
+                        help="Number of targets to collect (default: 100)")
+    parser.add_argument("--vary_init", action="store_true",
+                        help="Also randomise initial base pose per trajectory")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for random targets and init perturbation")
+    parser.add_argument("--out_dir", type=str,
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+                        help="Output directory (default: final/robotnik_arm_task/data/)")
+    args = parser.parse_args()
+
+    # Generate targets
+    if args.mode == "grid":
+        targets = generate_grid_targets(n=args.num_targets)
+    else:
+        targets = generate_random_targets(n=args.num_targets, seed=args.seed)
+
+    print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init})")
+
+    # Setup simulation once
+    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
+        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+    rng = np.random.default_rng(args.seed) if args.vary_init else None
+
+    # Run trajectories
+    all_data = []
+    for idx, target in enumerate(targets):
+        print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
+        data = run_single_trajectory(
+            sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles, lower_limits, upper_limits,
+            target_ee_pos=target, vary_init=args.vary_init, rng=rng,
+        )
+        if data is not None and len(data["time"]) > 0:
+            all_data.append(data)
+            print(f"  Steps: {len(data['time'])}  Final EE error: "
+                  f"{np.linalg.norm(target - data['final_ee_pos']):.4f}m")
+        else:
+            print(f"  [SKIP] No data collected for target {target}")
+
+    if not all_data:
+        print("No trajectories collected. Exiting.")
+        sys.exit(1)
+
+    # Assemble and save
+    print(f"\nAssembling dataset from {len(all_data)} trajectories...")
+    inputs, labels, metadata = assemble_dataset(all_data)
+    save_dataset(inputs, labels, metadata, args.out_dir)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
