@@ -9,7 +9,12 @@ Supports two modes:
 
 import argparse
 import os
+import sys
 import time
+
+# Parse --headless early so the env var is set before module-level reads in robotnik_arm_task
+if "--headless" in sys.argv:
+    os.environ["ROBOENV_HEADLESS"] = "1"
 
 import numpy as np
 import pinocchio as pin
@@ -337,9 +342,6 @@ def main():
                              base_chunk_size=base_chunk_size, base_execute=base_execute,
                              arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
                              arm_chunk_size=arm_chunk_size, arm_execute=arm_execute)
-
-    if args.headless:
-        os.environ["ROBOENV_HEADLESS"] = "1"
 
     # --- Run with retries ---
     max_attempts = 1 + args.retries
