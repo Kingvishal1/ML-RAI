@@ -5,10 +5,10 @@ Phase detection uses the wheel command norm:
   - Base phase: norm(wheel_cmds) > 0.05  (wheels active)
   - Arm phase:  norm(wheel_cmds) < 0.05  (wheels stopped)
 
-Base dataset (13 inputs -> 4 outputs):
+Base dataset (13 inputs -> 2 outputs):
   Inputs:  base_pos_xy(2), bearing(1), lin_vel(3), ang_vel(3), target_xy(2),
            dist_to_target(1), heading_error(1)
-  Labels:  wheel_cmds(4)
+  Labels:  v_cmd(1), w_cmd(1)  — linear/angular velocity from wheel inverse kinematics
 
 Arm dataset (20 inputs -> 7 outputs):
   Inputs:  q_arm(7), qd_arm(7), ee_pos(3), target_ee_pos(3)
@@ -40,6 +40,9 @@ ARM_INPUT_INDICES = list(range(17, 24)) + list(range(24, 31)) + \
                     [31, 32, 33, 34, 35, 36]                        # 20 dims
 
 # Full 11-dim label layout:  wheel_cmds(0:4), torque_arm(4:11)
+# Wheel kinematic constants (from BaseControllerParams)
+WHEEL_RADIUS = 0.11
+WHEEL_BASE_WIDTH = 0.66
 WHEEL_THRESHOLD = 0.05
 
 
@@ -81,7 +84,7 @@ def main():
 
     out_dir = args.out_dir or os.path.dirname(args.data)
 
-    # Base dataset: 13 inputs -> 4 outputs (wheel cmds only)
+    # Base dataset: 13 inputs -> 2 outputs (v_cmd, w_cmd)
     # Raw features from full observation
     base_raw = inputs[base_mask][:, BASE_INPUT_INDICES]   # (N, 11)
     # Computed goal-relative features the expert controller relies on
@@ -94,7 +97,13 @@ def main():
     heading_error = np.arctan2(np.sin(heading_to_target - bearing),
                                np.cos(heading_to_target - bearing))[:, None]  # (N, 1) wrapped
     base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 13)
-    base_labels = labels[base_mask][:, :4]
+    # Convert wheel cmds [rw, lw, lw, rw] -> [v_cmd, w_cmd]
+    wheel_raw = labels[base_mask][:, :4]                  # (N, 4)
+    rw = wheel_raw[:, 0]     # front_right == back_right
+    lw = wheel_raw[:, 1]     # front_left  == back_left
+    v_cmd = (rw + lw) / 2.0 * WHEEL_RADIUS               # m/s
+    w_cmd = (rw - lw) / WHEEL_BASE_WIDTH * WHEEL_RADIUS   # rad/s
+    base_labels = np.column_stack([v_cmd, w_cmd])         # (N, 2)
     base_metadata = metadata[base_mask]
     base_path = os.path.join(out_dir, "dataset_base.npz")
     np.savez(base_path, inputs=base_inputs, labels=base_labels, metadata=base_metadata)
