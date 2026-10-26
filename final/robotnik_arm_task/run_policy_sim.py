@@ -23,6 +23,10 @@ from robotnik_arm_control import (
 )
 from run_policy import load_policy, predict
 
+# Wheel kinematic constants (from BaseControllerParams)
+WHEEL_RADIUS = 0.11
+WHEEL_BASE_WIDTH = 0.66
+
 
 def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
                       q_mes, qd_mes, ee_pos, target_ee_pos):
@@ -175,8 +179,14 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                               device=device, chunk_size=base_chunk_size)
                 action_chunk = raw if base_chunk_size > 1 else raw[np.newaxis, :]
                 chunk_idx = 0
-            wheel_cmds = np.clip(action_chunk[chunk_idx], -3.0, 3.0)
+            # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
+            vw = action_chunk[chunk_idx]  # (2,)
             chunk_idx += 1
+            v_cmd = np.clip(vw[0], -0.25, 0.25)
+            w_cmd = np.clip(vw[1], -1.0, 1.0)
+            lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+            rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+            wheel_cmds = np.array([rw, lw, lw, rw])
 
             torque_arm, q_des_arm, qd_des_arm = arm_controller(
                 dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
