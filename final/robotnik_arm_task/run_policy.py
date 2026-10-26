@@ -19,7 +19,12 @@ def build_mlp(input_dim, output_dim, hidden_dim, num_layers):
 
 
 def load_policy(checkpoint_path, device="cpu"):
-    """Load model + normalization stats from a checkpoint."""
+    """Load model + normalization stats from a checkpoint.
+
+    Returns:
+        model, mean, std, chunk_size
+        chunk_size defaults to 1 for older checkpoints without it.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model = build_mlp(ckpt["input_dim"], ckpt["output_dim"],
                       ckpt["hidden_dim"], ckpt["num_layers"])
@@ -29,16 +34,20 @@ def load_policy(checkpoint_path, device="cpu"):
 
     mean = ckpt["input_mean"]
     std = ckpt["input_std"]
-    return model, mean, std
+    chunk_size = ckpt.get("chunk_size", 1)
+    return model, mean, std, chunk_size
 
 
-def predict(model, mean, std, obs, device="cpu"):
+def predict(model, mean, std, obs, device="cpu", chunk_size=1):
     """Run inference on a single observation or batch.
 
     Args:
         obs: numpy array of shape (37,) or (N, 37)
+        chunk_size: if > 1, reshape output to (K, 11) per sample
     Returns:
-        numpy array of shape (11,) or (N, 11) — [wheel_cmd_1..4, torque_arm_1..7]
+        chunk_size == 1: numpy array of shape (11,) or (N, 11)
+        chunk_size  > 1 (single obs): numpy array of shape (K, 11)
+        chunk_size  > 1 (batch):      numpy array of shape (N, K, 11)
     """
     single = obs.ndim == 1
     if single:
@@ -49,12 +58,15 @@ def predict(model, mean, std, obs, device="cpu"):
     with torch.no_grad():
         action = model(x).cpu().numpy()
 
+    if chunk_size > 1:
+        action = action.reshape(action.shape[0], chunk_size, -1)
+
     return action[0] if single else action
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run trained BC policy")
-    parser.add_argument("--checkpoint", type=str, default="bc_policy.pt", help="Path to .pt checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="bc_policy_100.pt", help="Path to .pt checkpoint")
     parser.add_argument("--data", type=str, help="Optional: .npz dataset to run policy on (uses val set)")
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU")
     args = parser.parse_args()
@@ -66,8 +78,8 @@ def main():
     else:
         device = torch.device("cpu")
 
-    model, mean, std = load_policy(args.checkpoint, device=str(device))
-    print(f"Loaded policy from {args.checkpoint}  device={device}")
+    model, mean, std, chunk_size = load_policy(args.checkpoint, device=str(device))
+    print(f"Loaded policy from {args.checkpoint}  device={device}  chunk_size={chunk_size}")
 
     if args.data:
         # Run on dataset and print sample predictions vs ground truth
@@ -116,7 +128,7 @@ def main():
         print(f"  torque_arm: {action[4:].round(4)}")
         print("\nUsage in code:")
         print("  from run_policy import load_policy, predict")
-        print("  model, mean, std = load_policy('bc_policy.pt')")
+        print("  model, mean, std = load_policy('bc_policy_100.pt')")
         print("  action = predict(model, mean, std, obs)  # obs shape (37,)")
 
 
