@@ -35,13 +35,18 @@ def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
 
 def main():
     parser = argparse.ArgumentParser(description="Run BC policy in simulation")
-    parser.add_argument("--checkpoint", type=str, default="bc_policy.pt",
+    parser.add_argument("--checkpoint", type=str, default="bc_policy_100.pt",
                         help="Path to trained .pt checkpoint")
     parser.add_argument("--target", type=float, nargs=3, default=[0.0, 1.1, 0.5],
                         metavar=("X", "Y", "Z"),
                         help="Target end-effector position (default: 0.0 1.1 0.5)")
     parser.add_argument("--max_steps", type=int, default=40000,
                         help="Maximum simulation steps")
+    parser.add_argument("--execute_steps", type=int, default=None,
+                        help="Execute this many steps from each chunk before re-predicting "
+                             "(MPC-style). Defaults to chunk_size (use full chunk).")
+    parser.add_argument("--headless", action="store_true",
+                        help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal (MPS) GPU for inference")
     args = parser.parse_args()
@@ -56,10 +61,17 @@ def main():
         device = "cuda"
     else:
         device = "cpu"
-    model, mean, std = load_policy(args.checkpoint, device=device)
-    print(f"Loaded policy from {args.checkpoint}  device={device}")
+    model, mean, std, chunk_size = load_policy(args.checkpoint, device=device)
+    execute_steps = args.execute_steps if args.execute_steps is not None else chunk_size
+    if execute_steps > chunk_size:
+        print(f"WARNING: execute_steps ({execute_steps}) > chunk_size ({chunk_size}), clamping.")
+        execute_steps = chunk_size
+    print(f"Loaded policy from {args.checkpoint}  device={device}  "
+          f"chunk_size={chunk_size}  execute_steps={execute_steps}")
 
     # --- Setup simulation ---
+    if args.headless:
+        os.environ["ROBOENV_HEADLESS"] = "1"
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
     add_target_visual(client, target_ee_pos)
@@ -79,9 +91,11 @@ def main():
 
     best_ee_error = np.inf
     step = 0
+    action_chunk = None  # cached chunk of K actions, shape (K, 11) or None
+    chunk_idx = 0        # index into current chunk
 
     while step < args.max_steps:
-        # ---- Sense ----
+        # ---- Sense (always needed for logging / exit checks) ----
         base_pos = np.array(sim.GetBasePosition())
         base_ori = np.array(sim.GetBaseOrientation())
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
@@ -101,10 +115,20 @@ def main():
         if ee_dist_error < best_ee_error:
             best_ee_error = ee_dist_error
 
-        # ---- Build observation & predict ----
-        obs = build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
-                                q_mes, qd_mes, ee_pos, target_ee_pos)
-        action = predict(model, mean, std, obs, device=device)
+        # ---- Predict new chunk if needed (MPC: re-predict every execute_steps) ----
+        if action_chunk is None or chunk_idx >= execute_steps:
+            obs = build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
+                                    q_mes, qd_mes, ee_pos, target_ee_pos)
+            raw = predict(model, mean, std, obs, device=device, chunk_size=chunk_size)
+            if chunk_size > 1:
+                action_chunk = raw          # shape (K, 11)
+            else:
+                action_chunk = raw[np.newaxis, :]  # shape (1, 11)
+            chunk_idx = 0
+
+        # ---- Pick action from chunk ----
+        action = action_chunk[chunk_idx]
+        chunk_idx += 1
 
         wheel_cmds = action[:4]
         torque_arm = action[4:]
@@ -116,17 +140,18 @@ def main():
         cmd.SetControlCmd(cmd_all, control_modes)
         sim.Step(cmd, "torque")
 
-        # ---- Optional visualisation ----
-        if dyn_model.visualizer:
-            for index in range(len(sim.bot)):
-                q = sim.GetMotorAngles(index)
-                dyn_model.DisplayModel(q)
+        if not args.headless:
+            # ---- Optional visualisation ----
+            if dyn_model.visualizer:
+                for index in range(len(sim.bot)):
+                    q = sim.GetMotorAngles(index)
+                    dyn_model.DisplayModel(q)
 
-        # ---- Exit on 'q' key ----
-        keys = sim.GetPyBulletClient().getKeyboardEvents()
-        if ord('q') in keys and keys[ord('q')] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
-            print("User quit.")
-            break
+            # ---- Exit on 'q' key ----
+            keys = sim.GetPyBulletClient().getKeyboardEvents()
+            if ord('q') in keys and keys[ord('q')] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
+                print("User quit.")
+                break
 
         # ---- Check if target reached ----
         if ee_dist_error < REACH_TOLERANCE and current_time > 8.0:
@@ -139,7 +164,8 @@ def main():
                   f"EE: {np.round(ee_pos, 3)} | EE err: {ee_dist_error:.4f}m | "
                   f"best: {best_ee_error:.4f}m")
 
-        time.sleep(0.001)
+        if not args.headless:
+            time.sleep(0.001)
         current_time += time_step
         step += 1
 

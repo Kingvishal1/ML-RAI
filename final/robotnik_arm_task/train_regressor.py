@@ -50,12 +50,40 @@ def main():
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader worker processes for parallel data loading (default: 0)")
+    parser.add_argument("--chunk_size", type=int, default=1,
+                        help="Number of future actions to predict per observation (default: 1)")
     args = parser.parse_args()
 
     # --- Load data ---
     data = np.load(args.data)
     inputs, labels, metadata = data["inputs"], data["labels"], data["metadata"]
     print(f"Loaded {inputs.shape[0]} samples  inputs={inputs.shape}  labels={labels.shape}")
+
+    # --- Build action chunks ---
+    K = args.chunk_size
+    ACTION_DIM = labels.shape[1]  # 11
+    if K > 1:
+        traj_ids = np.unique(metadata[:, 0])
+        chunked_inputs, chunked_labels, chunked_meta = [], [], []
+        for tid in traj_ids:
+            mask = metadata[:, 0] == tid
+            traj_inputs = inputs[mask]
+            traj_labels = labels[mask]
+            traj_meta = metadata[mask]
+            # Sort by timestep
+            order = np.argsort(traj_meta[:, 1])
+            traj_inputs = traj_inputs[order]
+            traj_labels = traj_labels[order]
+            traj_meta = traj_meta[order]
+            T = len(traj_inputs)
+            for t in range(T - K + 1):
+                chunked_inputs.append(traj_inputs[t])
+                chunked_labels.append(traj_labels[t:t + K].flatten())
+                chunked_meta.append(traj_meta[t])
+        inputs = np.array(chunked_inputs)
+        labels = np.array(chunked_labels)
+        metadata = np.array(chunked_meta)
+        print(f"Chunked (K={K}): {inputs.shape[0]} samples  labels={labels.shape}")
 
     # --- Split by trajectory ---
     X_train, y_train, X_val, y_val = split_by_trajectory(inputs, labels, metadata)
@@ -90,9 +118,10 @@ def main():
     criterion = nn.MSELoss()
     print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
 
-    # --- Label slices: wheel_cmd_1..4 (0:4), torque_arm_1..7 (4:11) ---
-    WHEEL_SLICE = slice(0, 4)
-    TORQUE_SLICE = slice(4, 11)
+    # --- Label slices: wheel_cmd_1..4 (0:4), torque_arm_1..7 (4:11) per action step ---
+    # With chunking, labels are [action_0, action_1, ..., action_{K-1}] each of dim 11
+    wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + 4) for k in range(K)])
+    torque_cols = [np.arange(k * ACTION_DIM + 4, k * ACTION_DIM + 11) for k in range(K)]
     arm_names = [f"arm_{i}" for i in range(1, 8)]
 
     # --- Checkpoint path (fixed once at start) ---
@@ -101,7 +130,7 @@ def main():
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_path = (f"bc_e{args.epochs}_h{args.hidden_dim}_l{args.num_layers}"
-                     f"_w{args.num_workers}_{timestamp}.pt")
+                     f"_w{args.num_workers}_c{K}_{timestamp}.pt")
     print(f"Checkpoint: {save_path}")
 
     # --- Training ---
@@ -134,13 +163,14 @@ def main():
                 bs = xb.size(0)
                 val_loss += criterion(pred, yb).item() * bs
                 err = (pred - yb).cpu().numpy()
-                val_se_wheel += (err[:, WHEEL_SLICE] ** 2).sum()
+                val_se_wheel += (err[:, wheel_cols] ** 2).sum()
                 for j in range(7):
-                    val_se_torque[j] += (err[:, 4 + j] ** 2).sum()
+                    cols_j = np.array([k * ACTION_DIM + 4 + j for k in range(K)])
+                    val_se_torque[j] += (err[:, cols_j] ** 2).sum()
 
         val_loss /= n_val
-        val_mse_wheel = val_se_wheel / n_val
-        val_mse_torque = val_se_torque / n_val
+        val_mse_wheel = val_se_wheel / (n_val * K)
+        val_mse_torque = val_se_torque / (n_val * K)
         val_mse_torque_avg = val_mse_torque.mean()
 
         tag = ""
@@ -164,6 +194,8 @@ def main():
                 "num_workers": args.num_workers,
                 "device": str(device),
                 "elapsed_sec": elapsed,
+                "chunk_size": K,
+                "action_dim": ACTION_DIM,
             }, save_path)
             tag = f"  *saved* → {save_path}"
 
