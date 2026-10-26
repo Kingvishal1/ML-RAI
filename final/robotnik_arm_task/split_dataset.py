@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Split the full expert dataset into base-navigation and arm-reaching subsets.
+
+Phase detection uses the wheel command norm:
+  - Base phase: norm(wheel_cmds) > 0.05  (wheels active)
+  - Arm phase:  norm(wheel_cmds) < 0.05  (wheels stopped)
+
+Base dataset (13 inputs -> 4 outputs):
+  Inputs:  base_pos_xy(2), bearing(1), lin_vel(3), ang_vel(3), target_xy(2),
+           dist_to_target(1), heading_error(1)
+  Labels:  wheel_cmds(4)
+
+Arm dataset (20 inputs -> 7 outputs):
+  Inputs:  q_arm(7), qd_arm(7), ee_pos(3), target_ee_pos(3)
+  Labels:  torque_arm(7)
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+import numpy as np
+
+
+# Full 37-dim input layout:
+#  0,1       base_pos_x, base_pos_y
+#  2         base_bearing
+#  3,4,5     base_lin_vel_x/y/z
+#  6,7,8     base_ang_vel_x/y/z
+#  9..12     q_base (wheel angles)
+#  13..16    qd_base (wheel velocities)
+#  17..23    q_arm
+#  24..30    qd_arm
+#  31,32,33  ee_pos_x/y/z
+#  34,35,36  target_x/y/z
+
+BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 34, 35]          # 11 raw dims + 2 computed
+ARM_INPUT_INDICES = list(range(17, 24)) + list(range(24, 31)) + \
+                    [31, 32, 33, 34, 35, 36]                        # 20 dims
+
+# Full 11-dim label layout:  wheel_cmds(0:4), torque_arm(4:11)
+WHEEL_THRESHOLD = 0.05
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Split expert dataset into base and arm subsets")
+    parser.add_argument("--data", type=str, required=True, help="Path to full .npz dataset")
+    parser.add_argument("--out_dir", type=str, default=None,
+                        help="Output directory (default: same as input)")
+    parser.add_argument("--train", action="store_true",
+                        help="Train base and arm policies after splitting")
+    parser.add_argument("--epochs", type=int, default=50,
+                        help="Training epochs (used with --train, default: 50)")
+    parser.add_argument("--hidden_dim", type=int, default=512,
+                        help="Hidden layer size (used with --train, default: 512)")
+    parser.add_argument("--num_layers", type=int, default=4,
+                        help="Number of hidden layers (used with --train, default: 4)")
+    parser.add_argument("--batch_size", type=int, default=4096,
+                        help="Batch size (used with --train, default: 4096)")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate (used with --train, default: 1e-3)")
+    parser.add_argument("--chunk_size", type=int, default=1,
+                        help="Action chunk size (used with --train, default: 1)")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="DataLoader workers (used with --train, default: 0)")
+    parser.add_argument("--mps", action="store_true",
+                        help="Use Apple Metal GPU (used with --train)")
+    args = parser.parse_args()
+
+    data = np.load(args.data)
+    inputs, labels, metadata = data["inputs"], data["labels"], data["metadata"]
+    print(f"Loaded {inputs.shape[0]} samples  inputs={inputs.shape}  labels={labels.shape}")
+
+    # Phase detection
+    wheel_norms = np.linalg.norm(labels[:, :4], axis=1)
+    base_mask = wheel_norms > WHEEL_THRESHOLD
+    arm_mask = wheel_norms < WHEEL_THRESHOLD
+    print(f"Base phase: {base_mask.sum()} samples ({100*base_mask.mean():.1f}%)")
+    print(f"Arm phase:  {arm_mask.sum()} samples ({100*arm_mask.mean():.1f}%)")
+
+    out_dir = args.out_dir or os.path.dirname(args.data)
+
+    # Base dataset: 13 inputs -> 4 outputs (wheel cmds only)
+    # Raw features from full observation
+    base_raw = inputs[base_mask][:, BASE_INPUT_INDICES]   # (N, 11)
+    # Computed goal-relative features the expert controller relies on
+    base_pos_xy = inputs[base_mask][:, :2]                # cols 0,1
+    bearing = inputs[base_mask][:, 2]                     # col 2
+    target_xy = inputs[base_mask][:, 34:36]               # cols 34,35
+    delta = target_xy - base_pos_xy
+    dist_to_target = np.linalg.norm(delta, axis=1, keepdims=True)           # (N, 1)
+    heading_to_target = np.arctan2(delta[:, 1], delta[:, 0])                # (N,)
+    heading_error = np.arctan2(np.sin(heading_to_target - bearing),
+                               np.cos(heading_to_target - bearing))[:, None]  # (N, 1) wrapped
+    base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 13)
+    base_labels = labels[base_mask][:, :4]
+    base_metadata = metadata[base_mask]
+    base_path = os.path.join(out_dir, "dataset_base.npz")
+    np.savez(base_path, inputs=base_inputs, labels=base_labels, metadata=base_metadata)
+    print(f"Saved base dataset: {base_path}  inputs={base_inputs.shape}  labels={base_labels.shape}")
+
+    # Arm dataset: 20 inputs -> 7 outputs (torque arm only)
+    arm_inputs = inputs[arm_mask][:, ARM_INPUT_INDICES]
+    arm_labels = labels[arm_mask][:, 4:]
+    arm_metadata = metadata[arm_mask]
+    arm_path = os.path.join(out_dir, "dataset_arm.npz")
+    np.savez(arm_path, inputs=arm_inputs, labels=arm_labels, metadata=arm_metadata)
+    print(f"Saved arm dataset:  {arm_path}  inputs={arm_inputs.shape}  labels={arm_labels.shape}")
+
+    if not args.train:
+        return
+
+    # --- Train both policies ---
+    train_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_regressor.py")
+    common_args = [
+        "--epochs", str(args.epochs),
+        "--hidden_dim", str(args.hidden_dim),
+        "--num_layers", str(args.num_layers),
+        "--batch_size", str(args.batch_size),
+        "--lr", str(args.lr),
+        "--chunk_size", str(args.chunk_size),
+        "--num_workers", str(args.num_workers),
+    ]
+    if args.mps:
+        common_args.append("--mps")
+
+    for name, path, mode in [("base", base_path, "base"), ("arm", arm_path, "arm")]:
+        print(f"\n{'='*60}")
+        print(f"Training {name} policy: {path}")
+        print(f"{'='*60}")
+        cmd = [sys.executable, train_script, "--data", path, "--mode", mode] + common_args
+        ret = subprocess.run(cmd)
+        if ret.returncode != 0:
+            print(f"ERROR: {name} training failed (exit code {ret.returncode})")
+            sys.exit(ret.returncode)
+
+
+if __name__ == "__main__":
+    main()
