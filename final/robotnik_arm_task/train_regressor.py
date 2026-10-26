@@ -2,8 +2,10 @@
 """Train a behaviour-cloning MLP regressor on expert trajectory data."""
 
 import argparse
+import glob
+import os
+import re
 import time as _time
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -52,6 +54,8 @@ def main():
                         help="DataLoader worker processes for parallel data loading (default: 0)")
     parser.add_argument("--chunk_size", type=int, default=1,
                         help="Number of future actions to predict per observation (default: 1)")
+    parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
+                        help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -118,19 +122,36 @@ def main():
     criterion = nn.MSELoss()
     print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
 
-    # --- Label slices: wheel_cmd_1..4 (0:4), torque_arm_1..7 (4:11) per action step ---
-    # With chunking, labels are [action_0, action_1, ..., action_{K-1}] each of dim 11
-    wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + 4) for k in range(K)])
-    torque_cols = [np.arange(k * ACTION_DIM + 4, k * ACTION_DIM + 11) for k in range(K)]
-    arm_names = [f"arm_{i}" for i in range(1, 8)]
+    # --- Label slices depend on mode ---
+    mode = args.mode
+    if mode == "full":
+        # 4 wheel + 7 arm torque per action step
+        wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + 4) for k in range(K)])
+        n_torque = 7
+        torque_offset = 4
+    elif mode == "base":
+        # All outputs are wheel commands (ACTION_DIM == 4)
+        wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + ACTION_DIM) for k in range(K)])
+        n_torque = 0
+        torque_offset = ACTION_DIM
+    elif mode == "arm":
+        # All outputs are arm torques (ACTION_DIM == 7)
+        wheel_cols = np.array([], dtype=int)
+        n_torque = ACTION_DIM
+        torque_offset = 0
+    arm_names = [f"arm_{i}" for i in range(1, n_torque + 1)]
 
     # --- Checkpoint path (fixed once at start) ---
     if args.out:
         save_path = args.out
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_path = (f"bc_e{args.epochs}_h{args.hidden_dim}_l{args.num_layers}"
-                     f"_w{args.num_workers}_c{K}_{timestamp}.pt")
+        # Auto-increment counter from existing .pt files in cwd
+        existing = glob.glob("*.pt")
+        counters = [int(m.group(1)) for f in existing
+                    if (m := re.match(r"^(\d+)_", f))]
+        next_id = max(counters, default=0) + 1
+        save_path = (f"{next_id:03d}_bc_{mode}_e{args.epochs}_h{args.hidden_dim}"
+                     f"_l{args.num_layers}_c{K}.pt")
     print(f"Checkpoint: {save_path}")
 
     # --- Training ---
@@ -153,8 +174,8 @@ def main():
         # Val — collect per-component errors
         model.eval()
         val_loss = 0.0
-        val_se_wheel = 0.0       # sum of squared errors for wheel cmds
-        val_se_torque = np.zeros(7)  # per-arm torque
+        val_se_wheel = 0.0
+        val_se_torque = np.zeros(max(n_torque, 1))  # avoid zero-length
         n_val = len(val_ds)
         with torch.no_grad():
             for xb, yb in val_loader:
@@ -163,15 +184,16 @@ def main():
                 bs = xb.size(0)
                 val_loss += criterion(pred, yb).item() * bs
                 err = (pred - yb).cpu().numpy()
-                val_se_wheel += (err[:, wheel_cols] ** 2).sum()
-                for j in range(7):
-                    cols_j = np.array([k * ACTION_DIM + 4 + j for k in range(K)])
+                if len(wheel_cols) > 0:
+                    val_se_wheel += (err[:, wheel_cols] ** 2).sum()
+                for j in range(n_torque):
+                    cols_j = np.array([k * ACTION_DIM + torque_offset + j for k in range(K)])
                     val_se_torque[j] += (err[:, cols_j] ** 2).sum()
 
         val_loss /= n_val
-        val_mse_wheel = val_se_wheel / (n_val * K)
-        val_mse_torque = val_se_torque / (n_val * K)
-        val_mse_torque_avg = val_mse_torque.mean()
+        val_mse_wheel = val_se_wheel / (n_val * K) if len(wheel_cols) > 0 else 0.0
+        val_mse_torque = val_se_torque[:n_torque] / (n_val * K) if n_torque > 0 else np.array([])
+        val_mse_torque_avg = val_mse_torque.mean() if n_torque > 0 else 0.0
 
         tag = ""
         if val_loss < best_val:
@@ -200,17 +222,26 @@ def main():
             tag = f"  *saved* → {save_path}"
 
         # Summary line
-        print(f"Epoch {epoch:4d}/{args.epochs}  "
-              f"train={train_loss:.6f}  val={val_loss:.6f}  "
-              f"wheel={val_mse_wheel:.6f}  torque_avg={val_mse_torque_avg:.6f}{tag}")
-        # Per-arm breakdown
-        arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(7))
-        print(f"         torque: {arm_str}")
+        if mode == "full":
+            print(f"Epoch {epoch:4d}/{args.epochs}  "
+                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"wheel={val_mse_wheel:.6f}  torque_avg={val_mse_torque_avg:.6f}{tag}")
+            arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
+            print(f"         torque: {arm_str}")
+        elif mode == "base":
+            print(f"Epoch {epoch:4d}/{args.epochs}  "
+                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"wheel={val_mse_wheel:.6f}{tag}")
+        elif mode == "arm":
+            arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
+            print(f"Epoch {epoch:4d}/{args.epochs}  "
+                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"torque_avg={val_mse_torque_avg:.6f}{tag}")
+            print(f"         torque: {arm_str}")
 
     total_time = _time.time() - t_start
     total_min = int(total_time // 60)
     final_path = save_path.replace(".pt", f"_{total_min}min.pt")
-    import os
     if os.path.exists(save_path):
         os.rename(save_path, final_path)
     print(f"\nBest val loss: {best_val:.6f} at epoch {best_epoch}")
