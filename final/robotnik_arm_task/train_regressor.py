@@ -2,6 +2,9 @@
 """Train a behaviour-cloning MLP regressor on expert trajectory data."""
 
 import argparse
+import time as _time
+from datetime import datetime
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,12 +41,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train BC regressor")
     parser.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=248)
+    parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--out", type=str, default="bc_policy.pt", help="Checkpoint save path")
+    parser.add_argument("--hidden_dim", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--out", type=str, default=None,
+                        help="Checkpoint save path (default: auto-generated from params)")
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="DataLoader worker processes for parallel data loading (default: 0)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -72,8 +78,10 @@ def main():
                              torch.tensor(y_train, dtype=torch.float32))
     val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
                            torch.tensor(y_val, dtype=torch.float32))
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
+    loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers,
+                         pin_memory=(device.type != "cpu"), persistent_workers=(args.num_workers > 0))
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, **loader_kwargs)
 
     # --- Model ---
     model = build_mlp(inputs.shape[1], labels.shape[1],
@@ -87,8 +95,18 @@ def main():
     TORQUE_SLICE = slice(4, 11)
     arm_names = [f"arm_{i}" for i in range(1, 8)]
 
+    # --- Checkpoint path (fixed once at start) ---
+    if args.out:
+        save_path = args.out
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = (f"bc_e{args.epochs}_h{args.hidden_dim}_l{args.num_layers}"
+                     f"_w{args.num_workers}_{timestamp}.pt")
+    print(f"Checkpoint: {save_path}")
+
     # --- Training ---
     best_val = float("inf")
+    t_start = _time.time()
     for epoch in range(1, args.epochs + 1):
         # Train
         model.train()
@@ -128,6 +146,8 @@ def main():
         tag = ""
         if val_loss < best_val:
             best_val = val_loss
+            best_epoch = epoch
+            elapsed = _time.time() - t_start
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "input_mean": mean,
@@ -136,8 +156,16 @@ def main():
                 "output_dim": labels.shape[1],
                 "hidden_dim": args.hidden_dim,
                 "num_layers": args.num_layers,
-            }, args.out)
-            tag = "  *saved*"
+                "epochs": args.epochs,
+                "best_epoch": best_epoch,
+                "best_val_loss": best_val,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "num_workers": args.num_workers,
+                "device": str(device),
+                "elapsed_sec": elapsed,
+            }, save_path)
+            tag = f"  *saved* → {save_path}"
 
         # Summary line
         print(f"Epoch {epoch:4d}/{args.epochs}  "
@@ -147,7 +175,14 @@ def main():
         arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(7))
         print(f"         torque: {arm_str}")
 
-    print(f"\nBest val loss: {best_val:.6f}  Checkpoint: {args.out}")
+    total_time = _time.time() - t_start
+    total_min = int(total_time // 60)
+    final_path = save_path.replace(".pt", f"_{total_min}min.pt")
+    import os
+    if os.path.exists(save_path):
+        os.rename(save_path, final_path)
+    print(f"\nBest val loss: {best_val:.6f} at epoch {best_epoch}")
+    print(f"Total time: {total_time/60:.1f}min  Checkpoint: {final_path}")
 
 
 if __name__ == "__main__":
