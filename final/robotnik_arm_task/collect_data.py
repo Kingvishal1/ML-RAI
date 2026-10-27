@@ -47,8 +47,8 @@ def generate_grid_targets(n=100):
 def generate_random_targets(n=100, seed=42):
     """Uniform random sampling from the workspace volume."""
     rng = np.random.default_rng(seed)
-    xs = rng.uniform(-0.8, 0.8, n)
-    ys = rng.uniform(0.5, 1.5, n)
+    xs = rng.uniform(-5, 5, n)
+    ys = rng.uniform(-5, 5, n)
     zs = rng.uniform(0.2, 1.0, n)
     return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
 

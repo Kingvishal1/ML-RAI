@@ -115,7 +115,10 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     print(f"Initial EE Position: {np.round(init_ee_pos, 4)}")
     print(f"Initial Error (m)  : {np.linalg.norm(target_ee_pos - init_ee_pos):.4f}")
     if split_mode:
-        print(f"Mode               : SPLIT (base -> arm at {args.base_threshold}m)")
+        if args.base_threshold is not None:
+            print(f"Mode               : SPLIT (base -> arm at XY dist < {args.base_threshold}m)")
+        else:
+            print(f"Mode               : SPLIT (base -> arm on settle)")
     else:
         print(f"Mode               : SINGLE")
     print("=" * 60)
@@ -132,6 +135,16 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     steps_since_ee_improved = 0
     SETTLE_PATIENCE = 500          # steps without EE improvement
     SETTLE_SPEED_THRESH = 0.05     # m/s base speed to consider "settled"
+
+    # Per-phase tracking
+    base_best_ee = np.inf
+    base_final_ee = np.inf
+    base_xy_at_switch = None
+    base_xy_at_best = None
+    base_bearing_at_best = None
+    arm_best_ee = np.inf
+    arm_final_ee = np.inf
+    switch_time = None
 
     # Track last known good state for the final report on crash
     ee_pos = init_ee_pos.copy()
@@ -150,7 +163,15 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             base_ang_vel = np.array(sim.GetBaseAngVelocity())
         except Exception as e:
             print(f"\nSim crashed reading sensors at t={current_time:.2f}s  step={step}: {e}")
-            return False
+            return {"ok": False, "final_err": float("inf"), "best_err": best_ee_error,
+                    "reached": False, "steps": step, "time": current_time,
+                    "target": target_ee_pos.tolist(), "phase_switched": phase_switched,
+                    "switch_time": switch_time, "base_best_ee": base_best_ee,
+                    "base_final_ee": base_final_ee,
+                    "base_xy_at_switch": base_xy_at_switch.tolist() if base_xy_at_switch is not None else None,
+                    "base_xy_at_best": base_xy_at_best.tolist() if base_xy_at_best is not None else None,
+                    "base_bearing_at_best": base_bearing_at_best,
+                    "arm_best_ee": arm_best_ee, "arm_final_ee": arm_final_ee}
 
         # Forward kinematics for EE position
         q_all = np.concatenate((base_pos, base_ori, q_mes))
@@ -170,24 +191,49 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         # ---- Phase transition check (split mode only) ----
         if phase == "base":
             base_speed = np.linalg.norm(base_lin_vel[:2])
-            # Track whether EE error is still improving
-            if ee_dist_error < best_ee_in_base - 0.01:
-                best_ee_in_base = ee_dist_error
-                steps_since_ee_improved = 0
+            switch = False
+            switch_reason = ""
+
+            if args.base_threshold is not None:
+                # XY distance mode
+                base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
+                if base_xy_dist < args.base_threshold:
+                    switch = True
+                    switch_reason = f"xy_dist={base_xy_dist:.4f}m"
             else:
-                steps_since_ee_improved += 1
-            # Switch when base has settled: EE stopped improving AND base speed is low
-            settled = (steps_since_ee_improved >= SETTLE_PATIENCE
-                       and base_speed < SETTLE_SPEED_THRESH
-                       and current_time > 2.0)
-            if settled:
-                phase = "arm"
+                # Settle detection mode
+                if ee_dist_error < best_ee_in_base - 0.01:
+                    best_ee_in_base = ee_dist_error
+                    steps_since_ee_improved = 0
+                else:
+                    steps_since_ee_improved += 1
+                settled = (steps_since_ee_improved >= SETTLE_PATIENCE
+                           and base_speed < SETTLE_SPEED_THRESH
+                           and current_time > 2.0)
+                if settled:
+                    switch = True
+                    switch_reason = (f"ee_err={ee_dist_error:.4f}m  "
+                                     f"base_speed={base_speed:.4f}m/s  "
+                                     f"best_ee={best_ee_in_base:.4f}m")
+
+            # Track base phase metrics
+            if ee_dist_error < base_best_ee:
+                base_best_ee = ee_dist_error
+                base_xy_at_best = base_pos[:2].copy()
+                base_bearing_at_best = base_bearing
+            base_final_ee = ee_dist_error
+
+            if switch:
                 phase_switched = True
+                switch_time = current_time
+                base_xy_at_switch = base_pos[:2].copy()
+                print(f">>> Phase switch: base -> arm at t={current_time:.2f}s  {switch_reason}")
+                if arm_model is None:
+                    # No arm policy (base_only mode) — stop here
+                    break
+                phase = "arm"
                 action_chunk = None
                 chunk_idx = 0
-                print(f">>> Phase switch: base -> arm at t={current_time:.2f}s  "
-                      f"ee_err={ee_dist_error:.4f}m  base_speed={base_speed:.4f}m/s  "
-                      f"best_ee_in_base={best_ee_in_base:.4f}m")
 
         # ---- Compute action based on mode/phase ----
         if phase == "single":
@@ -241,6 +287,10 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             torque_arm = np.clip(action_chunk[chunk_idx], -30.0, 30.0)
             chunk_idx += 1
             wheel_cmds = np.zeros(4)
+            # Track arm phase metrics
+            if ee_dist_error < arm_best_ee:
+                arm_best_ee = ee_dist_error
+            arm_final_ee = ee_dist_error
 
         # ---- Send commands ----
         torque_fingers = np.zeros(6)
@@ -253,7 +303,15 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             print(f"\nSim crashed at t={current_time:.2f}s  step={step}  phase={phase}")
             print(f"  Last base_pos: {np.round(base_pos, 3)}  wheel_cmds: {np.round(wheel_cmds, 3)}")
             print(f"  Error: {e}")
-            return False
+            return {"ok": False, "final_err": float("inf"), "best_err": best_ee_error,
+                    "reached": False, "steps": step, "time": current_time,
+                    "target": target_ee_pos.tolist(), "phase_switched": phase_switched,
+                    "switch_time": switch_time, "base_best_ee": base_best_ee,
+                    "base_final_ee": base_final_ee,
+                    "base_xy_at_switch": base_xy_at_switch.tolist() if base_xy_at_switch is not None else None,
+                    "base_xy_at_best": base_xy_at_best.tolist() if base_xy_at_best is not None else None,
+                    "base_bearing_at_best": base_bearing_at_best,
+                    "arm_best_ee": arm_best_ee, "arm_final_ee": arm_final_ee}
 
         if not args.headless:
             if dyn_model.visualizer:
@@ -284,6 +342,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         step += 1
 
     # ---- Final report ----
+    reached = ee_dist_error < REACH_TOLERANCE
     print("=" * 60)
     print(f"Final EE Position  : {np.round(ee_pos, 4)}")
     print(f"Target EE Position : {target_ee_pos}")
@@ -293,7 +352,24 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     if split_mode:
         print(f"Phase switched     : {'Yes' if phase_switched else 'No (stayed in base phase)'}")
     print("=" * 60)
-    return True
+    return {
+        "ok": True,
+        "final_err": ee_dist_error,
+        "best_err": best_ee_error,
+        "reached": reached,
+        "steps": step,
+        "time": current_time,
+        "target": target_ee_pos.tolist(),
+        "phase_switched": phase_switched,
+        "switch_time": switch_time,
+        "base_best_ee": base_best_ee,
+        "base_final_ee": base_final_ee,
+        "base_xy_at_switch": base_xy_at_switch.tolist() if base_xy_at_switch is not None else None,
+        "base_xy_at_best": base_xy_at_best.tolist() if base_xy_at_best is not None else None,
+        "base_bearing_at_best": base_bearing_at_best,
+        "arm_best_ee": arm_best_ee,
+        "arm_final_ee": arm_final_ee,
+    }
 
 
 def main():
@@ -306,8 +382,8 @@ def main():
                         help="Path to base policy .pt checkpoint (split mode)")
     parser.add_argument("--arm_checkpoint", type=str, default=None,
                         help="Path to arm policy .pt checkpoint (split mode)")
-    parser.add_argument("--base_threshold", type=float, default=0.5,
-                        help="XY distance to target below which to switch from base to arm (default: 0.15m)")
+    parser.add_argument("--base_threshold", type=float, default=None,
+                        help="XY distance to target for phase switch. If omitted, uses settle detection (EE plateau + low speed).")
     # Common args
     parser.add_argument("--target", type=float, nargs=3, default=[0.0, 1.1, 0.5],
                         metavar=("X", "Y", "Z"),
@@ -333,8 +409,6 @@ def main():
         single_mode = True
     if split_mode and single_mode:
         parser.error("Specify either --checkpoint OR (--base_checkpoint + --arm_checkpoint), not both.")
-
-    target_ee_pos = np.array(args.target)
 
     # --- Load policy/policies (once, reused across retries) ---
     import torch
@@ -371,7 +445,7 @@ def main():
             arm_execute = arm_chunk_size
         print(f"Split mode: base={args.base_checkpoint} (chunk={base_chunk_size}, exec={base_execute})  "
               f"arm={args.arm_checkpoint} (chunk={arm_chunk_size}, exec={arm_execute})  "
-              f"device={device}  base_threshold={args.base_threshold}m")
+              f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
         policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
                              base_chunk_size=base_chunk_size, base_execute=base_execute,
                              base_label_mean=base_lm, base_label_std=base_ls,
@@ -379,14 +453,16 @@ def main():
                              arm_chunk_size=arm_chunk_size, arm_execute=arm_execute,
                              arm_label_mean=arm_lm, arm_label_std=arm_ls)
 
+    target_ee_pos = np.array(args.target)
+
     # --- Run with retries ---
     max_attempts = 1 + args.retries
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
             print(f"\n>>> Restarting simulation (attempt {attempt}/{max_attempts}) <<<\n")
-        ok = run_sim(args, target_ee_pos, split_mode=split_mode, single_mode=single_mode,
-                     **policy_kwargs)
-        if ok:
+        result = run_sim(args, target_ee_pos, split_mode=split_mode, single_mode=single_mode,
+                         **policy_kwargs)
+        if result["ok"]:
             break
     else:
         print(f"\nAll {max_attempts} attempts crashed.")

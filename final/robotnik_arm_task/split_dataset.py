@@ -75,11 +75,20 @@ def main():
                         help="Val loss improvement threshold (used with --train, default: 0.005)")
     parser.add_argument("--patience", type=int, default=5,
                         help="Epochs without improvement before early stopping (used with --train, default: 5)")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Randomly subsample to this many rows before splitting (default: use all)")
     args = parser.parse_args()
 
     data = np.load(args.data)
     inputs, labels, metadata = data["inputs"], data["labels"], data["metadata"]
     print(f"Loaded {inputs.shape[0]} samples  inputs={inputs.shape}  labels={labels.shape}")
+
+    if args.max_samples and inputs.shape[0] > args.max_samples:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(inputs.shape[0], args.max_samples, replace=False)
+        idx.sort()
+        inputs, labels, metadata = inputs[idx], labels[idx], metadata[idx]
+        print(f"Subsampled to {inputs.shape[0]} samples")
 
     # Phase detection
     wheel_norms = np.linalg.norm(labels[:, :4], axis=1)
