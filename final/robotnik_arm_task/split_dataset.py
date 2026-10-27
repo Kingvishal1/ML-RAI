@@ -5,13 +5,13 @@ Phase detection uses the wheel command norm:
   - Base phase: norm(wheel_cmds) > 0.05  (wheels active)
   - Arm phase:  norm(wheel_cmds) < 0.05  (wheels stopped)
 
-Base dataset (13 inputs -> 2 outputs):
-  Inputs:  base_pos_xy(2), bearing(1), lin_vel(3), ang_vel(3), target_xy(2),
+Base dataset (14 inputs -> 2 outputs):
+  Inputs:  base_pos_xy(2), bearing(1), lin_vel(3), ang_vel(3), target_xyz(3),
            dist_to_target(1), heading_error(1)
   Labels:  v_cmd(1), w_cmd(1)  — linear/angular velocity from wheel inverse kinematics
 
-Arm dataset (20 inputs -> 7 outputs):
-  Inputs:  q_arm(7), qd_arm(7), ee_pos(3), target_ee_pos(3)
+Arm dataset (27 inputs -> 7 outputs):
+  Inputs:  q_arm(7), qd_arm(7), ee_pos(3), target_ee_pos(3), tau_gravity(7)
   Labels:  torque_arm(7)
 """
 
@@ -23,7 +23,7 @@ import sys
 import numpy as np
 
 
-# Full 37-dim input layout:
+# Full 44-dim input layout:
 #  0,1       base_pos_x, base_pos_y
 #  2         base_bearing
 #  3,4,5     base_lin_vel_x/y/z
@@ -34,10 +34,12 @@ import numpy as np
 #  24..30    qd_arm
 #  31,32,33  ee_pos_x/y/z
 #  34,35,36  target_x/y/z
+#  37..43    tau_gravity_1..7
 
-BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 34, 35]          # 11 raw dims + 2 computed
+BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 34, 35, 36]      # 12 raw dims + 2 computed
 ARM_INPUT_INDICES = list(range(17, 24)) + list(range(24, 31)) + \
-                    [31, 32, 33, 34, 35, 36]                        # 20 dims
+                    [31, 32, 33, 34, 35, 36] + \
+                    list(range(37, 44))                              # 27 dims
 
 # Full 11-dim label layout:  wheel_cmds(0:4), torque_arm(4:11)
 # Wheel kinematic constants (from BaseControllerParams)
@@ -69,6 +71,10 @@ def main():
                         help="DataLoader workers (used with --train, default: 0)")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal GPU (used with --train)")
+    parser.add_argument("--early_stop", type=float, default=0.005,
+                        help="Val loss improvement threshold (used with --train, default: 0.005)")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Epochs without improvement before early stopping (used with --train, default: 5)")
     args = parser.parse_args()
 
     data = np.load(args.data)
@@ -87,7 +93,7 @@ def main():
     # Base dataset: 13 inputs -> 2 outputs (v_cmd, w_cmd)
     # Raw features from full observation
     base_raw = inputs[base_mask][:, BASE_INPUT_INDICES]   # (N, 11)
-    # Computed goal-relative features the expert controller relies on
+    # Computed goal-relative features
     base_pos_xy = inputs[base_mask][:, :2]                # cols 0,1
     bearing = inputs[base_mask][:, 2]                     # col 2
     target_xy = inputs[base_mask][:, 34:36]               # cols 34,35
@@ -96,7 +102,7 @@ def main():
     heading_to_target = np.arctan2(delta[:, 1], delta[:, 0])                # (N,)
     heading_error = np.arctan2(np.sin(heading_to_target - bearing),
                                np.cos(heading_to_target - bearing))[:, None]  # (N, 1) wrapped
-    base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 13)
+    base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 14)
     # Convert wheel cmds [rw, lw, lw, rw] -> [v_cmd, w_cmd]
     wheel_raw = labels[base_mask][:, :4]                  # (N, 4)
     rw = wheel_raw[:, 0]     # front_right == back_right
@@ -130,6 +136,8 @@ def main():
         "--lr", str(args.lr),
         "--chunk_size", str(args.chunk_size),
         "--num_workers", str(args.num_workers),
+        "--early_stop", str(args.early_stop),
+        "--patience", str(args.patience),
     ]
     if args.mps:
         common_args.append("--mps")

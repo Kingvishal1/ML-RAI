@@ -109,11 +109,12 @@ def assemble_dataset(all_trajectory_data):
     """Assemble per-timestep rows from all trajectories.
 
     Returns (inputs, labels, metadata) as numpy arrays.
-      inputs:   (N, 37) — base_pos_x, base_pos_y, base_bearing,
+      inputs:   (N, 44) — base_pos_x, base_pos_y, base_bearing,
                            base_lin_vel_x/y/z, base_ang_vel_x/y/z,
                            q_base_1..4, qd_base_1..4,
                            q_arm_1..7, qd_arm_1..7,
-                           ee_pos_x/y/z, target_x, target_y, target_z
+                           ee_pos_x/y/z, target_x, target_y, target_z,
+                           tau_gravity_1..7
       labels:   (N, 11) — wheel_cmd_1..4, torque_arm_1..7
       metadata: (N, 2)  — trajectory_id, time
     """
@@ -123,6 +124,7 @@ def assemble_dataset(all_trajectory_data):
 
     for traj_id, data in enumerate(all_trajectory_data):
         n_steps = len(data["time"])
+        has_gravity = "tau_gravity" in data and len(data["tau_gravity"]) == n_steps
         for i in range(n_steps):
             base_pos_xy = data["base_pos"][i, :2]            # 2
             base_bearing = data["base_bearing"][i]            # 1
@@ -136,6 +138,7 @@ def assemble_dataset(all_trajectory_data):
             qd_arm = qd_mes[4:11]                             # 7
             ee_pos = data["ee_pos"][i]                         # 3
             target = data["target_ee_pos"][i]                  # 3
+            tau_grav = data["tau_gravity"][i] if has_gravity else np.zeros(7)  # 7
 
             inp = np.concatenate([
                 base_pos_xy,
@@ -148,7 +151,8 @@ def assemble_dataset(all_trajectory_data):
                 qd_arm,
                 ee_pos,
                 target,
-            ])  # 37 features
+                tau_grav,
+            ])  # 44 features
 
             wheel_cmds = data["wheel_cmds"][i]                 # 4
             torque_arm = data["torque_arm"][i]                  # 7
@@ -180,6 +184,7 @@ INPUT_COLS = (
     + [f"qd_arm_{i}" for i in range(1, 8)]
     + ["ee_pos_x", "ee_pos_y", "ee_pos_z"]
     + ["target_x", "target_y", "target_z"]
+    + [f"tau_gravity_{i}" for i in range(1, 8)]
 )
 
 LABEL_COLS = (

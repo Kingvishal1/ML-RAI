@@ -22,8 +22,9 @@ def load_policy(checkpoint_path, device="cpu"):
     """Load model + normalization stats from a checkpoint.
 
     Returns:
-        model, mean, std, chunk_size
+        model, mean, std, chunk_size, label_mean, label_std
         chunk_size defaults to 1 for older checkpoints without it.
+        label_mean/label_std default to 0/1 (no-op) for older checkpoints.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model = build_mlp(ckpt["input_dim"], ckpt["output_dim"],
@@ -35,19 +36,24 @@ def load_policy(checkpoint_path, device="cpu"):
     mean = ckpt["input_mean"]
     std = ckpt["input_std"]
     chunk_size = ckpt.get("chunk_size", 1)
-    return model, mean, std, chunk_size
+    # Backward compat: older checkpoints without label normalization
+    label_mean = ckpt.get("label_mean", np.zeros(ckpt["output_dim"]))
+    label_std = ckpt.get("label_std", np.ones(ckpt["output_dim"]))
+    return model, mean, std, chunk_size, label_mean, label_std
 
 
-def predict(model, mean, std, obs, device="cpu", chunk_size=1):
+def predict(model, mean, std, obs, device="cpu", chunk_size=1,
+            label_mean=None, label_std=None):
     """Run inference on a single observation or batch.
 
     Args:
-        obs: numpy array of shape (37,) or (N, 37)
-        chunk_size: if > 1, reshape output to (K, 11) per sample
+        obs: numpy array of shape (D,) or (N, D)
+        chunk_size: if > 1, reshape output to (K, action_dim) per sample
+        label_mean, label_std: if provided, un-normalize the output
     Returns:
-        chunk_size == 1: numpy array of shape (11,) or (N, 11)
-        chunk_size  > 1 (single obs): numpy array of shape (K, 11)
-        chunk_size  > 1 (batch):      numpy array of shape (N, K, 11)
+        chunk_size == 1: numpy array of shape (action_dim,) or (N, action_dim)
+        chunk_size  > 1 (single obs): numpy array of shape (K, action_dim)
+        chunk_size  > 1 (batch):      numpy array of shape (N, K, action_dim)
     """
     single = obs.ndim == 1
     if single:
@@ -57,6 +63,15 @@ def predict(model, mean, std, obs, device="cpu", chunk_size=1):
     x = torch.tensor(obs_norm, dtype=torch.float32).to(device)
     with torch.no_grad():
         action = model(x).cpu().numpy()
+
+    # Un-normalize labels back to original scale
+    if label_mean is not None and label_std is not None:
+        # action shape is (N, K*action_dim) — tile stats for chunked outputs
+        action_dim = len(label_mean)
+        K = action.shape[1] // action_dim
+        lm = np.tile(label_mean, K)
+        ls = np.tile(label_std, K)
+        action = action * ls + lm
 
     if chunk_size > 1:
         action = action.reshape(action.shape[0], chunk_size, -1)
@@ -78,7 +93,7 @@ def main():
     else:
         device = torch.device("cpu")
 
-    model, mean, std, chunk_size = load_policy(args.checkpoint, device=str(device))
+    model, mean, std, chunk_size, label_mean, label_std = load_policy(args.checkpoint, device=str(device))
     print(f"Loaded policy from {args.checkpoint}  device={device}  chunk_size={chunk_size}")
 
     if args.data:
@@ -90,7 +105,8 @@ def main():
         rng = np.random.RandomState(0)
         idxs = rng.choice(len(inputs), size=min(100, len(inputs)), replace=False)
 
-        preds = predict(model, mean, std, inputs[idxs], device=str(device))
+        preds = predict(model, mean, std, inputs[idxs], device=str(device),
+                        label_mean=label_mean, label_std=label_std)
         abs_err = np.abs(preds - labels[idxs])  # (N, 11)
 
         for i, idx in enumerate(idxs):
@@ -122,7 +138,8 @@ def main():
     else:
         # Demo with a zero observation
         obs = np.zeros(37)
-        action = predict(model, mean, std, obs, device=str(device))
+        action = predict(model, mean, std, obs, device=str(device),
+                         label_mean=label_mean, label_std=label_std)
         print(f"Demo (zero input):")
         print(f"  wheel_cmds: {action[:4].round(4)}")
         print(f"  torque_arm: {action[4:].round(4)}")

@@ -56,6 +56,10 @@ def main():
                         help="Number of future actions to predict per observation (default: 1)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
+    parser.add_argument("--early_stop", type=float, default=0.001,
+                        help="Stop if val loss improvement is below this for --patience epochs (default: 0.005)")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Number of epochs without improvement before early stopping (default: 5)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -93,11 +97,20 @@ def main():
     X_train, y_train, X_val, y_val = split_by_trajectory(inputs, labels, metadata)
     print(f"Train: {X_train.shape[0]}  Val: {X_val.shape[0]}")
 
-    # --- Normalisation (input only) ---
+    # --- Normalisation (input + output) ---
     mean = X_train.mean(axis=0)
     std = X_train.std(axis=0) + 1e-8
     X_train = (X_train - mean) / std
     X_val = (X_val - mean) / std
+
+    # Compute per-action label stats (ACTION_DIM), then tile for chunked labels (K*ACTION_DIM)
+    label_mean_single = y_train[:, :ACTION_DIM].mean(axis=0)
+    label_std_single = y_train[:, :ACTION_DIM].std(axis=0) + 1e-8
+    label_mean = np.tile(label_mean_single, K)
+    label_std = np.tile(label_std_single, K)
+    y_train = (y_train - label_mean) / label_std
+    y_val = (y_val - label_mean) / label_std
+    print(f"Label stats: mean={np.round(label_mean_single, 4)}  std={np.round(label_std_single, 4)}")
 
     # --- Torch datasets ---
     if args.mps and torch.backends.mps.is_available():
@@ -156,6 +169,7 @@ def main():
 
     # --- Training ---
     best_val = float("inf")
+    epochs_without_improvement = 0
     t_start = _time.time()
     for epoch in range(1, args.epochs + 1):
         # Train
@@ -171,7 +185,7 @@ def main():
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_ds)
 
-        # Val — collect per-component errors
+        # Val — collect per-component errors (reported in original scale)
         model.eval()
         val_loss = 0.0
         val_se_wheel = 0.0
@@ -183,12 +197,13 @@ def main():
                 pred = model(xb)
                 bs = xb.size(0)
                 val_loss += criterion(pred, yb).item() * bs
-                err = (pred - yb).cpu().numpy()
+                # Un-scale error to original units for interpretable metrics
+                err_orig = (pred - yb).cpu().numpy() * label_std
                 if len(wheel_cols) > 0:
-                    val_se_wheel += (err[:, wheel_cols] ** 2).sum()
+                    val_se_wheel += (err_orig[:, wheel_cols] ** 2).sum()
                 for j in range(n_torque):
                     cols_j = np.array([k * ACTION_DIM + torque_offset + j for k in range(K)])
-                    val_se_torque[j] += (err[:, cols_j] ** 2).sum()
+                    val_se_torque[j] += (err_orig[:, cols_j] ** 2).sum()
 
         val_loss /= n_val
         val_mse_wheel = val_se_wheel / (n_val * K) if len(wheel_cols) > 0 else 0.0
@@ -196,6 +211,8 @@ def main():
         val_mse_torque_avg = val_mse_torque.mean() if n_torque > 0 else 0.0
 
         tag = ""
+        if val_loss < best_val - args.early_stop:
+            epochs_without_improvement = 0
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch
@@ -204,6 +221,8 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "input_mean": mean,
                 "input_std": std,
+                "label_mean": label_mean_single,
+                "label_std": label_std_single,
                 "input_dim": inputs.shape[1],
                 "output_dim": labels.shape[1],
                 "hidden_dim": args.hidden_dim,
@@ -238,6 +257,13 @@ def main():
                   f"train={train_loss:.6f}  val={val_loss:.6f}  "
                   f"torque_avg={val_mse_torque_avg:.6f}{tag}")
             print(f"         torque: {arm_str}")
+
+        # Early stopping
+        if val_loss >= best_val - args.early_stop:
+            epochs_without_improvement += 1
+        if epochs_without_improvement >= args.patience:
+            print(f"\nEarly stopping: no improvement > {args.early_stop} for {args.patience} epochs")
+            break
 
     total_time = _time.time() - t_start
     total_min = int(total_time // 60)
