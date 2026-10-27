@@ -127,6 +127,12 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     phase = "base" if split_mode else "single"
     phase_switched = False
 
+    # Phase switch tracking: settle detection
+    best_ee_in_base = np.inf
+    steps_since_ee_improved = 0
+    SETTLE_PATIENCE = 500          # steps without EE improvement
+    SETTLE_SPEED_THRESH = 0.05     # m/s base speed to consider "settled"
+
     # Track last known good state for the final report on crash
     ee_pos = init_ee_pos.copy()
     ee_dist_error = np.linalg.norm(target_ee_pos - ee_pos)
@@ -163,15 +169,25 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
 
         # ---- Phase transition check (split mode only) ----
         if phase == "base":
-            base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
             base_speed = np.linalg.norm(base_lin_vel[:2])
-            if base_xy_dist < args.base_threshold:
+            # Track whether EE error is still improving
+            if ee_dist_error < best_ee_in_base - 0.01:
+                best_ee_in_base = ee_dist_error
+                steps_since_ee_improved = 0
+            else:
+                steps_since_ee_improved += 1
+            # Switch when base has settled: EE stopped improving AND base speed is low
+            settled = (steps_since_ee_improved >= SETTLE_PATIENCE
+                       and base_speed < SETTLE_SPEED_THRESH
+                       and current_time > 2.0)
+            if settled:
                 phase = "arm"
                 phase_switched = True
                 action_chunk = None
                 chunk_idx = 0
                 print(f">>> Phase switch: base -> arm at t={current_time:.2f}s  "
-                      f"base_xy_dist={base_xy_dist:.4f}m")
+                      f"ee_err={ee_dist_error:.4f}m  base_speed={base_speed:.4f}m/s  "
+                      f"best_ee_in_base={best_ee_in_base:.4f}m")
 
         # ---- Compute action based on mode/phase ----
         if phase == "single":

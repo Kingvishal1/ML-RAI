@@ -185,30 +185,66 @@ def main():
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_ds)
 
-        # Val — collect per-component errors (reported in original scale)
+        # Val — collect all predictions for detailed metrics (in original scale)
         model.eval()
         val_loss = 0.0
-        val_se_wheel = 0.0
-        val_se_torque = np.zeros(max(n_torque, 1))  # avoid zero-length
+        all_pred_orig = []
+        all_label_orig = []
         n_val = len(val_ds)
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 pred = model(xb)
-                bs = xb.size(0)
-                val_loss += criterion(pred, yb).item() * bs
-                # Un-scale error to original units for interpretable metrics
-                err_orig = (pred - yb).cpu().numpy() * label_std
-                if len(wheel_cols) > 0:
-                    val_se_wheel += (err_orig[:, wheel_cols] ** 2).sum()
-                for j in range(n_torque):
-                    cols_j = np.array([k * ACTION_DIM + torque_offset + j for k in range(K)])
-                    val_se_torque[j] += (err_orig[:, cols_j] ** 2).sum()
+                val_loss += criterion(pred, yb).item() * xb.size(0)
+                # Un-scale to original units
+                all_pred_orig.append(pred.cpu().numpy() * label_std + label_mean)
+                all_label_orig.append(yb.cpu().numpy() * label_std + label_mean)
 
         val_loss /= n_val
+        all_pred_orig = np.concatenate(all_pred_orig)
+        all_label_orig = np.concatenate(all_label_orig)
+        err_orig = all_pred_orig - all_label_orig  # signed error in original scale
+
+        # --- Per-component MSE (existing) ---
+        val_se_wheel = 0.0
+        val_se_torque = np.zeros(max(n_torque, 1))
+        if len(wheel_cols) > 0:
+            val_se_wheel = (err_orig[:, wheel_cols] ** 2).sum()
+        for j in range(n_torque):
+            cols_j = np.array([k * ACTION_DIM + torque_offset + j for k in range(K)])
+            val_se_torque[j] = (err_orig[:, cols_j] ** 2).sum()
         val_mse_wheel = val_se_wheel / (n_val * K) if len(wheel_cols) > 0 else 0.0
         val_mse_torque = val_se_torque[:n_torque] / (n_val * K) if n_torque > 0 else np.array([])
         val_mse_torque_avg = val_mse_torque.mean() if n_torque > 0 else 0.0
+
+        # --- Additional metrics (first action step only for readability) ---
+        pred_a0 = all_pred_orig[:, :ACTION_DIM]
+        label_a0 = all_label_orig[:, :ACTION_DIM]
+        err_a0 = pred_a0 - label_a0
+        abs_err_a0 = np.abs(err_a0)
+
+        mae_per_dim = abs_err_a0.mean(axis=0)
+        max_err_per_dim = abs_err_a0.max(axis=0)
+        p90_per_dim = np.percentile(abs_err_a0, 90, axis=0)
+        p99_per_dim = np.percentile(abs_err_a0, 99, axis=0)
+
+        # Sign accuracy: % of samples where pred and label have the same sign
+        # (only meaningful where label != 0)
+        nonzero_mask = np.abs(label_a0) > 1e-6
+        sign_match = np.sign(pred_a0) == np.sign(label_a0)
+        sign_acc_per_dim = np.array([
+            sign_match[nonzero_mask[:, d], d].mean() * 100 if nonzero_mask[:, d].any() else 100.0
+            for d in range(ACTION_DIM)
+        ])
+
+        # Near-zero accuracy: when expert outputs ~0, does model also output ~0?
+        near_zero_thresh = 0.02
+        expert_near_zero = np.abs(label_a0) < near_zero_thresh
+        pred_near_zero = np.abs(pred_a0) < near_zero_thresh
+        zero_acc_per_dim = np.array([
+            pred_near_zero[expert_near_zero[:, d], d].mean() * 100 if expert_near_zero[:, d].any() else 100.0
+            for d in range(ACTION_DIM)
+        ])
 
         tag = ""
         if val_loss < best_val - args.early_stop:
@@ -248,15 +284,34 @@ def main():
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"         torque: {arm_str}")
         elif mode == "base":
+            dim_names = ["v_cmd", "w_cmd"]
             print(f"Epoch {epoch:4d}/{args.epochs}  "
                   f"train={train_loss:.6f}  val={val_loss:.6f}  "
                   f"wheel={val_mse_wheel:.6f}{tag}")
         elif mode == "arm":
+            dim_names = [f"arm_{i}" for i in range(1, ACTION_DIM + 1)]
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"Epoch {epoch:4d}/{args.epochs}  "
                   f"train={train_loss:.6f}  val={val_loss:.6f}  "
                   f"torque_avg={val_mse_torque_avg:.6f}{tag}")
             print(f"         torque: {arm_str}")
+
+        # Detailed metrics (every 5 epochs or on save)
+        if epoch % 5 == 0 or tag:
+            if mode in ("base", "arm"):
+                names = dim_names
+            else:
+                names = [f"w{i}" for i in range(1, 5)] + [f"a{i}" for i in range(1, 8)]
+            mae_s = "  ".join(f"{names[d]}={mae_per_dim[d]:.4f}" for d in range(ACTION_DIM))
+            max_s = "  ".join(f"{names[d]}={max_err_per_dim[d]:.4f}" for d in range(ACTION_DIM))
+            p90_s = "  ".join(f"{names[d]}={p90_per_dim[d]:.4f}" for d in range(ACTION_DIM))
+            sign_s = "  ".join(f"{names[d]}={sign_acc_per_dim[d]:.1f}%" for d in range(ACTION_DIM))
+            zero_s = "  ".join(f"{names[d]}={zero_acc_per_dim[d]:.1f}%" for d in range(ACTION_DIM))
+            print(f"         MAE:      {mae_s}")
+            print(f"         max_err:  {max_s}")
+            print(f"         p90:      {p90_s}")
+            print(f"         sign_acc: {sign_s}")
+            print(f"         zero_acc: {zero_s}")
 
         # Early stopping
         if val_loss >= best_val - args.early_stop:

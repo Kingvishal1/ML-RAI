@@ -33,8 +33,8 @@ def generate_grid_targets(n=100):
     Grid dimensions scale automatically so that nx * ny * nz >= n.
     """
     points_per_axis = int(np.ceil(n ** (1.0 / 3.0)))
-    xs = np.linspace(-0.8, 0.8, points_per_axis)
-    ys = np.linspace(0.5, 1.5, points_per_axis)
+    xs = np.linspace(-5, 5, points_per_axis)
+    ys = np.linspace(-5, 5, points_per_axis)
     zs = np.linspace(0.2, 1.0, points_per_axis)
     targets = []
     for x in xs:
@@ -264,6 +264,53 @@ def save_dataset(inputs, labels, metadata, out_dir):
 
 
 # ==============================================================================
+# Worker for parallel collection
+# ==============================================================================
+
+def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir):
+    """Run a batch of trajectories in an independent sim instance.
+
+    Returns list of chunk file paths written to disk.
+    """
+    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
+        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+    rng = np.random.default_rng(seed + worker_id) if vary_init else None
+
+    all_data = []
+    chunk_paths = []
+    chunk_idx = 0
+    for idx, target in enumerate(targets):
+        print(f"  [W{worker_id}] [{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
+        data = run_single_trajectory(
+            sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles, lower_limits, upper_limits,
+            target_ee_pos=target, vary_init=vary_init, rng=rng,
+        )
+        if data is not None and len(data["time"]) > 0:
+            all_data.append(data)
+            print(f"  [W{worker_id}]   Steps: {len(data['time'])}  Final EE error: "
+                  f"{np.linalg.norm(target - data['final_ee_pos']):.4f}m")
+        else:
+            print(f"  [W{worker_id}]   [SKIP] No data for target {target}")
+
+        if len(all_data) >= flush_every:
+            path = flush_chunk(all_data, out_dir, chunk_idx * 100 + worker_id)
+            if path:
+                chunk_paths.append(path)
+                chunk_idx += 1
+            all_data = []
+
+    if all_data:
+        path = flush_chunk(all_data, out_dir, chunk_idx * 100 + worker_id)
+        if path:
+            chunk_paths.append(path)
+
+    return chunk_paths
+
+
+# ==============================================================================
 # CLI
 # ==============================================================================
 
@@ -282,6 +329,8 @@ def main():
     parser.add_argument("--out_dir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
                         help="Output directory (default: final/robotnik_arm_task/data/)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel sim workers (default: 1)")
     args = parser.parse_args()
 
     # Generate targets
@@ -290,47 +339,69 @@ def main():
     else:
         targets = generate_random_targets(n=args.num_targets, seed=args.seed)
 
-    print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init})")
+    print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init}, "
+          f"workers={args.workers})")
 
-    # Setup simulation once
-    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
-    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
-        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+    if args.workers <= 1:
+        # Single-process mode (original behavior)
+        sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+        dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
+            lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
 
-    rng = np.random.default_rng(args.seed) if args.vary_init else None
+        rng = np.random.default_rng(args.seed) if args.vary_init else None
 
-    # Run trajectories, flushing to disk periodically
-    all_data = []
-    chunk_paths = []
-    chunk_idx = 0
-    for idx, target in enumerate(targets):
-        print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
-        data = run_single_trajectory(
-            sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
-            init_joint_angles, lower_limits, upper_limits,
-            target_ee_pos=target, vary_init=args.vary_init, rng=rng,
-        )
-        if data is not None and len(data["time"]) > 0:
-            all_data.append(data)
-            print(f"  Steps: {len(data['time'])}  Final EE error: "
-                  f"{np.linalg.norm(target - data['final_ee_pos']):.4f}m")
-        else:
-            print(f"  [SKIP] No data collected for target {target}")
+        all_data = []
+        chunk_paths = []
+        chunk_idx = 0
+        for idx, target in enumerate(targets):
+            print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
+            data = run_single_trajectory(
+                sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
+                init_joint_angles, lower_limits, upper_limits,
+                target_ee_pos=target, vary_init=args.vary_init, rng=rng,
+            )
+            if data is not None and len(data["time"]) > 0:
+                all_data.append(data)
+                print(f"  Steps: {len(data['time'])}  Final EE error: "
+                      f"{np.linalg.norm(target - data['final_ee_pos']):.4f}m")
+            else:
+                print(f"  [SKIP] No data collected for target {target}")
 
-        # Flush to disk every flush_every successful trajectories
-        if len(all_data) >= args.flush_every:
+            if len(all_data) >= args.flush_every:
+                path = flush_chunk(all_data, args.out_dir, chunk_idx)
+                if path:
+                    chunk_paths.append(path)
+                    chunk_idx += 1
+                all_data = []
+
+        if all_data:
             path = flush_chunk(all_data, args.out_dir, chunk_idx)
             if path:
                 chunk_paths.append(path)
-                chunk_idx += 1
-            all_data = []  # free memory
+            all_data = []
+    else:
+        # Parallel mode: split targets across workers
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    # Flush any remaining trajectories
-    if all_data:
-        path = flush_chunk(all_data, args.out_dir, chunk_idx)
-        if path:
-            chunk_paths.append(path)
-        all_data = []
+        splits = np.array_split(targets, args.workers)
+        chunk_paths = []
+
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(
+                    _worker_collect, wid, list(map(np.array, split)),
+                    args.vary_init, args.seed, args.flush_every, args.out_dir
+                ): wid
+                for wid, split in enumerate(splits) if len(split) > 0
+            }
+            for future in as_completed(futures):
+                wid = futures[future]
+                try:
+                    paths = future.result()
+                    chunk_paths.extend(paths)
+                    print(f"Worker {wid} done: {len(paths)} chunks")
+                except Exception as e:
+                    print(f"Worker {wid} failed: {e}")
 
     if not chunk_paths:
         print("No trajectories collected. Exiting.")
