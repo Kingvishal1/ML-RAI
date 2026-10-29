@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Train a behaviour-cloning MLP regressor on expert trajectory data."""
+"""Train a behaviour-cloning MLP regressor on expert trajectory data.
+
+Data loading, the train/val split, normalisation and checkpoint saving live
+here; the training loop itself is the shared "mlp" regressor in regressors.py.
+"""
 
 import argparse
 import glob
@@ -9,19 +13,9 @@ import time as _time
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
 
-
-def build_mlp(input_dim, output_dim, hidden_dim, num_layers):
-    layers = []
-    prev = input_dim
-    for _ in range(num_layers):
-        layers.append(nn.Linear(prev, hidden_dim))
-        layers.append(nn.ReLU())
-        prev = hidden_dim
-    layers.append(nn.Linear(prev, output_dim))
-    return nn.Sequential(*layers)
+from activations import ACTIVATIONS, DEFAULT_ACTIVATION
+from regressors import build_mlp, get_regressor  # noqa: F401  (build_mlp re-exported)
 
 
 def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
@@ -42,11 +36,20 @@ def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
 def main():
     parser = argparse.ArgumentParser(description="Train BC regressor")
     parser.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
+    # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
+                        help=f"Hidden-layer activation function (default: {DEFAULT_ACTIVATION})")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="AdamW weight decay (default: 0)")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm, 0 to disable (default: 1.0)")
+    parser.add_argument("--wheel_weight", type=float, default=0.5,
+                        help="Loss weight of wheel outputs vs arm outputs in full mode (default: 0.5)")
     parser.add_argument("--out", type=str, default=None,
                         help="Checkpoint save path (default: auto-generated from params)")
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
@@ -54,10 +57,10 @@ def main():
                         help="DataLoader worker processes for parallel data loading (default: 0)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
-    parser.add_argument("--early_stop", type=float, default=0.001,
-                        help="Stop if val loss improvement is below this for --patience epochs (default: 0.005)")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Number of epochs without improvement before early stopping (default: 5)")
+    parser.add_argument("--early_stop", type=float, default=0.0,
+                        help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Number of epochs without improvement before early stopping (default: 20)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -86,28 +89,17 @@ def main():
     y_val = (y_val - label_mean) / label_std
     print(f"Label stats: mean={np.round(label_mean, 4)}  std={np.round(label_std, 4)}")
 
-    # --- Torch datasets ---
+    # --- Device ---
     if args.mps and torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
-                             torch.tensor(y_train, dtype=torch.float32))
-    val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
-                           torch.tensor(y_val, dtype=torch.float32))
-    loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers,
-                         pin_memory=(device.type != "cpu"), persistent_workers=(args.num_workers > 0))
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, **loader_kwargs)
-
-    # --- Model ---
-    model = build_mlp(inputs.shape[1], labels.shape[1],
-                      args.hidden_dim, args.num_layers).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-    print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
+    n_params = sum(p.numel() for p in build_mlp(inputs.shape[1], labels.shape[1],
+                                                 args.hidden_dim, args.num_layers).parameters())
+    print(f"Model: {n_params} params  activation={args.activation}  device={device}")
+    y_val_orig = y_val * label_std + label_mean  # labels in original units, for metrics
 
     # --- Label slices depend on mode ---
     mode = args.mode
@@ -125,6 +117,11 @@ def main():
         torque_offset = 0
     arm_names = [f"arm_{i}" for i in range(1, n_torque + 1)]
 
+    # Per-output loss weights: wheel outputs scaled by --wheel_weight (only matters in full mode)
+    loss_weights = np.ones(labels.shape[1])
+    if mode == "full":
+        loss_weights[wheel_cols] = args.wheel_weight
+
     # --- Checkpoint path (fixed once at start) ---
     if args.out:
         save_path = args.out
@@ -134,46 +131,18 @@ def main():
         counters = [int(m.group(1)) for f in existing
                     if (m := re.match(r"^(\d+)_", f))]
         next_id = max(counters, default=0) + 1
-        save_path = (f"{next_id:03d}_bc_{mode}_e{args.epochs}_h{args.hidden_dim}"
+        save_path = (f"{next_id:03d}_bc_{mode}_{args.activation}_e{args.epochs}_h{args.hidden_dim}"
                      f"_l{args.num_layers}.pt")
     print(f"Checkpoint: {save_path}")
 
-    # --- Training ---
-    best_val = float("inf")
-    epochs_without_improvement = 0
+    # --- Per-epoch reporting and checkpointing (called by the trainer after each epoch) ---
     t_start = _time.time()
-    for epoch in range(1, args.epochs + 1):
-        # Train
-        model.train()
-        train_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_ds)
 
-        # Val — collect all predictions for detailed metrics (in original scale)
-        model.eval()
-        val_loss = 0.0
-        all_pred_orig = []
-        all_label_orig = []
-        n_val = len(val_ds)
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                pred = model(xb)
-                val_loss += criterion(pred, yb).item() * xb.size(0)
-                # Un-scale to original units
-                all_pred_orig.append(pred.cpu().numpy() * label_std + label_mean)
-                all_label_orig.append(yb.cpu().numpy() * label_std + label_mean)
-
-        val_loss /= n_val
-        all_pred_orig = np.concatenate(all_pred_orig)
-        all_label_orig = np.concatenate(all_label_orig)
+    def on_epoch(epoch, train_loss, val_loss, val_pred, improved, model):
+        # Un-scale to original units
+        all_pred_orig = val_pred * label_std + label_mean
+        all_label_orig = y_val_orig
+        n_val = len(all_label_orig)
         err_orig = all_pred_orig - all_label_orig  # signed error in original scale
 
         # --- Per-component MSE ---
@@ -213,15 +182,12 @@ def main():
             for d in range(ACTION_DIM)
         ])
 
+        # Save a checkpoint whenever validation reaches a new best
         tag = ""
-        if val_loss < best_val - args.early_stop:
-            epochs_without_improvement = 0
-        if val_loss < best_val:
-            best_val = val_loss
-            best_epoch = epoch
+        if improved:
             elapsed = _time.time() - t_start
             torch.save({
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
                 "input_mean": mean,
                 "input_std": std,
                 "label_mean": label_mean,
@@ -230,11 +196,17 @@ def main():
                 "output_dim": labels.shape[1],
                 "hidden_dim": args.hidden_dim,
                 "num_layers": args.num_layers,
+                "activation": args.activation,
                 "epochs": args.epochs,
-                "best_epoch": best_epoch,
-                "best_val_loss": best_val,
+                "best_epoch": epoch,
+                "best_val_loss": val_loss,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "optimizer": "AdamW",
+                "weight_decay": args.weight_decay,
+                "train_loss": "MAE",
+                "grad_clip": args.grad_clip,
+                "wheel_weight": args.wheel_weight if mode == "full" else None,
                 "num_workers": args.num_workers,
                 "device": str(device),
                 "elapsed_sec": elapsed,
@@ -246,20 +218,20 @@ def main():
         # Summary line
         if mode == "full":
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"wheel={val_mse_wheel:.6f}  torque_avg={val_mse_torque_avg:.6f}{tag}")
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"         torque: {arm_str}")
         elif mode == "base":
             dim_names = ["v_cmd", "w_cmd"]
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"wheel={val_mse_wheel:.6f}{tag}")
         elif mode == "arm":
             dim_names = [f"arm_{i}" for i in range(1, ACTION_DIM + 1)]
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"torque_avg={val_mse_torque_avg:.6f}{tag}")
             print(f"         torque: {arm_str}")
 
@@ -280,19 +252,31 @@ def main():
             print(f"         sign_acc: {sign_s}")
             print(f"         zero_acc: {zero_s}")
 
-        # Early stopping
-        if val_loss >= best_val - args.early_stop:
-            epochs_without_improvement += 1
-        if epochs_without_improvement >= args.patience:
-            print(f"\nEarly stopping: no improvement > {args.early_stop} for {args.patience} epochs")
-            break
+    # --- Training (shared MLP trainer in regressors.py) ---
+    metrics = get_regressor("mlp")().fit(
+        X_train, y_train, X_val, y_val,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        activation=args.activation,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        loss_weights=loss_weights,
+        early_stop=args.early_stop,
+        patience=args.patience,
+        num_workers=args.num_workers,
+        device=device,
+        on_epoch=on_epoch,
+    )
 
     total_time = _time.time() - t_start
     total_min = int(total_time // 60)
     final_path = save_path.replace(".pt", f"_{total_min}min.pt")
     if os.path.exists(save_path):
         os.rename(save_path, final_path)
-    print(f"\nBest val loss: {best_val:.6f} at epoch {best_epoch}")
+    print(f"\nBest val loss: {metrics['val_mse']:.6f} at epoch {metrics['best_epoch']}")
     print(f"Total time: {total_time/60:.1f}min  Checkpoint: {final_path}")
 
 

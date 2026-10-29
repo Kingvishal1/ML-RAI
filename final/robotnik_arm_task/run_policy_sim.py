@@ -29,6 +29,7 @@ from robotnik_arm_control import (
     ArmControllerParams, arm_controller, configure_gripper_fingers, quaternion2bearing,
 )
 from run_policy import load_policy, predict
+from activations import LEGACY_ACTIVATION, get_activation
 
 
 def load_gravity_comp(path, device="cpu"):
@@ -36,11 +37,12 @@ def load_gravity_comp(path, device="cpu"):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     hidden_dim = ckpt["hidden_dim"]
     num_layers = ckpt["num_layers"]
+    activation = ckpt.get("activation", LEGACY_ACTIVATION)
     layers = []
     prev = 7
     for _ in range(num_layers):
         layers.append(nn.Linear(prev, hidden_dim))
-        layers.append(nn.ReLU())
+        layers.append(get_activation(activation))
         prev = hidden_dim
     layers.append(nn.Linear(prev, 7))
     model = nn.Sequential(*layers)

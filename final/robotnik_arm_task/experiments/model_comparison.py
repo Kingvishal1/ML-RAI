@@ -29,6 +29,7 @@ if PROJECT_DIR not in sys.path:
 
 from train_regressor import split_by_trajectory
 from regressors import get_regressor, available_regressors
+from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +158,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
+                        help=f"Hidden-layer activation for mlp/transformer (default: {DEFAULT_ACTIVATION})")
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--early_stop", type=float, default=0.001)
@@ -240,6 +243,7 @@ def main():
         lr=args.lr,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        activation=args.activation,
         early_stop=args.early_stop,
         patience=args.patience,
         num_workers=args.num_workers,

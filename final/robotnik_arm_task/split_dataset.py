@@ -22,6 +22,8 @@ import sys
 
 import numpy as np
 
+from activations import ACTIVATIONS, DEFAULT_ACTIVATION
+
 
 # Full 44-dim input layout:
 #  0,1       base_pos_x, base_pos_y
@@ -69,14 +71,16 @@ def main():
                         help="Output directory (default: same as input)")
     parser.add_argument("--train", action="store_true",
                         help="Train base and arm policies after splitting")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Training epochs (used with --train, default: 50)")
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="Training epochs (used with --train, default: 100)")
     parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Hidden layer size (used with --train, default: 512)")
-    parser.add_argument("--num_layers", type=int, default=4,
-                        help="Number of hidden layers (used with --train, default: 4)")
-    parser.add_argument("--batch_size", type=int, default=4096,
-                        help="Batch size (used with --train, default: 4096)")
+    parser.add_argument("--num_layers", type=int, default=3,
+                        help="Number of hidden layers (used with --train, default: 3)")
+    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
+                        help=f"Hidden-layer activation (used with --train, default: {DEFAULT_ACTIVATION})")
+    parser.add_argument("--batch_size", type=int, default=256,
+                        help="Batch size (used with --train, default: 256)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate (used with --train, default: 1e-3)")
     parser.add_argument("--num_workers", type=int, default=0,
@@ -200,6 +204,7 @@ def main():
         "--epochs", str(args.epochs),
         "--hidden_dim", str(args.hidden_dim),
         "--num_layers", str(args.num_layers),
+        "--activation", args.activation,
         "--batch_size", str(args.batch_size),
         "--lr", str(args.lr),
         "--num_workers", str(args.num_workers),

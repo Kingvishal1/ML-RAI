@@ -5,20 +5,8 @@ import argparse
 
 import numpy as np
 import torch
-import torch.nn as nn
 
-from regressors import load_model_from_checkpoint, SklearnModelWrapper  # noqa: F401
-
-
-def build_mlp(input_dim, output_dim, hidden_dim, num_layers):
-    layers = []
-    prev = input_dim
-    for _ in range(num_layers):
-        layers.append(nn.Linear(prev, hidden_dim))
-        layers.append(nn.ReLU())
-        prev = hidden_dim
-    layers.append(nn.Linear(prev, output_dim))
-    return nn.Sequential(*layers)
+from regressors import load_model_from_checkpoint, SklearnModelWrapper, build_mlp  # noqa: F401
 
 
 def load_policy(checkpoint_path, device="cpu"):

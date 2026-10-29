@@ -21,7 +21,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
-from train_regressor import build_mlp
+from activations import DEFAULT_ACTIVATION, LEGACY_ACTIVATION, get_activation
+
+
+def build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation=DEFAULT_ACTIVATION):
+    layers = []
+    prev = input_dim
+    for _ in range(num_layers):
+        layers.append(nn.Linear(prev, hidden_dim))
+        layers.append(get_activation(activation))
+        prev = hidden_dim
+    layers.append(nn.Linear(prev, output_dim))
+    return nn.Sequential(*layers)
 
 
 # ---------------------------------------------------------------------------
@@ -116,30 +127,47 @@ class MLPRegressor(BaseRegressor):
     @classmethod
     def load_model(cls, ckpt, device):
         model = build_mlp(ckpt["input_dim"], ckpt["output_dim"],
-                          ckpt["hidden_dim"], ckpt["num_layers"])
+                          ckpt["hidden_dim"], ckpt["num_layers"],
+                          ckpt.get("activation", LEGACY_ACTIVATION))
         model.load_state_dict(ckpt["model_state_dict"])
         model.to(device)
         model.eval()
         return model
 
     def fit(self, X_train, y_train, X_val, y_val, **kwargs):
+        """Train on MAE (L1), keep the checkpoint with the best validation MSE.
+
+        Defaults follow the selected settings of the 618-run hyperparameter study.
+        Optional kwargs:
+          loss_weights: per-output weights for the training loss (default: all 1)
+          on_epoch:     callback(epoch, train_loss, val_loss, val_pred, improved, model)
+                        called after every epoch; val_pred is in normalised units
+        """
         epochs = kwargs.get("epochs", 100)
-        batch_size = kwargs.get("batch_size", 4096)
+        batch_size = kwargs.get("batch_size", 256)
         lr = kwargs.get("lr", 1e-3)
         hidden_dim = kwargs.get("hidden_dim", 512)
-        num_layers = kwargs.get("num_layers", 4)
-        early_stop = kwargs.get("early_stop", 0.001)
-        patience = kwargs.get("patience", 5)
+        num_layers = kwargs.get("num_layers", 3)
+        activation = kwargs.get("activation", DEFAULT_ACTIVATION)
+        weight_decay = kwargs.get("weight_decay", 0.0)
+        grad_clip = kwargs.get("grad_clip", 1.0)
+        loss_weights = kwargs.get("loss_weights", None)
+        early_stop = kwargs.get("early_stop", 0.0)
+        patience = kwargs.get("patience", 20)
         num_workers = kwargs.get("num_workers", 0)
         device_name = kwargs.get("device", "cpu")
+        on_epoch = kwargs.get("on_epoch", None)
 
         device = torch.device(device_name)
         input_dim = X_train.shape[1]
         output_dim = y_train.shape[1]
 
-        model = build_mlp(input_dim, output_dim, hidden_dim, num_layers).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        model = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.MSELoss()
+        if loss_weights is None:
+            loss_weights = np.ones(output_dim)
+        loss_weights = torch.tensor(loss_weights, dtype=torch.float32, device=device)
 
         train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                  torch.tensor(y_train, dtype=torch.float32))
@@ -158,39 +186,52 @@ class MLPRegressor(BaseRegressor):
         t_start = _time.time()
 
         for epoch in range(1, epochs + 1):
+            # Train: weighted MAE, gradient clipping
             model.train()
+            train_loss = 0.0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 pred = model(xb)
-                loss = criterion(pred, yb)
+                loss = ((pred - yb).abs() * loss_weights).mean()
                 optimizer.zero_grad()
                 loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                train_loss += loss.item() * xb.size(0)
+            train_loss /= len(train_ds)
 
-            # Validation
+            # Validation: MSE
             model.eval()
             val_loss = 0.0
+            val_pred = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb, yb = xb.to(device), yb.to(device)
-                    val_loss += criterion(model(xb), yb).item() * xb.size(0)
+                    pred = model(xb)
+                    val_loss += criterion(pred, yb).item() * xb.size(0)
+                    if on_epoch is not None:
+                        val_pred.append(pred.cpu().numpy())
             val_loss /= len(val_ds)
 
             if val_loss < best_val - early_stop:
                 epochs_without_improvement = 0
-            if val_loss < best_val:
+            else:
+                epochs_without_improvement += 1
+            improved = val_loss < best_val
+            if improved:
                 best_val = val_loss
                 best_epoch = epoch
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-            if val_loss >= best_val - early_stop:
-                epochs_without_improvement += 1
-            if epochs_without_improvement >= patience:
-                print(f"  [mlp] Early stop at epoch {epoch}")
-                break
-
-            if epoch % max(1, epochs // 5) == 0 or epoch == 1:
+            if on_epoch is not None:
+                on_epoch(epoch, train_loss, val_loss, np.concatenate(val_pred), improved, model)
+            elif epoch % max(1, epochs // 5) == 0 or epoch == 1:
                 print(f"  [mlp] epoch {epoch}/{epochs}  val_loss={val_loss:.6f}  best={best_val:.6f}")
+
+            if epochs_without_improvement >= patience:
+                print(f"\nEarly stopping: no improvement > {early_stop} for {patience} epochs")
+                break
 
         elapsed = _time.time() - t_start
 
@@ -219,6 +260,7 @@ class MLPRegressor(BaseRegressor):
         self._best_state = best_state
         self._hidden_dim = hidden_dim
         self._num_layers = num_layers
+        self._activation = activation
         self._input_dim = input_dim
         self._output_dim = output_dim
         self._best_val = best_val
@@ -236,6 +278,7 @@ class MLPRegressor(BaseRegressor):
             "output_dim": self._output_dim,
             "hidden_dim": self._hidden_dim,
             "num_layers": self._num_layers,
+            "activation": self._activation,
             "best_val_loss": self._best_val,
             "best_epoch": self._best_epoch,
             "elapsed_sec": self._elapsed,
@@ -254,12 +297,14 @@ class TransformerModel(nn.Module):
     """
 
     def __init__(self, input_dim, output_dim, d_model=512, nhead=8,
-                 num_layers=4, dim_feedforward=2048):
+                 num_layers=4, dim_feedforward=2048, activation=DEFAULT_ACTIVATION):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
+        # PyTorch's fast path only recognises relu/gelu when given by name
+        act = activation if activation in ("relu", "gelu") else get_activation(activation)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            batch_first=True, dropout=0.1)
+            batch_first=True, dropout=0.1, activation=act)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(d_model, output_dim)
 
@@ -284,6 +329,7 @@ class TransformerRegressor(BaseRegressor):
             nhead=ckpt["nhead"],
             num_layers=ckpt["num_layers"],
             dim_feedforward=ckpt["dim_feedforward"],
+            activation=ckpt.get("activation", LEGACY_ACTIVATION),
         )
         model.load_state_dict(ckpt["model_state_dict"])
         model.to(device)
@@ -298,6 +344,7 @@ class TransformerRegressor(BaseRegressor):
         nhead = kwargs.get("nhead", 8)
         num_layers = kwargs.get("num_layers", 4)
         dim_feedforward = kwargs.get("dim_feedforward", hidden_dim * 4)
+        activation = kwargs.get("activation", DEFAULT_ACTIVATION)
         early_stop = kwargs.get("early_stop", 0.001)
         patience = kwargs.get("patience", 5)
         num_workers = kwargs.get("num_workers", 0)
@@ -311,6 +358,7 @@ class TransformerRegressor(BaseRegressor):
             input_dim, output_dim,
             d_model=hidden_dim, nhead=nhead,
             num_layers=num_layers, dim_feedforward=dim_feedforward,
+            activation=activation,
         ).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
@@ -395,6 +443,7 @@ class TransformerRegressor(BaseRegressor):
         self._nhead = nhead
         self._num_layers = num_layers
         self._dim_feedforward = dim_feedforward
+        self._activation = activation
         self._input_dim = input_dim
         self._output_dim = output_dim
         self._best_val = best_val
@@ -414,6 +463,7 @@ class TransformerRegressor(BaseRegressor):
             "nhead": self._nhead,
             "num_layers": self._num_layers,
             "dim_feedforward": self._dim_feedforward,
+            "activation": self._activation,
             "best_val_loss": self._best_val,
             "best_epoch": self._best_epoch,
             "elapsed_sec": self._elapsed,

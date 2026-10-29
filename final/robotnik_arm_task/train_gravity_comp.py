@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
+from activations import ACTIVATIONS, DEFAULT_ACTIVATION, get_activation
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train gravity compensation network")
@@ -25,6 +27,8 @@ def main():
                         help="Output checkpoint path")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
+                        help=f"Hidden-layer activation function (default: {DEFAULT_ACTIVATION})")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -90,7 +94,7 @@ def main():
     prev = 7
     for _ in range(args.num_layers):
         layers.append(nn.Linear(prev, args.hidden_dim))
-        layers.append(nn.ReLU())
+        layers.append(get_activation(args.activation))
         prev = args.hidden_dim
     layers.append(nn.Linear(prev, 7))
     model = nn.Sequential(*layers).to(device)
@@ -169,6 +173,7 @@ def main():
         "tau_std": tau_std,
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
+        "activation": args.activation,
         "best_val_loss": best_val,
         "elapsed_sec": elapsed,
     }, args.out)
