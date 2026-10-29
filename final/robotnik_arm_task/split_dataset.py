@@ -5,8 +5,8 @@ Phase detection uses the wheel command norm:
   - Base phase: norm(wheel_cmds) > 0.05  (wheels active)
   - Arm phase:  norm(wheel_cmds) < 0.05  (wheels stopped)
 
-Base dataset (14 inputs -> 2 outputs):
-  Inputs:  base_pos_xy(2), bearing(1), lin_vel(3), ang_vel(3), target_xyz(3),
+Base dataset (12 inputs -> 2 outputs):
+  Inputs:  base_pos_xy(2), bearing(1), lin_vel_xy(2), ang_vel(3), target_xy(2),
            dist_to_target(1), heading_error(1)
   Labels:  v_cmd(1), w_cmd(1)  — linear/angular velocity from wheel inverse kinematics
 
@@ -36,10 +36,24 @@ import numpy as np
 #  34,35,36  target_x/y/z
 #  37..43    tau_gravity_1..7
 
-BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 34, 35, 36]      # 12 raw dims + 2 computed
+BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 6, 7, 8, 34, 35]             # 10 raw dims + 2 computed
+
+BASE_FEATURE_NAMES = [
+    "base_pos_x", "base_pos_y", "base_bearing",
+    "base_lin_vel_x", "base_lin_vel_y",
+    "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
+    "target_x", "target_y",
+    "dist_to_target", "heading_error",
+]
+
+ARM_FEATURE_NAMES = (
+    [f"q_arm_{i}" for i in range(1, 8)]
+    + [f"qd_arm_{i}" for i in range(1, 8)]
+    + ["ee_pos_x", "ee_pos_y", "ee_pos_z"]
+    + ["target_x", "target_y", "target_z"]
+)
 ARM_INPUT_INDICES = list(range(17, 24)) + list(range(24, 31)) + \
-                    [31, 32, 33, 34, 35, 36] + \
-                    list(range(37, 44))                              # 27 dims
+                    [31, 32, 33, 34, 35, 36]                        # 20 dims
 
 # Full 11-dim label layout:  wheel_cmds(0:4), torque_arm(4:11)
 # Wheel kinematic constants (from BaseControllerParams)
@@ -65,12 +79,14 @@ def main():
                         help="Batch size (used with --train, default: 4096)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate (used with --train, default: 1e-3)")
-    parser.add_argument("--chunk_size", type=int, default=1,
-                        help="Action chunk size (used with --train, default: 1)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers (used with --train, default: 0)")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal GPU (used with --train)")
+    parser.add_argument("--drop_base", type=str, nargs="*", default=[],
+                        help="Base features to drop (e.g. --drop_base dist_to_target heading_error)")
+    parser.add_argument("--drop_arm", type=str, nargs="*", default=[],
+                        help="Arm features to drop (e.g. --drop_arm tau_gravity_1 tau_gravity_2)")
     parser.add_argument("--early_stop", type=float, default=0.005,
                         help="Val loss improvement threshold (used with --train, default: 0.005)")
     parser.add_argument("--patience", type=int, default=5,
@@ -112,6 +128,24 @@ def main():
     heading_error = np.arctan2(np.sin(heading_to_target - bearing),
                                np.cos(heading_to_target - bearing))[:, None]  # (N, 1) wrapped
     base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 14)
+    base_names = list(BASE_FEATURE_NAMES)
+
+    # Drop requested base features
+    if args.drop_base:
+        drop_idxs = []
+        for name in args.drop_base:
+            if name in base_names:
+                drop_idxs.append(base_names.index(name))
+            else:
+                print(f"WARNING: unknown base feature '{name}', skipping. "
+                      f"Available: {base_names}")
+        if drop_idxs:
+            keep = [i for i in range(base_inputs.shape[1]) if i not in drop_idxs]
+            dropped = [base_names[i] for i in drop_idxs]
+            base_inputs = base_inputs[:, keep]
+            base_names = [base_names[i] for i in keep]
+            print(f"Dropped base features: {dropped}  → {base_inputs.shape[1]} dims")
+
     # Convert wheel cmds [rw, lw, lw, rw] -> [v_cmd, w_cmd]
     wheel_raw = labels[base_mask][:, :4]                  # (N, 4)
     rw = wheel_raw[:, 0]     # front_right == back_right
@@ -121,16 +155,41 @@ def main():
     base_labels = np.column_stack([v_cmd, w_cmd])         # (N, 2)
     base_metadata = metadata[base_mask]
     base_path = os.path.join(out_dir, "dataset_base.npz")
-    np.savez(base_path, inputs=base_inputs, labels=base_labels, metadata=base_metadata)
+    np.savez(base_path, inputs=base_inputs, labels=base_labels, metadata=base_metadata,
+             feature_names=np.array(base_names))
     print(f"Saved base dataset: {base_path}  inputs={base_inputs.shape}  labels={base_labels.shape}")
+    print(f"  Features: {base_names}")
 
-    # Arm dataset: 20 inputs -> 7 outputs (torque arm only)
+    # Arm dataset: 27 inputs -> 7 outputs (torque arm only)
     arm_inputs = inputs[arm_mask][:, ARM_INPUT_INDICES]
-    arm_labels = labels[arm_mask][:, 4:]
+    arm_names = list(ARM_FEATURE_NAMES)
+
+    # Drop requested arm features
+    if args.drop_arm:
+        drop_idxs = []
+        for name in args.drop_arm:
+            if name in arm_names:
+                drop_idxs.append(arm_names.index(name))
+            else:
+                print(f"WARNING: unknown arm feature '{name}', skipping. "
+                      f"Available: {arm_names}")
+        if drop_idxs:
+            keep = [i for i in range(arm_inputs.shape[1]) if i not in drop_idxs]
+            dropped = [arm_names[i] for i in drop_idxs]
+            arm_inputs = arm_inputs[:, keep]
+            arm_names = [arm_names[i] for i in keep]
+            print(f"Dropped arm features: {dropped}  → {arm_inputs.shape[1]} dims")
+
+    arm_torques = labels[arm_mask][:, 4:]               # raw expert torques (7)
+    tau_gravity = inputs[arm_mask][:, 37:44]              # gravity comp from expert (7)
+    arm_labels = arm_torques - tau_gravity                 # residual torques
     arm_metadata = metadata[arm_mask]
     arm_path = os.path.join(out_dir, "dataset_arm.npz")
-    np.savez(arm_path, inputs=arm_inputs, labels=arm_labels, metadata=arm_metadata)
+    np.savez(arm_path, inputs=arm_inputs, labels=arm_labels, metadata=arm_metadata,
+             feature_names=np.array(arm_names))
     print(f"Saved arm dataset:  {arm_path}  inputs={arm_inputs.shape}  labels={arm_labels.shape}")
+    print(f"  Labels: residual torques (expert - gravity comp)")
+    print(f"  Features: {arm_names}")
 
     if not args.train:
         return
@@ -143,7 +202,6 @@ def main():
         "--num_layers", str(args.num_layers),
         "--batch_size", str(args.batch_size),
         "--lr", str(args.lr),
-        "--chunk_size", str(args.chunk_size),
         "--num_workers", str(args.num_workers),
         "--early_stop", str(args.early_stop),
         "--patience", str(args.patience),
