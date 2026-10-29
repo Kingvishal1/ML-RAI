@@ -55,14 +55,14 @@ def main():
                         help="Output directory (default: same as input)")
     parser.add_argument("--train", action="store_true",
                         help="Train base and arm policies after splitting")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Training epochs (used with --train, default: 50)")
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="Training epochs (used with --train, default: 100)")
     parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Hidden layer size (used with --train, default: 512)")
-    parser.add_argument("--num_layers", type=int, default=4,
-                        help="Number of hidden layers (used with --train, default: 4)")
-    parser.add_argument("--batch_size", type=int, default=4096,
-                        help="Batch size (used with --train, default: 4096)")
+    parser.add_argument("--num_layers", type=int, default=3,
+                        help="Number of hidden layers (used with --train, default: 3)")
+    parser.add_argument("--batch_size", type=int, default=256,
+                        help="Batch size (used with --train, default: 256)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate (used with --train, default: 1e-3)")
     parser.add_argument("--chunk_size", type=int, default=1,
@@ -71,10 +71,10 @@ def main():
                         help="DataLoader workers (used with --train, default: 0)")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal GPU (used with --train)")
-    parser.add_argument("--early_stop", type=float, default=0.005,
-                        help="Val loss improvement threshold (used with --train, default: 0.005)")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Epochs without improvement before early stopping (used with --train, default: 5)")
+    parser.add_argument("--early_stop", type=float, default=0.0,
+                        help="Val loss improvement threshold (used with --train, default: 0)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Epochs without improvement before early stopping (used with --train, default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     args = parser.parse_args()

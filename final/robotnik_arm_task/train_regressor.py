@@ -42,11 +42,18 @@ def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
 def main():
     parser = argparse.ArgumentParser(description="Train BC regressor")
     parser.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
+    # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="AdamW weight decay (default: 0)")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm, 0 to disable (default: 1.0)")
+    parser.add_argument("--wheel_weight", type=float, default=0.5,
+                        help="Loss weight of wheel outputs vs arm outputs in full mode (default: 0.5)")
     parser.add_argument("--out", type=str, default=None,
                         help="Checkpoint save path (default: auto-generated from params)")
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
@@ -56,10 +63,10 @@ def main():
                         help="Number of future actions to predict per observation (default: 1)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
-    parser.add_argument("--early_stop", type=float, default=0.001,
-                        help="Stop if val loss improvement is below this for --patience epochs (default: 0.005)")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Number of epochs without improvement before early stopping (default: 5)")
+    parser.add_argument("--early_stop", type=float, default=0.0,
+                        help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Number of epochs without improvement before early stopping (default: 20)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -131,7 +138,8 @@ def main():
     # --- Model ---
     model = build_mlp(inputs.shape[1], labels.shape[1],
                       args.hidden_dim, args.num_layers).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Train on MAE (L1), select checkpoints on MSE
     criterion = nn.MSELoss()
     print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
 
@@ -153,6 +161,11 @@ def main():
         n_torque = ACTION_DIM
         torque_offset = 0
     arm_names = [f"arm_{i}" for i in range(1, n_torque + 1)]
+
+    # Per-output loss weights: wheel outputs scaled by --wheel_weight (only matters in full mode)
+    loss_weights = torch.ones(labels.shape[1], device=device)
+    if mode == "full":
+        loss_weights[wheel_cols] = args.wheel_weight
 
     # --- Checkpoint path (fixed once at start) ---
     if args.out:
@@ -178,9 +191,11 @@ def main():
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             pred = model(xb)
-            loss = criterion(pred, yb)
+            loss = ((pred - yb).abs() * loss_weights).mean()
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_ds)
@@ -249,6 +264,8 @@ def main():
         tag = ""
         if val_loss < best_val - args.early_stop:
             epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch
@@ -268,6 +285,11 @@ def main():
                 "best_val_loss": best_val,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
+                "optimizer": "AdamW",
+                "weight_decay": args.weight_decay,
+                "train_loss": "MAE",
+                "grad_clip": args.grad_clip,
+                "wheel_weight": args.wheel_weight if mode == "full" else None,
                 "num_workers": args.num_workers,
                 "device": str(device),
                 "elapsed_sec": elapsed,
@@ -279,20 +301,20 @@ def main():
         # Summary line
         if mode == "full":
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"wheel={val_mse_wheel:.6f}  torque_avg={val_mse_torque_avg:.6f}{tag}")
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"         torque: {arm_str}")
         elif mode == "base":
             dim_names = ["v_cmd", "w_cmd"]
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"wheel={val_mse_wheel:.6f}{tag}")
         elif mode == "arm":
             dim_names = [f"arm_{i}" for i in range(1, ACTION_DIM + 1)]
             arm_str = "  ".join(f"{arm_names[j]}={val_mse_torque[j]:.6f}" for j in range(n_torque))
             print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train={train_loss:.6f}  val={val_loss:.6f}  "
+                  f"train_mae={train_loss:.6f}  val_mse={val_loss:.6f}  "
                   f"torque_avg={val_mse_torque_avg:.6f}{tag}")
             print(f"         torque: {arm_str}")
 
@@ -314,8 +336,6 @@ def main():
             print(f"         zero_acc: {zero_s}")
 
         # Early stopping
-        if val_loss >= best_val - args.early_stop:
-            epochs_without_improvement += 1
         if epochs_without_improvement >= args.patience:
             print(f"\nEarly stopping: no improvement > {args.early_stop} for {args.patience} epochs")
             break
