@@ -79,8 +79,8 @@ def main():
                         help="Number of hidden layers (used with --train, default: 3)")
     parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
                         help=f"Hidden-layer activation (used with --train, default: {DEFAULT_ACTIVATION})")
-    parser.add_argument("--batch_size", type=int, default=256,
-                        help="Batch size (used with --train, default: 256)")
+    parser.add_argument("--batch_size", type=int, default=2048,
+                        help="Batch size (used with --train, default: 2048)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate (used with --train, default: 1e-3)")
     parser.add_argument("--num_workers", type=int, default=0,
@@ -91,10 +91,10 @@ def main():
                         help="Base features to drop (e.g. --drop_base dist_to_target heading_error)")
     parser.add_argument("--drop_arm", type=str, nargs="*", default=[],
                         help="Arm features to drop (e.g. --drop_arm tau_gravity_1 tau_gravity_2)")
-    parser.add_argument("--early_stop", type=float, default=0.005,
-                        help="Val loss improvement threshold (used with --train, default: 0.005)")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Epochs without improvement before early stopping (used with --train, default: 5)")
+    parser.add_argument("--early_stop", type=float, default=0.0,
+                        help="Val loss improvement threshold (used with --train, default: 0)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Epochs without improvement before early stopping (used with --train, default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     args = parser.parse_args()

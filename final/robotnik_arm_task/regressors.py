@@ -144,7 +144,7 @@ class MLPRegressor(BaseRegressor):
                         called after every epoch; val_pred is in normalised units
         """
         epochs = kwargs.get("epochs", 100)
-        batch_size = kwargs.get("batch_size", 256)
+        batch_size = kwargs.get("batch_size", 2048)
         lr = kwargs.get("lr", 1e-3)
         hidden_dim = kwargs.get("hidden_dim", 512)
         num_layers = kwargs.get("num_layers", 3)

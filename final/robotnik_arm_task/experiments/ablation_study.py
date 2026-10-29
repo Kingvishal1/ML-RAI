@@ -257,7 +257,7 @@ def main():
                         help="Policy mode to ablate")
     parser.add_argument("--features", type=str, nargs="+", required=True,
                         help="Feature names to ablate (all combinations will be tested)")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs per run")
+    parser.add_argument("--epochs", type=int, default=100, help="Training epochs per run")
     parser.add_argument("--num_targets", type=int, default=20,
                         help="Evaluation targets per run")
     parser.add_argument("--max_combo_size", type=int, default=None,
@@ -272,12 +272,12 @@ def main():
 
     # Pass-through training hyperparams
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--early_stop", type=float, default=0.005)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--early_stop", type=float, default=0.0)
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Subsample dataset to N rows before splitting (passed to split_dataset.py)")
 

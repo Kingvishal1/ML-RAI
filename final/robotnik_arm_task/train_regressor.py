@@ -41,7 +41,7 @@ def main():
                         help=f"Model type (default: mlp, available: {available_regressors()})")
     # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=3)

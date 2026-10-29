@@ -188,8 +188,9 @@ def train_one(activation, data, args, device):
     torch.manual_seed(42)  # same starting weights recipe for every activation
     model = build_mlp(data["input_dim"], data["output_dim"],
                       args.hidden_dim, args.num_layers, activation).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    # Report recipe: AdamW (no weight decay), MAE training loss, grad clip 1.0. Validation stays MSE.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    criterion = nn.L1Loss()
 
     best_val = float("inf")
     best_state = None
@@ -207,6 +208,7 @@ def train_one(activation, data, args, device):
             loss = criterion(model(xb), yb)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss += loss.item() * xb.size(0)
         train_loss /= data["n_train"]
@@ -364,17 +366,17 @@ def main():
                         help="Activation functions to test (default: all)")
     parser.add_argument("--models", nargs="+", default=["base", "arm"], choices=["base", "arm"],
                         help="Which models to train (default: base arm)")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs (default: 50)")
+    parser.add_argument("--epochs", type=int, default=100, help="Training epochs (default: 100)")
     parser.add_argument("--hidden_dim", type=int, default=512, help="Hidden layer size (default: 512)")
-    parser.add_argument("--num_layers", type=int, default=4, help="Number of hidden layers (default: 4)")
-    parser.add_argument("--batch_size", type=int, default=4096, help="Batch size (default: 4096)")
+    parser.add_argument("--num_layers", type=int, default=3, help="Number of hidden layers (default: 3)")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Batch size (default: 2048)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (default: 0)")
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal GPU")
-    parser.add_argument("--early_stop", type=float, default=0.0001,
-                        help="Val loss improvement threshold (default: 0.005)")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Epochs without improvement before early stopping (default: 5)")
+    parser.add_argument("--early_stop", type=float, default=0.0,
+                        help="Val loss improvement threshold (default: 0)")
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Epochs without improvement before early stopping (default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     args = parser.parse_args()
@@ -437,7 +439,7 @@ def main():
         ["--early_stop", args.early_stop],
         ["--patience", args.patience],
         ["--num_workers", args.num_workers],
-        ["Optimizer / loss", "Adam / MSE"],
+        ["Optimizer / loss", "AdamW (wd 0) / MAE train, MSE val, grad clip 1.0"],
         ["Train/val split", "80/20 by trajectory, seed 42"],
         ["Random seed (weights)", 42],
         ["Device", gpu],
