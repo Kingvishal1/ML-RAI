@@ -288,6 +288,16 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 phase_switched = True
                 switch_time = current_time
                 base_xy_at_switch = base_pos[:2].copy()
+                wheel_lock_pos = q_mes[0:4].copy()
+                # TODO: Remove base lock constraint — no controller code allowed in final version.
+                #       For now, used to test arm policy without base drift.
+                _p = sim.GetPyBulletClient()
+                _base_pos_ori = _p.getBasePositionAndOrientation(sim.bot[0].bot_pybullet)
+                base_lock_cid = _p.createConstraint(
+                    sim.bot[0].bot_pybullet, -1, -1, -1, _p.JOINT_FIXED,
+                    [0, 0, 0], [0, 0, 0], list(_base_pos_ori[0]),
+                    parentFrameOrientation=[0, 0, 0, 1],
+                    childFrameOrientation=list(_base_pos_ori[1]))
                 print(f">>> Phase switch: base -> arm at t={current_time:.2f}s  {switch_reason}")
                 if arm_model is None:
                     # No arm policy (base_only mode) — stop here
@@ -300,8 +310,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                                     q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity_arm)
             action = predict(model, mean, std, obs, device=device,
                              label_mean=label_mean, label_std=label_std)
-            wheel_cmds = action[:4]
-            torque_arm = action[4:]
+            wheel_cmds = np.clip(action[:4], -0.25 / WHEEL_RADIUS, 0.25 / WHEEL_RADIUS)
+            torque_arm = np.clip(action[4:], -30.0, 30.0)
 
         elif phase == "base":
             obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
@@ -341,7 +351,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 raw_torque = raw_torque + tau_grav
             torque_arm = np.clip(raw_torque, -30.0, 30.0)
 
-            wheel_cmds = np.zeros(4)
+            wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
             # Track arm phase metrics
             if ee_dist_error < arm_best_ee:
                 arm_best_ee = ee_dist_error

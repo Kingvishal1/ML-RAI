@@ -27,7 +27,7 @@ if "--headless" in sys.argv:
 
 import numpy as np
 
-from run_policy_sim import run_sim, load_policy, REACH_TOLERANCE
+from run_policy_sim import run_sim, load_policy, load_gravity_comp, REACH_TOLERANCE
 from robotnik_arm_task import compute_base_goal
 
 
@@ -64,7 +64,8 @@ def main():
     parser.add_argument("--arm_checkpoint", type=str, default=None)
     parser.add_argument("--base_threshold", type=float, default=None)
     parser.add_argument("--num_targets", type=int, default=20)
-    parser.add_argument("--max_steps", type=int, default=400000)
+    parser.add_argument("--max_steps", type=int, default=100000,
+                        help="Max sim steps (default: 100000 ≈ 100s at 1ms timestep)")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -72,6 +73,8 @@ def main():
                         help="Only evaluate base phase (stop at phase switch)")
     parser.add_argument("--arm_only", action="store_true",
                         help="Only evaluate arm phase (use expert base)")
+    parser.add_argument("--gravity_comp", type=str, default=None,
+                        help="Path to gravity compensation network checkpoint")
     args = parser.parse_args()
 
     # Determine mode
@@ -133,6 +136,14 @@ def main():
             print(f"Arm policy: {args.arm_checkpoint}")
 
         print(f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
+
+    if args.gravity_comp:
+        grav_model, grav_q_mean, grav_q_std, grav_tau_mean, grav_tau_std = \
+            load_gravity_comp(args.gravity_comp, device=device)
+        print(f"Gravity comp: {args.gravity_comp}")
+        policy_kwargs.update(grav_model=grav_model, grav_q_mean=grav_q_mean,
+                             grav_q_std=grav_q_std, grav_tau_mean=grav_tau_mean,
+                             grav_tau_std=grav_tau_std)
 
     # Generate targets
     targets = generate_targets(args.num_targets, seed=args.seed)

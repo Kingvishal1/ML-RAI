@@ -64,6 +64,8 @@ def main():
                         help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
     parser.add_argument("--patience", type=int, default=20,
                         help="Number of epochs without improvement before early stopping (default: 20)")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Randomly subsample to this many rows before splitting (default: use all)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -73,6 +75,13 @@ def main():
     print(f"Loaded {inputs.shape[0]} samples  inputs={inputs.shape}  labels={labels.shape}")
     if feature_names:
         print(f"Features: {feature_names}")
+
+    if args.max_samples and inputs.shape[0] > args.max_samples:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(inputs.shape[0], args.max_samples, replace=False)
+        idx.sort()
+        inputs, labels, metadata = inputs[idx], labels[idx], metadata[idx]
+        print(f"Subsampled to {inputs.shape[0]} samples")
 
     ACTION_DIM = labels.shape[1]
 
