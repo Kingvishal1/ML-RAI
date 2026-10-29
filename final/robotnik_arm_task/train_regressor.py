@@ -52,8 +52,6 @@ def main():
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader worker processes for parallel data loading (default: 0)")
-    parser.add_argument("--chunk_size", type=int, default=1,
-                        help="Number of future actions to predict per observation (default: 1)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
     parser.add_argument("--early_stop", type=float, default=0.001,
@@ -65,33 +63,12 @@ def main():
     # --- Load data ---
     data = np.load(args.data)
     inputs, labels, metadata = data["inputs"], data["labels"], data["metadata"]
+    feature_names = list(data["feature_names"]) if "feature_names" in data else None
     print(f"Loaded {inputs.shape[0]} samples  inputs={inputs.shape}  labels={labels.shape}")
+    if feature_names:
+        print(f"Features: {feature_names}")
 
-    # --- Build action chunks ---
-    K = args.chunk_size
-    ACTION_DIM = labels.shape[1]  # 11
-    if K > 1:
-        traj_ids = np.unique(metadata[:, 0])
-        chunked_inputs, chunked_labels, chunked_meta = [], [], []
-        for tid in traj_ids:
-            mask = metadata[:, 0] == tid
-            traj_inputs = inputs[mask]
-            traj_labels = labels[mask]
-            traj_meta = metadata[mask]
-            # Sort by timestep
-            order = np.argsort(traj_meta[:, 1])
-            traj_inputs = traj_inputs[order]
-            traj_labels = traj_labels[order]
-            traj_meta = traj_meta[order]
-            T = len(traj_inputs)
-            for t in range(T - K + 1):
-                chunked_inputs.append(traj_inputs[t])
-                chunked_labels.append(traj_labels[t:t + K].flatten())
-                chunked_meta.append(traj_meta[t])
-        inputs = np.array(chunked_inputs)
-        labels = np.array(chunked_labels)
-        metadata = np.array(chunked_meta)
-        print(f"Chunked (K={K}): {inputs.shape[0]} samples  labels={labels.shape}")
+    ACTION_DIM = labels.shape[1]
 
     # --- Split by trajectory ---
     X_train, y_train, X_val, y_val = split_by_trajectory(inputs, labels, metadata)
@@ -103,14 +80,11 @@ def main():
     X_train = (X_train - mean) / std
     X_val = (X_val - mean) / std
 
-    # Compute per-action label stats (ACTION_DIM), then tile for chunked labels (K*ACTION_DIM)
-    label_mean_single = y_train[:, :ACTION_DIM].mean(axis=0)
-    label_std_single = y_train[:, :ACTION_DIM].std(axis=0) + 1e-8
-    label_mean = np.tile(label_mean_single, K)
-    label_std = np.tile(label_std_single, K)
+    label_mean = y_train.mean(axis=0)
+    label_std = y_train.std(axis=0) + 1e-8
     y_train = (y_train - label_mean) / label_std
     y_val = (y_val - label_mean) / label_std
-    print(f"Label stats: mean={np.round(label_mean_single, 4)}  std={np.round(label_std_single, 4)}")
+    print(f"Label stats: mean={np.round(label_mean, 4)}  std={np.round(label_std, 4)}")
 
     # --- Torch datasets ---
     if args.mps and torch.backends.mps.is_available():
@@ -138,17 +112,14 @@ def main():
     # --- Label slices depend on mode ---
     mode = args.mode
     if mode == "full":
-        # 4 wheel + 7 arm torque per action step
-        wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + 4) for k in range(K)])
+        wheel_cols = np.arange(4)
         n_torque = 7
         torque_offset = 4
     elif mode == "base":
-        # All outputs are wheel commands (ACTION_DIM == 4)
-        wheel_cols = np.concatenate([np.arange(k * ACTION_DIM, k * ACTION_DIM + ACTION_DIM) for k in range(K)])
+        wheel_cols = np.arange(ACTION_DIM)
         n_torque = 0
         torque_offset = ACTION_DIM
     elif mode == "arm":
-        # All outputs are arm torques (ACTION_DIM == 7)
         wheel_cols = np.array([], dtype=int)
         n_torque = ACTION_DIM
         torque_offset = 0
@@ -164,7 +135,7 @@ def main():
                     if (m := re.match(r"^(\d+)_", f))]
         next_id = max(counters, default=0) + 1
         save_path = (f"{next_id:03d}_bc_{mode}_e{args.epochs}_h{args.hidden_dim}"
-                     f"_l{args.num_layers}_c{K}.pt")
+                     f"_l{args.num_layers}.pt")
     print(f"Checkpoint: {save_path}")
 
     # --- Training ---
@@ -205,23 +176,19 @@ def main():
         all_label_orig = np.concatenate(all_label_orig)
         err_orig = all_pred_orig - all_label_orig  # signed error in original scale
 
-        # --- Per-component MSE (existing) ---
+        # --- Per-component MSE ---
         val_se_wheel = 0.0
         val_se_torque = np.zeros(max(n_torque, 1))
         if len(wheel_cols) > 0:
             val_se_wheel = (err_orig[:, wheel_cols] ** 2).sum()
         for j in range(n_torque):
-            cols_j = np.array([k * ACTION_DIM + torque_offset + j for k in range(K)])
-            val_se_torque[j] = (err_orig[:, cols_j] ** 2).sum()
-        val_mse_wheel = val_se_wheel / (n_val * K) if len(wheel_cols) > 0 else 0.0
-        val_mse_torque = val_se_torque[:n_torque] / (n_val * K) if n_torque > 0 else np.array([])
+            val_se_torque[j] = (err_orig[:, torque_offset + j] ** 2).sum()
+        val_mse_wheel = val_se_wheel / n_val if len(wheel_cols) > 0 else 0.0
+        val_mse_torque = val_se_torque[:n_torque] / n_val if n_torque > 0 else np.array([])
         val_mse_torque_avg = val_mse_torque.mean() if n_torque > 0 else 0.0
 
-        # --- Additional metrics (first action step only for readability) ---
-        pred_a0 = all_pred_orig[:, :ACTION_DIM]
-        label_a0 = all_label_orig[:, :ACTION_DIM]
-        err_a0 = pred_a0 - label_a0
-        abs_err_a0 = np.abs(err_a0)
+        # --- Additional metrics ---
+        abs_err_a0 = np.abs(err_orig)
 
         mae_per_dim = abs_err_a0.mean(axis=0)
         max_err_per_dim = abs_err_a0.max(axis=0)
@@ -230,8 +197,8 @@ def main():
 
         # Sign accuracy: % of samples where pred and label have the same sign
         # (only meaningful where label != 0)
-        nonzero_mask = np.abs(label_a0) > 1e-6
-        sign_match = np.sign(pred_a0) == np.sign(label_a0)
+        nonzero_mask = np.abs(all_label_orig) > 1e-6
+        sign_match = np.sign(all_pred_orig) == np.sign(all_label_orig)
         sign_acc_per_dim = np.array([
             sign_match[nonzero_mask[:, d], d].mean() * 100 if nonzero_mask[:, d].any() else 100.0
             for d in range(ACTION_DIM)
@@ -239,8 +206,8 @@ def main():
 
         # Near-zero accuracy: when expert outputs ~0, does model also output ~0?
         near_zero_thresh = 0.02
-        expert_near_zero = np.abs(label_a0) < near_zero_thresh
-        pred_near_zero = np.abs(pred_a0) < near_zero_thresh
+        expert_near_zero = np.abs(all_label_orig) < near_zero_thresh
+        pred_near_zero = np.abs(all_pred_orig) < near_zero_thresh
         zero_acc_per_dim = np.array([
             pred_near_zero[expert_near_zero[:, d], d].mean() * 100 if expert_near_zero[:, d].any() else 100.0
             for d in range(ACTION_DIM)
@@ -257,8 +224,8 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "input_mean": mean,
                 "input_std": std,
-                "label_mean": label_mean_single,
-                "label_std": label_std_single,
+                "label_mean": label_mean,
+                "label_std": label_std,
                 "input_dim": inputs.shape[1],
                 "output_dim": labels.shape[1],
                 "hidden_dim": args.hidden_dim,
@@ -271,8 +238,8 @@ def main():
                 "num_workers": args.num_workers,
                 "device": str(device),
                 "elapsed_sec": elapsed,
-                "chunk_size": K,
                 "action_dim": ACTION_DIM,
+                "feature_names": feature_names,
             }, save_path)
             tag = f"  *saved* → {save_path}"
 
