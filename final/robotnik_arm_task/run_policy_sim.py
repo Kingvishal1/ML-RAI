@@ -17,6 +17,8 @@ if "--headless" in sys.argv:
     os.environ["ROBOENV_HEADLESS"] = "1"
 
 import numpy as np
+import torch
+import torch.nn as nn
 import pinocchio as pin
 from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
@@ -27,6 +29,34 @@ from robotnik_arm_control import (
     ArmControllerParams, arm_controller, configure_gripper_fingers, quaternion2bearing,
 )
 from run_policy import load_policy, predict
+
+
+def load_gravity_comp(path, device="cpu"):
+    """Load gravity compensation network from checkpoint."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    hidden_dim = ckpt["hidden_dim"]
+    num_layers = ckpt["num_layers"]
+    layers = []
+    prev = 7
+    for _ in range(num_layers):
+        layers.append(nn.Linear(prev, hidden_dim))
+        layers.append(nn.ReLU())
+        prev = hidden_dim
+    layers.append(nn.Linear(prev, 7))
+    model = nn.Sequential(*layers)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+    model.eval()
+    return model, ckpt["q_mean"], ckpt["q_std"], ckpt["tau_mean"], ckpt["tau_std"]
+
+
+def predict_gravity(grav_model, q_mean, q_std, tau_mean, tau_std, q_arm, device="cpu"):
+    """Predict gravity compensation torques from joint angles."""
+    q_norm = (q_arm - q_mean) / q_std
+    x = torch.tensor(q_norm, dtype=torch.float32).unsqueeze(0).to(device)
+    with torch.no_grad():
+        pred = grav_model(x).cpu().numpy()[0]
+    return pred * tau_std + tau_mean
 
 # Wheel kinematic constants (from BaseControllerParams)
 WHEEL_RADIUS = 0.11
@@ -51,44 +81,84 @@ def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
     ])  # total: 44
 
 
-def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel, target_ee_pos):
-    """Assemble the 14-dim base policy observation."""
+def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
+                           target_ee_pos, feature_names=None):
+    """Assemble base policy observation, optionally filtered by feature_names."""
     delta = target_ee_pos[:2] - base_pos[:2]
     dist_to_target = np.linalg.norm(delta)
     heading_to_target = np.arctan2(delta[1], delta[0])
     heading_error = np.arctan2(np.sin(heading_to_target - base_bearing),
                                np.cos(heading_to_target - base_bearing))
-    return np.concatenate([
-        base_pos[:2],               # 2: base_pos_x, base_pos_y
-        [base_bearing],             # 1: base_bearing
-        base_lin_vel,               # 3: base_lin_vel_x/y/z
-        base_ang_vel,               # 3: base_ang_vel_x/y/z
-        target_ee_pos[:3],          # 3: target_x, target_y, target_z
-        [dist_to_target],           # 1: distance to target XY
-        [heading_error],            # 1: wrapped heading error
-    ])  # total: 14
+
+    # All possible base features
+    ALL_BASE = {
+        "base_pos_x": base_pos[0],
+        "base_pos_y": base_pos[1],
+        "base_bearing": base_bearing,
+        "base_lin_vel_x": base_lin_vel[0],
+        "base_lin_vel_y": base_lin_vel[1],
+        "base_lin_vel_z": base_lin_vel[2],
+        "base_ang_vel_x": base_ang_vel[0],
+        "base_ang_vel_y": base_ang_vel[1],
+        "base_ang_vel_z": base_ang_vel[2],
+        "target_x": target_ee_pos[0],
+        "target_y": target_ee_pos[1],
+        "target_z": target_ee_pos[2],
+        "dist_to_target": dist_to_target,
+        "heading_error": heading_error,
+    }
+
+    if feature_names is None:
+        # Default 12-dim (no z features)
+        feature_names = [
+            "base_pos_x", "base_pos_y", "base_bearing",
+            "base_lin_vel_x", "base_lin_vel_y",
+            "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
+            "target_x", "target_y",
+            "dist_to_target", "heading_error",
+        ]
+
+    return np.array([ALL_BASE[name] for name in feature_names])
 
 
-def build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity):
-    """Assemble the 27-dim arm policy observation."""
-    return np.concatenate([
-        q_mes[4:11],               # 7: q_arm
-        qd_mes[4:11],              # 7: qd_arm
-        ee_pos,                     # 3: ee_pos_x/y/z
-        target_ee_pos,              # 3: target_x/y/z
-        tau_gravity,                # 7: gravity compensation torques
-    ])  # total: 27
+def build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
+                          feature_names=None):
+    """Assemble arm policy observation, optionally filtered by feature_names."""
+    ALL_ARM = {}
+    for i in range(7):
+        ALL_ARM[f"q_arm_{i+1}"] = q_mes[4 + i]
+    for i in range(7):
+        ALL_ARM[f"qd_arm_{i+1}"] = qd_mes[4 + i]
+    ALL_ARM["ee_pos_x"] = ee_pos[0]
+    ALL_ARM["ee_pos_y"] = ee_pos[1]
+    ALL_ARM["ee_pos_z"] = ee_pos[2]
+    ALL_ARM["target_x"] = target_ee_pos[0]
+    ALL_ARM["target_y"] = target_ee_pos[1]
+    ALL_ARM["target_z"] = target_ee_pos[2]
+
+    if feature_names is None:
+        feature_names = (
+            [f"q_arm_{i}" for i in range(1, 8)]
+            + [f"qd_arm_{i}" for i in range(1, 8)]
+            + ["ee_pos_x", "ee_pos_y", "ee_pos_z"]
+            + ["target_x", "target_y", "target_z"]
+        )
+
+    return np.array([ALL_ARM[name] for name in feature_names])
 
 
 def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             # single-mode policy
-            model=None, mean=None, std=None, chunk_size=None, execute_steps=None,
+            model=None, mean=None, std=None,
             label_mean=None, label_std=None,
             # split-mode policies
-            base_model=None, base_mean=None, base_std=None, base_chunk_size=None, base_execute=None,
-            base_label_mean=None, base_label_std=None,
-            arm_model=None, arm_mean=None, arm_std=None, arm_chunk_size=None, arm_execute=None,
-            arm_label_mean=None, arm_label_std=None):
+            base_model=None, base_mean=None, base_std=None,
+            base_label_mean=None, base_label_std=None, base_feature_names=None,
+            arm_model=None, arm_mean=None, arm_std=None,
+            arm_label_mean=None, arm_label_std=None, arm_feature_names=None,
+            # gravity compensation
+            grav_model=None, grav_q_mean=None, grav_q_std=None,
+            grav_tau_mean=None, grav_tau_std=None):
     """Run one simulation attempt. Returns True if finished normally, False if crashed."""
 
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
@@ -125,8 +195,6 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
 
     best_ee_error = np.inf
     step = 0
-    action_chunk = None
-    chunk_idx = 0
     phase = "base" if split_mode else "single"
     phase_switched = False
 
@@ -181,9 +249,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
         ee_dist_error = np.linalg.norm(target_ee_pos - ee_pos)
 
-        # Gravity compensation torques for arm joints
-        tau_g_full = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-        tau_gravity_arm = tau_g_full[6:13].copy()
+        tau_gravity_arm = np.zeros(7)  # not available at inference
 
         if ee_dist_error < best_ee_error:
             best_ee_error = ee_dist_error
@@ -232,35 +298,24 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                     # No arm policy (base_only mode) — stop here
                     break
                 phase = "arm"
-                action_chunk = None
-                chunk_idx = 0
 
         # ---- Compute action based on mode/phase ----
         if phase == "single":
-            if action_chunk is None or chunk_idx >= execute_steps:
-                obs = build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
-                                        q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity_arm)
-                raw = predict(model, mean, std, obs, device=device, chunk_size=chunk_size,
-                              label_mean=label_mean, label_std=label_std)
-                action_chunk = raw if chunk_size > 1 else raw[np.newaxis, :]
-                chunk_idx = 0
-            action = action_chunk[chunk_idx]
-            chunk_idx += 1
+            obs = build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
+                                    q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity_arm)
+            action = predict(model, mean, std, obs, device=device,
+                             label_mean=label_mean, label_std=label_std)
             wheel_cmds = action[:4]
             torque_arm = action[4:]
 
         elif phase == "base":
-            if action_chunk is None or chunk_idx >= base_execute:
-                obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
-                                                  base_ang_vel, target_ee_pos)
-                raw = predict(base_model, base_mean, base_std, obs_base,
-                              device=device, chunk_size=base_chunk_size,
-                              label_mean=base_label_mean, label_std=base_label_std)
-                action_chunk = raw if base_chunk_size > 1 else raw[np.newaxis, :]
-                chunk_idx = 0
+            obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
+                                              base_ang_vel, target_ee_pos,
+                                              feature_names=base_feature_names)
+            vw = predict(base_model, base_mean, base_std, obs_base,
+                         device=device,
+                         label_mean=base_label_mean, label_std=base_label_std)
             # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
-            vw = action_chunk[chunk_idx]  # (2,)
-            chunk_idx += 1
             v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
             w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
             v_cmd = np.clip(v_cmd, -0.25, 0.25)
@@ -277,15 +332,20 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             )
 
         elif phase == "arm":
-            if action_chunk is None or chunk_idx >= arm_execute:
-                obs_arm = build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity_arm)
-                raw = predict(arm_model, arm_mean, arm_std, obs_arm,
-                              device=device, chunk_size=arm_chunk_size,
-                              label_mean=arm_label_mean, label_std=arm_label_std)
-                action_chunk = raw if arm_chunk_size > 1 else raw[np.newaxis, :]
-                chunk_idx = 0
-            torque_arm = np.clip(action_chunk[chunk_idx], -30.0, 30.0)
-            chunk_idx += 1
+            # Arm policy
+            obs_arm = build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
+                                            feature_names=arm_feature_names)
+            raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
+                                 device=device,
+                                 label_mean=arm_label_mean, label_std=arm_label_std)
+            # Add gravity compensation if available
+            if grav_model is not None:
+                tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
+                                           grav_tau_mean, grav_tau_std,
+                                           q_mes[4:11], device=device)
+                raw_torque = raw_torque + tau_grav
+            torque_arm = np.clip(raw_torque, -30.0, 30.0)
+
             wheel_cmds = np.zeros(4)
             # Track arm phase metrics
             if ee_dist_error < arm_best_ee:
@@ -390,9 +450,8 @@ def main():
                         help="Target end-effector position (default: 0.0 1.1 0.5)")
     parser.add_argument("--max_steps", type=int, default=400000,
                         help="Maximum simulation steps")
-    parser.add_argument("--execute_steps", type=int, default=None,
-                        help="Execute this many steps from each chunk before re-predicting "
-                             "(MPC-style). Defaults to chunk_size (use full chunk).")
+    parser.add_argument("--gravity_comp", type=str, default=None,
+                        help="Path to gravity compensation network checkpoint (adds predicted gravity torques to arm output)")
     parser.add_argument("--headless", action="store_true",
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
@@ -411,7 +470,6 @@ def main():
         parser.error("Specify either --checkpoint OR (--base_checkpoint + --arm_checkpoint), not both.")
 
     # --- Load policy/policies (once, reused across retries) ---
-    import torch
     if args.mps and torch.backends.mps.is_available():
         device = "mps"
     elif torch.cuda.is_available():
@@ -422,36 +480,32 @@ def main():
     policy_kwargs = dict(device=device)
 
     if single_mode:
-        model, mean, std, chunk_size, label_mean, label_std = load_policy(args.checkpoint, device=device)
-        execute_steps = args.execute_steps if args.execute_steps is not None else chunk_size
-        if execute_steps > chunk_size:
-            print(f"WARNING: execute_steps ({execute_steps}) > chunk_size ({chunk_size}), clamping.")
-            execute_steps = chunk_size
-        print(f"Loaded policy from {args.checkpoint}  device={device}  "
-              f"chunk_size={chunk_size}  execute_steps={execute_steps}")
+        model, mean, std, label_mean, label_std, _ = load_policy(args.checkpoint, device=device)
+        print(f"Loaded policy from {args.checkpoint}  device={device}")
         policy_kwargs.update(model=model, mean=mean, std=std,
-                             chunk_size=chunk_size, execute_steps=execute_steps,
                              label_mean=label_mean, label_std=label_std)
     else:
-        base_model, base_mean, base_std, base_chunk_size, base_lm, base_ls = \
+        base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
             load_policy(args.base_checkpoint, device=device)
-        arm_model, arm_mean, arm_std, arm_chunk_size, arm_lm, arm_ls = \
+        arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
             load_policy(args.arm_checkpoint, device=device)
-        base_execute = args.execute_steps if args.execute_steps is not None else base_chunk_size
-        arm_execute = args.execute_steps if args.execute_steps is not None else arm_chunk_size
-        if base_execute > base_chunk_size:
-            base_execute = base_chunk_size
-        if arm_execute > arm_chunk_size:
-            arm_execute = arm_chunk_size
-        print(f"Split mode: base={args.base_checkpoint} (chunk={base_chunk_size}, exec={base_execute})  "
-              f"arm={args.arm_checkpoint} (chunk={arm_chunk_size}, exec={arm_execute})  "
+        print(f"Split mode: base={args.base_checkpoint}  arm={args.arm_checkpoint}  "
               f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
         policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
-                             base_chunk_size=base_chunk_size, base_execute=base_execute,
                              base_label_mean=base_lm, base_label_std=base_ls,
+                             base_feature_names=base_fnames,
                              arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
-                             arm_chunk_size=arm_chunk_size, arm_execute=arm_execute,
-                             arm_label_mean=arm_lm, arm_label_std=arm_ls)
+                             arm_label_mean=arm_lm, arm_label_std=arm_ls,
+                             arm_feature_names=arm_fnames)
+
+    # Load gravity compensation network if provided
+    if args.gravity_comp:
+        grav_model, grav_q_mean, grav_q_std, grav_tau_mean, grav_tau_std = \
+            load_gravity_comp(args.gravity_comp, device=device)
+        print(f"Gravity comp: {args.gravity_comp}")
+        policy_kwargs.update(grav_model=grav_model, grav_q_mean=grav_q_mean,
+                             grav_q_std=grav_q_std, grav_tau_mean=grav_tau_mean,
+                             grav_tau_std=grav_tau_std)
 
     target_ee_pos = np.array(args.target)
 
