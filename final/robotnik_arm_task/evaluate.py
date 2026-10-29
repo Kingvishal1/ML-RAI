@@ -65,7 +65,6 @@ def main():
     parser.add_argument("--base_threshold", type=float, default=None)
     parser.add_argument("--num_targets", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=400000)
-    parser.add_argument("--execute_steps", type=int, default=None)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -112,35 +111,25 @@ def main():
     policy_kwargs = dict(device=device)
 
     if single_mode:
-        model, mean, std, chunk_size, label_mean, label_std = load_policy(args.checkpoint, device=device)
-        execute_steps = args.execute_steps if args.execute_steps is not None else chunk_size
-        if execute_steps > chunk_size:
-            execute_steps = chunk_size
+        model, mean, std, label_mean, label_std, _ = load_policy(args.checkpoint, device=device)
         policy_kwargs.update(model=model, mean=mean, std=std,
-                             chunk_size=chunk_size, execute_steps=execute_steps,
                              label_mean=label_mean, label_std=label_std)
         print(f"Single policy: {args.checkpoint}  device={device}")
     else:
         if args.base_checkpoint:
-            base_model, base_mean, base_std, base_chunk_size, base_lm, base_ls = \
+            base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
                 load_policy(args.base_checkpoint, device=device)
-            base_execute = args.execute_steps if args.execute_steps is not None else base_chunk_size
-            if base_execute > base_chunk_size:
-                base_execute = base_chunk_size
             policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
-                                 base_chunk_size=base_chunk_size, base_execute=base_execute,
-                                 base_label_mean=base_lm, base_label_std=base_ls)
+                                 base_label_mean=base_lm, base_label_std=base_ls,
+                                 base_feature_names=base_fnames)
             print(f"Base policy: {args.base_checkpoint}")
 
         if args.arm_checkpoint:
-            arm_model, arm_mean, arm_std, arm_chunk_size, arm_lm, arm_ls = \
+            arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
                 load_policy(args.arm_checkpoint, device=device)
-            arm_execute = args.execute_steps if args.execute_steps is not None else arm_chunk_size
-            if arm_execute > arm_chunk_size:
-                arm_execute = arm_chunk_size
             policy_kwargs.update(arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
-                                 arm_chunk_size=arm_chunk_size, arm_execute=arm_execute,
-                                 arm_label_mean=arm_lm, arm_label_std=arm_ls)
+                                 arm_label_mean=arm_lm, arm_label_std=arm_ls,
+                                 arm_feature_names=arm_fnames)
             print(f"Arm policy: {args.arm_checkpoint}")
 
         print(f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
