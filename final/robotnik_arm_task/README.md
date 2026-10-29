@@ -19,3 +19,4 @@ Key variables in robotnik_arm_task.py:
  
  Assessment Goal:
   - ML model that produces (wheel_cmds, torque_arm) from measurements (base_pos,base_bearing,q_mes,qd_mes)
+  a

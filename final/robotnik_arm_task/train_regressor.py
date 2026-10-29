@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from activations import ACTIVATIONS, DEFAULT_ACTIVATION
-from regressors import build_mlp, get_regressor  # noqa: F401  (build_mlp re-exported)
+from regressors import build_mlp, get_regressor, available_regressors  # noqa: F401  (build_mlp re-exported)
 
 
 def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
@@ -36,6 +36,9 @@ def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
 def main():
     parser = argparse.ArgumentParser(description="Train BC regressor")
     parser.add_argument("--data", type=str, required=True, help="Path to .npz dataset")
+    parser.add_argument("--model", type=str, default="mlp",
+                        choices=available_regressors(),
+                        help=f"Model type (default: mlp, available: {available_regressors()})")
     # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
@@ -80,20 +83,20 @@ def main():
     # --- Normalisation (input + output) ---
     mean = X_train.mean(axis=0)
     std = X_train.std(axis=0) + 1e-8
-    X_train = (X_train - mean) / std
-    X_val = (X_val - mean) / std
+    X_train_norm = (X_train - mean) / std
+    X_val_norm = (X_val - mean) / std
 
     label_mean = y_train.mean(axis=0)
     label_std = y_train.std(axis=0) + 1e-8
-    y_train = (y_train - label_mean) / label_std
-    y_val = (y_val - label_mean) / label_std
+    y_train_norm = (y_train - label_mean) / label_std
+    y_val_norm = (y_val - label_mean) / label_std
     print(f"Label stats: mean={np.round(label_mean, 4)}  std={np.round(label_std, 4)}")
 
     # --- Device ---
     if args.mps and torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = "mps"
     elif torch.cuda.is_available():
-        device = torch.device("cuda")
+        device = "cuda"
     else:
         device = torch.device("cpu")
     n_params = sum(p.numel() for p in build_mlp(inputs.shape[1], labels.shape[1],
@@ -162,7 +165,6 @@ def main():
         mae_per_dim = abs_err_a0.mean(axis=0)
         max_err_per_dim = abs_err_a0.max(axis=0)
         p90_per_dim = np.percentile(abs_err_a0, 90, axis=0)
-        p99_per_dim = np.percentile(abs_err_a0, 99, axis=0)
 
         # Sign accuracy: % of samples where pred and label have the same sign
         # (only meaningful where label != 0)
@@ -252,9 +254,9 @@ def main():
             print(f"         sign_acc: {sign_s}")
             print(f"         zero_acc: {zero_s}")
 
-    # --- Training (shared MLP trainer in regressors.py) ---
-    metrics = get_regressor("mlp")().fit(
-        X_train, y_train, X_val, y_val,
+    # --- Training (shared trainer in regressors.py) ---
+    metrics = get_regressor(args.model)().fit(
+        X_train_norm, y_train_norm, X_val_norm, y_val_norm,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
