@@ -18,7 +18,6 @@ if "--headless" in sys.argv:
 
 import numpy as np
 import torch
-import torch.nn as nn
 import pinocchio as pin
 from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
@@ -29,7 +28,8 @@ from robotnik_arm_control import (
     ArmControllerParams, arm_controller, configure_gripper_fingers, quaternion2bearing,
 )
 from run_policy import load_policy, predict
-from activations import LEGACY_ACTIVATION, get_activation
+from regressors import build_mlp
+from activations import LEGACY_ACTIVATION
 
 
 def load_gravity_comp(path, device="cpu"):
@@ -38,14 +38,7 @@ def load_gravity_comp(path, device="cpu"):
     hidden_dim = ckpt["hidden_dim"]
     num_layers = ckpt["num_layers"]
     activation = ckpt.get("activation", LEGACY_ACTIVATION)
-    layers = []
-    prev = 7
-    for _ in range(num_layers):
-        layers.append(nn.Linear(prev, hidden_dim))
-        layers.append(get_activation(activation))
-        prev = hidden_dim
-    layers.append(nn.Linear(prev, 7))
-    model = nn.Sequential(*layers)
+    model = build_mlp(7, 7, hidden_dim, num_layers, activation)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()

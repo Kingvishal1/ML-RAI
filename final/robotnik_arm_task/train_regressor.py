@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train a behaviour-cloning MLP regressor on expert trajectory data.
+"""Train a behaviour-cloning regressor on expert trajectory data.
 
 Data loading, the train/val split, normalisation and checkpoint saving live
-here; the training loop itself is the shared "mlp" regressor in regressors.py.
+here; the training loop itself is delegated to the regressor in regressors.py.
 """
 
 import argparse
@@ -99,9 +99,7 @@ def main():
         device = "cuda"
     else:
         device = torch.device("cpu")
-    n_params = sum(p.numel() for p in build_mlp(inputs.shape[1], labels.shape[1],
-                                                 args.hidden_dim, args.num_layers).parameters())
-    print(f"Model: {n_params} params  activation={args.activation}  device={device}")
+
     y_val_orig = y_val * label_std + label_mean  # labels in original units, for metrics
 
     # --- Label slices depend on mode ---
@@ -138,7 +136,7 @@ def main():
                      f"_l{args.num_layers}.pt")
     print(f"Checkpoint: {save_path}")
 
-    # --- Per-epoch reporting and checkpointing (called by the trainer after each epoch) ---
+    # --- Per-epoch reporting callback (for models that support on_epoch) ---
     t_start = _time.time()
 
     def on_epoch(epoch, train_loss, val_loss, val_pred, improved, model):
@@ -167,7 +165,6 @@ def main():
         p90_per_dim = np.percentile(abs_err_a0, 90, axis=0)
 
         # Sign accuracy: % of samples where pred and label have the same sign
-        # (only meaningful where label != 0)
         nonzero_mask = np.abs(all_label_orig) > 1e-6
         sign_match = np.sign(all_pred_orig) == np.sign(all_label_orig)
         sign_acc_per_dim = np.array([
@@ -184,38 +181,7 @@ def main():
             for d in range(ACTION_DIM)
         ])
 
-        # Save a checkpoint whenever validation reaches a new best
-        tag = ""
-        if improved:
-            elapsed = _time.time() - t_start
-            torch.save({
-                "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-                "input_mean": mean,
-                "input_std": std,
-                "label_mean": label_mean,
-                "label_std": label_std,
-                "input_dim": inputs.shape[1],
-                "output_dim": labels.shape[1],
-                "hidden_dim": args.hidden_dim,
-                "num_layers": args.num_layers,
-                "activation": args.activation,
-                "epochs": args.epochs,
-                "best_epoch": epoch,
-                "best_val_loss": val_loss,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "optimizer": "AdamW",
-                "weight_decay": args.weight_decay,
-                "train_loss": "MAE",
-                "grad_clip": args.grad_clip,
-                "wheel_weight": args.wheel_weight if mode == "full" else None,
-                "num_workers": args.num_workers,
-                "device": str(device),
-                "elapsed_sec": elapsed,
-                "action_dim": ACTION_DIM,
-                "feature_names": feature_names,
-            }, save_path)
-            tag = f"  *saved* → {save_path}"
+        tag = " *best*" if improved else ""
 
         # Summary line
         if mode == "full":
@@ -238,7 +204,7 @@ def main():
             print(f"         torque: {arm_str}")
 
         # Detailed metrics (every 5 epochs or on save)
-        if epoch % 5 == 0 or tag:
+        if epoch % 5 == 0 or improved:
             if mode in ("base", "arm"):
                 names = dim_names
             else:
@@ -255,7 +221,8 @@ def main():
             print(f"         zero_acc: {zero_s}")
 
     # --- Training (shared trainer in regressors.py) ---
-    metrics = get_regressor(args.model)().fit(
+    regressor = get_regressor(args.model)()
+    metrics = regressor.fit(
         X_train_norm, y_train_norm, X_val_norm, y_val_norm,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -272,6 +239,23 @@ def main():
         device=device,
         on_epoch=on_epoch,
     )
+
+    # Print param count from the actual trained model
+    if regressor.model is not None and hasattr(regressor.model, 'parameters'):
+        n_params = sum(p.numel() for p in regressor.model.parameters())
+        print(f"Model: {args.model}  {n_params} params")
+
+    # --- Save checkpoint via regressor interface (model-agnostic) ---
+    regressor.save_checkpoint(save_path,
+                              input_mean=mean,
+                              input_std=std,
+                              label_mean=label_mean,
+                              label_std=label_std,
+                              epochs=args.epochs,
+                              batch_size=args.batch_size,
+                              lr=args.lr,
+                              action_dim=ACTION_DIM,
+                              feature_names=feature_names)
 
     total_time = _time.time() - t_start
     total_min = int(total_time // 60)

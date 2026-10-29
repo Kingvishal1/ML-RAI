@@ -519,6 +519,7 @@ class LinearRegressor(_SklearnRegressor):
         self._output_dim = y_train.shape[1]
         metrics = self._compute_metrics(X_val, y_val)
         metrics["elapsed_sec"] = elapsed
+        metrics["best_epoch"] = 1
         print(f"  [linear] Done. val_mse={metrics['val_mse']:.6f}  mae={metrics['mae']:.4f}")
         return metrics
 
@@ -555,6 +556,7 @@ class RandomForestRegressor(_SklearnRegressor):
         self._output_dim = y_train.shape[1]
         metrics = self._compute_metrics(X_val, y_val)
         metrics["elapsed_sec"] = elapsed
+        metrics["best_epoch"] = 1
         print(f"  [random_forest] Done. val_mse={metrics['val_mse']:.6f}  mae={metrics['mae']:.4f}")
         return metrics
 

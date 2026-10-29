@@ -100,7 +100,7 @@ def _eval_single_feature(args_tuple):
     """
     (feat_idx, X_norm, y_val, checkpoint_path, n_repeats, seed) = args_tuple
     # Each worker loads its own model (avoids pickling torch model / sharing GPU state)
-    model, _, _, _, _, _, _ = load_policy(checkpoint_path, device="cpu")
+    model, _, _, _, _, _ = load_policy(checkpoint_path, device="cpu")
     model.eval()
     X_t_base = torch.tensor(X_norm, dtype=torch.float32)
     y_t = torch.tensor(y_val, dtype=torch.float32)
@@ -241,7 +241,7 @@ def main():
         device = "cpu"
 
     # Load model
-    model, mean, std, _, _, _, _ = load_policy(args.checkpoint, device=device)
+    model, mean, std, _, _, _ = load_policy(args.checkpoint, device=device)
     print(f"Loaded policy from {args.checkpoint}  device={device}")
 
     # Load data and get val split

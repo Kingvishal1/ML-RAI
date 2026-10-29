@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
-from activations import ACTIVATIONS, DEFAULT_ACTIVATION, get_activation
+from activations import ACTIVATIONS, DEFAULT_ACTIVATION
+from regressors import build_mlp
 
 
 def main():
@@ -90,14 +91,7 @@ def main():
         device = torch.device("cpu")
 
     # Build model
-    layers = []
-    prev = 7
-    for _ in range(args.num_layers):
-        layers.append(nn.Linear(prev, args.hidden_dim))
-        layers.append(get_activation(args.activation))
-        prev = args.hidden_dim
-    layers.append(nn.Linear(prev, 7))
-    model = nn.Sequential(*layers).to(device)
+    model = build_mlp(7, 7, args.hidden_dim, args.num_layers, args.activation).to(device)
     print(f"Model: {sum(p.numel() for p in model.parameters())} params  device={device}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
