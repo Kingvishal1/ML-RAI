@@ -331,7 +331,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
 
             if args.expert_grav:
                 tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                torque_arm = np.clip(tau_g[6:13], -30.0, 30.0)
+                pd_torque = 40.0 * (q_init_arm - q_mes[4:11]) - 5.0 * qd_mes[4:11]
+                torque_arm = np.clip(pd_torque + tau_g[6:13], -30.0, 30.0)
             elif grav_model is not None:
                 torque_arm = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                              grav_tau_mean, grav_tau_std,
