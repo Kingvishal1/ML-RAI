@@ -329,12 +329,18 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
             wheel_cmds = np.array([rw, lw, lw, rw])
 
-            torque_arm, q_des_arm, qd_des_arm = arm_controller(
-                dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
-                q_des_arm, q_init_arm, target_ee_pos, ee_pos,
-                ee_frame_id, shoulder_frame_id, arm_lower, arm_upper,
-                time_step, arm_params, reach_active=False,
-            )
+            if grav_model is not None:
+                torque_arm = predict_gravity(grav_model, grav_q_mean, grav_q_std,
+                                             grav_tau_mean, grav_tau_std,
+                                             q_mes[4:11], device=device)
+                torque_arm = np.clip(torque_arm, -30.0, 30.0)
+            else:
+                torque_arm, q_des_arm, qd_des_arm = arm_controller(
+                    dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
+                    q_des_arm, q_init_arm, target_ee_pos, ee_pos,
+                    ee_frame_id, shoulder_frame_id, arm_lower, arm_upper,
+                    time_step, arm_params, reach_active=False,
+                )
 
         elif phase == "arm":
             # Arm policy
@@ -343,13 +349,14 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            # Add gravity compensation if available
+            raw_torque = np.clip(raw_torque, -5.0, 5.0)
+            # Add gravity compensation if available (unclamped so arm doesn't droop)
             if grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
                                            q_mes[4:11], device=device)
                 raw_torque = raw_torque + tau_grav
-            torque_arm = np.clip(raw_torque, -30.0, 30.0)
+            torque_arm = raw_torque
 
             wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
             # Track arm phase metrics
