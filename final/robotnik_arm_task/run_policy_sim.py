@@ -353,17 +353,17 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            raw_torque = np.clip(raw_torque, -5.0, 5.0)
+            raw_torque = np.clip(raw_torque, -2.0, 2.0)
             # Add gravity compensation (unclamped so arm doesn't droop)
             if args.expert_grav:
                 tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                raw_torque = raw_torque + tau_g[6:13] - 5.0 * qd_mes[4:11]
+                raw_torque = raw_torque + tau_g[6:13] - 10.0 * qd_mes[4:11]
             elif grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
                                            q_mes[4:11], device=device)
                 raw_torque = raw_torque + tau_grav
-            torque_arm = raw_torque
+            torque_arm = np.clip(raw_torque, -30.0, 30.0)
 
             wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
             # Track arm phase metrics
