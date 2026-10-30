@@ -329,7 +329,10 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
             wheel_cmds = np.array([rw, lw, lw, rw])
 
-            if grav_model is not None:
+            if args.expert_grav:
+                tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
+                torque_arm = np.clip(tau_g[6:13], -30.0, 30.0)
+            elif grav_model is not None:
                 torque_arm = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                              grav_tau_mean, grav_tau_std,
                                              q_mes[4:11], device=device)
@@ -350,8 +353,11 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
             raw_torque = np.clip(raw_torque, -5.0, 5.0)
-            # Add gravity compensation if available (unclamped so arm doesn't droop)
-            if grav_model is not None:
+            # Add gravity compensation (unclamped so arm doesn't droop)
+            if args.expert_grav:
+                tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
+                raw_torque = raw_torque + tau_g[6:13]
+            elif grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
                                            q_mes[4:11], device=device)
@@ -464,6 +470,8 @@ def main():
                         help="Maximum simulation steps")
     parser.add_argument("--gravity_comp", type=str, default=None,
                         help="Path to gravity compensation network checkpoint (adds predicted gravity torques to arm output)")
+    parser.add_argument("--expert_grav", action="store_true",
+                        help="Use analytical (Pinocchio) gravity compensation instead of learned network")
     parser.add_argument("--headless", action="store_true",
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
