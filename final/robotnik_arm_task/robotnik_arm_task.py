@@ -28,7 +28,7 @@ BASE_NAV_TIMEOUT = 25.0
 ARM_REACH_LIMIT = 0.85
 STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
-REACH_TOLERANCE = 0.01
+REACH_TOLERANCE = 0.02
 
 
 def setup_simulation():
@@ -144,6 +144,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     q_d_all, qd_d_all = [], []
     torque_arm_all, wheel_cmds_all, base_bearing_all, target_ee_pos_all = [], [], [], []
     base_lin_vel_all, base_ang_vel_all = [], []
+    tau_gravity_all = []
 
     while True:
         # ---- Sense ----
@@ -163,6 +164,10 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
         ee_error = target_ee_pos - ee_pos
         ee_dist_error = np.linalg.norm(ee_error)
+
+        # ---- Gravity compensation (for data logging) ----
+        tau_g_full = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
+        tau_gravity_arm = tau_g_full[6:13].copy()  # 7 arm joints
 
         # ---- Base control ----
         wheel_cmds = base_controller(
@@ -216,6 +221,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         target_ee_pos_all.append(target_ee_pos.copy())
         base_lin_vel_all.append(base_lin_vel)
         base_ang_vel_all.append(base_ang_vel)
+        tau_gravity_all.append(tau_gravity_arm)
 
         if not headless:
             time.sleep(0.001)
@@ -241,6 +247,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "target_ee_pos": np.array(target_ee_pos_all),
         "base_lin_vel": np.array(base_lin_vel_all),
         "base_ang_vel": np.array(base_ang_vel_all),
+        "tau_gravity": np.array(tau_gravity_all),
         "final_base_pos": base_pos,
         "final_ee_pos": ee_pos,
         "final_q_mes": q_mes,

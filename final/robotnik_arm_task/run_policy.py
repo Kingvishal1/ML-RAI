@@ -2,52 +2,43 @@
 """Load a trained BC policy checkpoint and run inference on input observations."""
 
 import argparse
+
 import numpy as np
 import torch
-import torch.nn as nn
 
-
-def build_mlp(input_dim, output_dim, hidden_dim, num_layers):
-    layers = []
-    prev = input_dim
-    for _ in range(num_layers):
-        layers.append(nn.Linear(prev, hidden_dim))
-        layers.append(nn.ReLU())
-        prev = hidden_dim
-    layers.append(nn.Linear(prev, output_dim))
-    return nn.Sequential(*layers)
+from regressors import load_model_from_checkpoint, SklearnModelWrapper, build_mlp  # noqa: F401
 
 
 def load_policy(checkpoint_path, device="cpu"):
     """Load model + normalization stats from a checkpoint.
 
     Returns:
-        model, mean, std, chunk_size
-        chunk_size defaults to 1 for older checkpoints without it.
+        model, mean, std, label_mean, label_std, feature_names
+        label_mean/label_std default to 0/1 (no-op) for older checkpoints.
+        feature_names is None for older checkpoints.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = build_mlp(ckpt["input_dim"], ckpt["output_dim"],
-                      ckpt["hidden_dim"], ckpt["num_layers"])
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
+
+    model = load_model_from_checkpoint(ckpt, device)
 
     mean = ckpt["input_mean"]
     std = ckpt["input_std"]
-    chunk_size = ckpt.get("chunk_size", 1)
-    return model, mean, std, chunk_size
+    # Backward compat: older checkpoints without label normalization
+    label_mean = ckpt.get("label_mean", np.zeros(ckpt["output_dim"]))
+    label_std = ckpt.get("label_std", np.ones(ckpt["output_dim"]))
+    feature_names = ckpt.get("feature_names", None)
+    return model, mean, std, label_mean, label_std, feature_names
 
 
-def predict(model, mean, std, obs, device="cpu", chunk_size=1):
+def predict(model, mean, std, obs, device="cpu",
+            label_mean=None, label_std=None):
     """Run inference on a single observation or batch.
 
     Args:
-        obs: numpy array of shape (37,) or (N, 37)
-        chunk_size: if > 1, reshape output to (K, 11) per sample
+        obs: numpy array of shape (D,) or (N, D)
+        label_mean, label_std: if provided, un-normalize the output
     Returns:
-        chunk_size == 1: numpy array of shape (11,) or (N, 11)
-        chunk_size  > 1 (single obs): numpy array of shape (K, 11)
-        chunk_size  > 1 (batch):      numpy array of shape (N, K, 11)
+        numpy array of shape (action_dim,) or (N, action_dim)
     """
     single = obs.ndim == 1
     if single:
@@ -58,8 +49,9 @@ def predict(model, mean, std, obs, device="cpu", chunk_size=1):
     with torch.no_grad():
         action = model(x).cpu().numpy()
 
-    if chunk_size > 1:
-        action = action.reshape(action.shape[0], chunk_size, -1)
+    # Un-normalize labels back to original scale
+    if label_mean is not None and label_std is not None:
+        action = action * label_std + label_mean
 
     return action[0] if single else action
 
@@ -78,8 +70,8 @@ def main():
     else:
         device = torch.device("cpu")
 
-    model, mean, std, chunk_size = load_policy(args.checkpoint, device=str(device))
-    print(f"Loaded policy from {args.checkpoint}  device={device}  chunk_size={chunk_size}")
+    model, mean, std, label_mean, label_std, _ = load_policy(args.checkpoint, device=str(device))
+    print(f"Loaded policy from {args.checkpoint}  device={device}")
 
     if args.data:
         # Run on dataset and print sample predictions vs ground truth
@@ -90,7 +82,8 @@ def main():
         rng = np.random.RandomState(0)
         idxs = rng.choice(len(inputs), size=min(100, len(inputs)), replace=False)
 
-        preds = predict(model, mean, std, inputs[idxs], device=str(device))
+        preds = predict(model, mean, std, inputs[idxs], device=str(device),
+                        label_mean=label_mean, label_std=label_std)
         abs_err = np.abs(preds - labels[idxs])  # (N, 11)
 
         for i, idx in enumerate(idxs):
@@ -122,7 +115,8 @@ def main():
     else:
         # Demo with a zero observation
         obs = np.zeros(37)
-        action = predict(model, mean, std, obs, device=str(device))
+        action = predict(model, mean, std, obs, device=str(device),
+                         label_mean=label_mean, label_std=label_std)
         print(f"Demo (zero input):")
         print(f"  wheel_cmds: {action[:4].round(4)}")
         print(f"  torque_arm: {action[4:].round(4)}")
