@@ -357,7 +357,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             # Add gravity compensation (unclamped so arm doesn't droop)
             if args.expert_grav:
                 tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                raw_torque = raw_torque + tau_g[6:13]
+                raw_torque = raw_torque + tau_g[6:13] - 5.0 * qd_mes[4:11]
             elif grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
