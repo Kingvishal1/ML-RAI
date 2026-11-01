@@ -166,8 +166,33 @@ def main():
     print(f"Saved base dataset: {base_path}  inputs={base_inputs.shape}  labels={base_labels.shape}")
     print(f"  Features: {base_names}")
 
-    # Arm dataset: 27 inputs -> 7 outputs (torque arm only)
-    arm_inputs = inputs[arm_mask][:, ARM_INPUT_INDICES]
+    # Arm dataset: 20 inputs -> 7 outputs (torque arm only)
+    # Extract raw columns then transform ee_pos and target to base-relative frame
+    arm_raw = inputs[arm_mask][:, ARM_INPUT_INDICES]  # (N, 20)
+    # q_arm(0:7), qd_arm(7:14) stay as-is; ee_pos(14:17), target(17:20) need transform
+    arm_base_pos = inputs[arm_mask][:, :3].copy()       # base x, y, bearing→z=0
+    arm_base_pos[:, 2] = 0.0  # base z position not stored; use 0 (ground plane)
+    arm_bearing = inputs[arm_mask][:, 2]                 # base_bearing
+    # Build per-sample rotation: R @ (world - base_pos)
+    c = np.cos(arm_bearing)
+    s = np.sin(arm_bearing)
+    ee_world = arm_raw[:, 14:17].copy()
+    tgt_world = arm_raw[:, 17:20].copy()
+    # Translate to base origin (use actual base z from sim — col 0,1 are xy, z≈0.15 not stored,
+    # but the height difference is what matters for the arm, so only rotate xy and keep z relative)
+    # For simplicity: rotate xy, keep z as world (arm z is mostly base-independent)
+    base_xy = inputs[arm_mask][:, :2]
+    ee_dx = ee_world[:, 0] - base_xy[:, 0]
+    ee_dy = ee_world[:, 1] - base_xy[:, 1]
+    tgt_dx = tgt_world[:, 0] - base_xy[:, 0]
+    tgt_dy = tgt_world[:, 1] - base_xy[:, 1]
+    arm_raw[:, 14] = c * ee_dx + s * ee_dy      # ee_x in base frame
+    arm_raw[:, 15] = -s * ee_dx + c * ee_dy      # ee_y in base frame
+    arm_raw[:, 16] = ee_world[:, 2]               # ee_z (keep world)
+    arm_raw[:, 17] = c * tgt_dx + s * tgt_dy      # target_x in base frame
+    arm_raw[:, 18] = -s * tgt_dx + c * tgt_dy      # target_y in base frame
+    arm_raw[:, 19] = tgt_world[:, 2]               # target_z (keep world)
+    arm_inputs = arm_raw
     arm_names = list(ARM_FEATURE_NAMES)
 
     # Drop requested arm features

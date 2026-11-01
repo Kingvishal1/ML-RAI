@@ -119,19 +119,34 @@ def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
 
 
 def build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
+                          base_pos=None, base_bearing=None,
                           feature_names=None):
-    """Assemble arm policy observation, optionally filtered by feature_names."""
+    """Assemble arm policy observation, optionally filtered by feature_names.
+
+    If base_pos and base_bearing are provided, ee_pos and target_ee_pos are
+    expressed in the base frame (translation + yaw rotation), making the
+    observation independent of the base's world-frame pose.
+    """
+    if base_pos is not None and base_bearing is not None:
+        c, s = np.cos(base_bearing), np.sin(base_bearing)
+        R = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
+        ee_rel = R @ (ee_pos - base_pos)
+        tgt_rel = R @ (target_ee_pos - base_pos)
+    else:
+        ee_rel = ee_pos
+        tgt_rel = target_ee_pos
+
     ALL_ARM = {}
     for i in range(7):
         ALL_ARM[f"q_arm_{i+1}"] = q_mes[4 + i]
     for i in range(7):
         ALL_ARM[f"qd_arm_{i+1}"] = qd_mes[4 + i]
-    ALL_ARM["ee_pos_x"] = ee_pos[0]
-    ALL_ARM["ee_pos_y"] = ee_pos[1]
-    ALL_ARM["ee_pos_z"] = ee_pos[2]
-    ALL_ARM["target_x"] = target_ee_pos[0]
-    ALL_ARM["target_y"] = target_ee_pos[1]
-    ALL_ARM["target_z"] = target_ee_pos[2]
+    ALL_ARM["ee_pos_x"] = ee_rel[0]
+    ALL_ARM["ee_pos_y"] = ee_rel[1]
+    ALL_ARM["ee_pos_z"] = ee_rel[2]
+    ALL_ARM["target_x"] = tgt_rel[0]
+    ALL_ARM["target_y"] = tgt_rel[1]
+    ALL_ARM["target_z"] = tgt_rel[2]
 
     if feature_names is None:
         feature_names = (
@@ -367,6 +382,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         elif phase == "arm":
             # Arm policy
             obs_arm = build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
+                                            base_pos=base_pos, base_bearing=base_bearing,
                                             feature_names=arm_feature_names)
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
@@ -382,7 +398,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 raw_torque = raw_torque + tau_grav
             if args.arm_damping > 0:
                 raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
-            torque_arm = np.clip(raw_torque, -30.0, 30.0)
+            torque_arm = np.clip(raw_torque, -20.0, 20.0)
 
             wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
             # Track arm phase metrics
