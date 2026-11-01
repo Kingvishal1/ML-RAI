@@ -263,7 +263,11 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             switch = False
             switch_reason = ""
 
-            if args.base_threshold is not None:
+            if getattr(args, "expert_base", False) and expert_base_state.done:
+                # Expert controller finished its own nav sequence
+                switch = True
+                switch_reason = "expert_done"
+            elif args.base_threshold is not None:
                 # XY distance mode
                 base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
                 if base_xy_dist < args.base_threshold:
