@@ -15,6 +15,8 @@ os.environ["ROBOENV_HEADLESS"] = "1"
 
 from robotnik_arm_task import (
     FIXED_FINGER_ANGLES,
+    TorqueNoise,
+    TorqueNoiseParams,
     setup_simulation,
     setup_kinematics,
     run_simulation_loop,
@@ -47,8 +49,8 @@ def generate_grid_targets(n=100):
 def generate_random_targets(n=100, seed=42):
     """Uniform random sampling from the workspace volume."""
     rng = np.random.default_rng(seed)
-    xs = rng.uniform(-5, 5, n)
-    ys = rng.uniform(-5, 5, n)
+    xs = rng.uniform(-1, 1, n)
+    ys = rng.uniform(-1, 1, n)
     zs = rng.uniform(0.2, 1.0, n)
     return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
 
@@ -60,7 +62,8 @@ def generate_random_targets(n=100, seed=42):
 def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
                           shoulder_frame_id, init_joint_angles,
                           lower_limits, upper_limits,
-                          target_ee_pos, vary_init=False, rng=None):
+                          target_ee_pos, vary_init=False, rng=None,
+                          torque_noise=None, hold_time=0.0):
     """Reset the sim and run one trajectory for a given target.
 
     Returns the data dict from run_simulation_loop or None on failure.
@@ -94,6 +97,8 @@ def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
             init_joint_angles_now, target_finger_angles,
             lower_limits, upper_limits,
             target_ee_pos=target_ee_pos,
+            torque_noise=torque_noise,
+            hold_time=hold_time,
         )
         return data
     except Exception as e:
@@ -195,6 +200,13 @@ LABEL_COLS = (
 META_COLS = ["trajectory_id", "time"]
 
 
+def make_torque_noise(noise_params, clean_frac, noise_rng):
+    """Return a fresh TorqueNoise for one trajectory, or None for a clean (noise-free) run."""
+    if noise_params is None or noise_rng.random() < clean_frac:
+        return None
+    return TorqueNoise(noise_params, noise_rng)
+
+
 def flush_chunk(all_trajectory_data, out_dir, chunk_idx):
     """Assemble a batch of trajectories and write to a temporary .npz chunk.
 
@@ -267,7 +279,8 @@ def save_dataset(inputs, labels, metadata, out_dir):
 # Worker for parallel collection
 # ==============================================================================
 
-def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir):
+def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir,
+                    noise_params=None, clean_frac=0.0, hold_time=0.0):
     """Run a batch of trajectories in an independent sim instance.
 
     Returns list of chunk file paths written to disk.
@@ -277,16 +290,20 @@ def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir):
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
 
     rng = np.random.default_rng(seed + worker_id) if vary_init else None
+    noise_rng = np.random.default_rng(seed + 1000 + worker_id)
 
     all_data = []
     chunk_paths = []
     chunk_idx = 0
     for idx, target in enumerate(targets):
-        print(f"  [W{worker_id}] [{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
+        torque_noise = make_torque_noise(noise_params, clean_frac, noise_rng)
+        print(f"  [W{worker_id}] [{idx+1}/{len(targets)}] Target: {np.round(target, 3)}"
+              f"{'  (noisy)' if torque_noise else ''}")
         data = run_single_trajectory(
             sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
             init_joint_angles, lower_limits, upper_limits,
             target_ee_pos=target, vary_init=vary_init, rng=rng,
+            torque_noise=torque_noise, hold_time=hold_time,
         )
         if data is not None and len(data["time"]) > 0:
             all_data.append(data)
@@ -331,7 +348,26 @@ def main():
                         help="Output directory (default: final/robotnik_arm_task/data/)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel sim workers (default: 1)")
+    # Torque noise (DART): perturb the executed arm torque, log the clean expert torque
+    parser.add_argument("--noise_std", type=float, default=0.0,
+                        help="Per-joint torque noise std in N*m during arm reaching; 0 disables (default: 0)")
+    parser.add_argument("--noise_prob", type=float, default=0.5,
+                        help="Chance each noise segment is active vs quiet (default: 0.5)")
+    parser.add_argument("--noise_kick_prob", type=float, default=0.1,
+                        help="Chance an active segment is a larger kick (default: 0.1)")
+    parser.add_argument("--noise_kick_scale", type=float, default=3.0,
+                        help="Kick std as a multiple of --noise_std (default: 3.0)")
+    parser.add_argument("--clean_frac", type=float, default=0.25,
+                        help="Fraction of trajectories collected without noise (default: 0.25)")
+    parser.add_argument("--hold_time", type=float, default=0.0,
+                        help="Seconds to keep recording after the target is first reached (default: 0)")
     args = parser.parse_args()
+
+    noise_params = None
+    if args.noise_std > 0:
+        noise_params = TorqueNoiseParams(std=args.noise_std, active_prob=args.noise_prob,
+                                         kick_prob=args.noise_kick_prob,
+                                         kick_scale=args.noise_kick_scale)
 
     # Generate targets
     if args.mode == "grid":
@@ -341,6 +377,10 @@ def main():
 
     print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init}, "
           f"workers={args.workers})")
+    if noise_params:
+        print(f"Torque noise: {noise_params}  clean_frac={args.clean_frac}")
+    if args.hold_time > 0:
+        print(f"Hold after reach: {args.hold_time}s")
 
     if args.workers <= 1:
         # Single-process mode (original behavior)
@@ -349,16 +389,20 @@ def main():
             lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
 
         rng = np.random.default_rng(args.seed) if args.vary_init else None
+        noise_rng = np.random.default_rng(args.seed + 1000)
 
         all_data = []
         chunk_paths = []
         chunk_idx = 0
         for idx, target in enumerate(targets):
-            print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}")
+            torque_noise = make_torque_noise(noise_params, args.clean_frac, noise_rng)
+            print(f"\n[{idx+1}/{len(targets)}] Target: {np.round(target, 3)}"
+                  f"{'  (noisy)' if torque_noise else ''}")
             data = run_single_trajectory(
                 sim, client, rid, dyn_model, ee_frame_id, shoulder_frame_id,
                 init_joint_angles, lower_limits, upper_limits,
                 target_ee_pos=target, vary_init=args.vary_init, rng=rng,
+                torque_noise=torque_noise, hold_time=args.hold_time,
             )
             if data is not None and len(data["time"]) > 0:
                 all_data.append(data)
@@ -390,7 +434,8 @@ def main():
             futures = {
                 executor.submit(
                     _worker_collect, wid, list(map(np.array, split)),
-                    args.vary_init, args.seed, args.flush_every, args.out_dir
+                    args.vary_init, args.seed, args.flush_every, args.out_dir,
+                    noise_params, args.clean_frac, args.hold_time,
                 ): wid
                 for wid, split in enumerate(splits) if len(split) > 0
             }

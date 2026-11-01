@@ -216,6 +216,14 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     phase = "base" if split_mode else "single"
     phase_switched = False
 
+    # Only stop once the EE has stayed inside the goal for HOLD_TIME seconds in a row;
+    # drifting out resets the timer and the simulation keeps running
+    HOLD_TIME = 1.0
+    first_reach_time = None
+    in_goal_since = None
+    times_drifted_out = 0
+    held = False
+
     # Phase switch tracking: settle detection
     best_ee_in_base = np.inf
     steps_since_ee_improved = 0
@@ -370,7 +378,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 torque_arm = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                              grav_tau_mean, grav_tau_std,
                                              q_mes[4:11], device=device)
-                torque_arm = np.clip(torque_arm, -30.0, 30.0)
+                torque_arm = np.clip(torque_arm, -50.0, 50.0)
             else:
                 torque_arm, q_des_arm, qd_des_arm = arm_controller(
                     dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
@@ -439,8 +447,22 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 break
 
         # ---- Check if target reached ----
-        if ee_dist_error < REACH_TOLERANCE and current_time > 8.0:
-            print(f"Target reached within {REACH_TOLERANCE*1000:.0f}mm at t={current_time:.2f}s!")
+        in_goal = ee_dist_error < REACH_TOLERANCE and current_time > 8.0
+        if in_goal and in_goal_since is None:
+            in_goal_since = current_time
+            if first_reach_time is None:
+                first_reach_time = current_time
+            print(f"Entered goal ({REACH_TOLERANCE*1000:.0f}mm) at t={current_time:.2f}s, "
+                  f"needs to stay {HOLD_TIME:.1f}s...")
+        elif not in_goal and in_goal_since is not None:
+            times_drifted_out += 1
+            print(f"Drifted out of goal at t={current_time:.2f}s after "
+                  f"{current_time - in_goal_since:.2f}s  EE err: {ee_dist_error:.4f}m, continuing")
+            in_goal_since = None
+        if in_goal_since is not None and current_time - in_goal_since >= HOLD_TIME:
+            held = True
+            print(f"Target held within {REACH_TOLERANCE*1000:.0f}mm for {HOLD_TIME:.1f}s "
+                  f"at t={current_time:.2f}s!")
             break
 
         # ---- Logging ----
@@ -456,12 +478,15 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         step += 1
 
     # ---- Final report ----
-    reached = ee_dist_error < REACH_TOLERANCE
+    reached = held
     print("=" * 60)
     print(f"Final EE Position  : {np.round(ee_pos, 4)}")
     print(f"Target EE Position : {target_ee_pos}")
     print(f"Final Error (m)    : {ee_dist_error:.4f}")
     print(f"Best Error (m)     : {best_ee_error:.4f}")
+    if first_reach_time is not None:
+        print(f"First reached at   : t={first_reach_time:.2f}s  "
+              f"(drifted out {times_drifted_out}x, held {HOLD_TIME:.1f}s: {'Yes' if held else 'No'})")
     print(f"Steps: {step}  Time: {current_time:.2f}s")
     if split_mode:
         print(f"Phase switched     : {'Yes' if phase_switched else 'No (stayed in base phase)'}")
@@ -471,6 +496,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         "final_err": ee_dist_error,
         "best_err": best_ee_error,
         "reached": reached,
+        "first_reach_time": first_reach_time,
+        "times_drifted_out": times_drifted_out,
         "steps": step,
         "time": current_time,
         "target": target_ee_pos.tolist(),
