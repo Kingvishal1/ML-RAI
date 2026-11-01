@@ -62,7 +62,7 @@ def main():
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
     parser.add_argument("--early_stop", type=float, default=0.0,
                         help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
-    parser.add_argument("--patience", type=int, default=20,
+    parser.add_argument("--patience", type=int, default=25,
                         help="Number of epochs without improvement before early stopping (default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
@@ -109,7 +109,7 @@ def main():
     else:
         device = torch.device("cpu")
 
-    y_val_orig = y_val * label_std + label_mean  # labels in original units, for metrics
+    y_val_orig = y_val  # already in original units (pre-normalization)
 
     # --- Label slices depend on mode ---
     mode = args.mode

@@ -353,16 +353,17 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            raw_torque = np.clip(raw_torque, -2.0, 2.0)
-            # Add gravity compensation (unclamped so arm doesn't droop)
+            # Add gravity compensation if using residual torque model
             if args.expert_grav:
                 tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                raw_torque = raw_torque + tau_g[6:13] - 10.0 * qd_mes[4:11]
+                raw_torque = raw_torque + tau_g[6:13]
             elif grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
                                            q_mes[4:11], device=device)
                 raw_torque = raw_torque + tau_grav
+            if args.arm_damping > 0:
+                raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
             torque_arm = np.clip(raw_torque, -30.0, 30.0)
 
             wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
@@ -473,6 +474,8 @@ def main():
                         help="Path to gravity compensation network checkpoint (adds predicted gravity torques to arm output)")
     parser.add_argument("--expert_grav", action="store_true",
                         help="Use analytical (Pinocchio) gravity compensation instead of learned network")
+    parser.add_argument("--arm_damping", type=float, default=0.0,
+                        help="Velocity damping coefficient for arm joints (default: 0, e.g. 5.0)")
     parser.add_argument("--headless", action="store_true",
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",

@@ -97,6 +97,8 @@ def main():
                         help="Epochs without improvement before early stopping (used with --train, default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
+    parser.add_argument("--arm_full_torque", action="store_true",
+                        help="Use full expert torques as arm labels (includes gravity) instead of residual")
     args = parser.parse_args()
 
     data = np.load(args.data)
@@ -185,14 +187,19 @@ def main():
             print(f"Dropped arm features: {dropped}  → {arm_inputs.shape[1]} dims")
 
     arm_torques = labels[arm_mask][:, 4:]               # raw expert torques (7)
-    tau_gravity = inputs[arm_mask][:, 37:44]              # gravity comp from expert (7)
-    arm_labels = arm_torques - tau_gravity                 # residual torques
+    if args.arm_full_torque:
+        arm_labels = arm_torques                          # full torques (includes gravity)
+        label_desc = "full expert torques (includes gravity)"
+    else:
+        tau_gravity = inputs[arm_mask][:, 37:44]          # gravity comp from expert (7)
+        arm_labels = arm_torques - tau_gravity             # residual torques
+        label_desc = "residual torques (expert - gravity comp)"
     arm_metadata = metadata[arm_mask]
     arm_path = os.path.join(out_dir, "dataset_arm.npz")
     np.savez(arm_path, inputs=arm_inputs, labels=arm_labels, metadata=arm_metadata,
              feature_names=np.array(arm_names))
     print(f"Saved arm dataset:  {arm_path}  inputs={arm_inputs.shape}  labels={arm_labels.shape}")
-    print(f"  Labels: residual torques (expert - gravity comp)")
+    print(f"  Labels: {label_desc}")
     print(f"  Features: {arm_names}")
 
     if not args.train:
