@@ -23,9 +23,11 @@ from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, REACH_TOLERANCE, ARM_REACH_LIMIT,
+    compute_base_goal, BASE_NAV_TIMEOUT,
 )
 from robotnik_arm_control import (
-    ArmControllerParams, arm_controller, configure_gripper_fingers, quaternion2bearing,
+    ArmControllerParams, BaseControllerParams, BaseNavState,
+    arm_controller, base_controller, configure_gripper_fingers, quaternion2bearing,
 )
 from run_policy import load_policy, predict
 from regressors import build_mlp
@@ -175,6 +177,12 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     arm_lower = np.array(lower_limits[4:11])
     arm_upper = np.array(upper_limits[4:11])
 
+    # Expert base controller state (used when --expert_base is set)
+    if getattr(args, "expert_base", False):
+        expert_base_state = BaseNavState()
+        base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT)
+        base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
+
     print("=" * 60)
     print(f"Target EE Position : {target_ee_pos}")
     print(f"Initial EE Position: {np.round(init_ee_pos, 4)}")
@@ -314,20 +322,26 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             torque_arm = np.clip(action[4:], -30.0, 30.0)
 
         elif phase == "base":
-            obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
-                                              base_ang_vel, target_ee_pos,
-                                              feature_names=base_feature_names)
-            vw = predict(base_model, base_mean, base_std, obs_base,
-                         device=device,
-                         label_mean=base_label_mean, label_std=base_label_std)
-            # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
-            v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
-            w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
-            v_cmd = np.clip(v_cmd, -0.25, 0.25)
-            w_cmd = np.clip(w_cmd, -1.0, 1.0)
-            lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-            rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-            wheel_cmds = np.array([rw, lw, lw, rw])
+            if getattr(args, "expert_base", False):
+                wheel_cmds = base_controller(
+                    expert_base_state, base_pos, base_bearing,
+                    base_goal_pos, base_goal_bearing, current_time, base_params,
+                )
+            else:
+                obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
+                                                  base_ang_vel, target_ee_pos,
+                                                  feature_names=base_feature_names)
+                vw = predict(base_model, base_mean, base_std, obs_base,
+                             device=device,
+                             label_mean=base_label_mean, label_std=base_label_std)
+                # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
+                v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
+                w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
+                v_cmd = np.clip(v_cmd, -0.25, 0.25)
+                w_cmd = np.clip(w_cmd, -1.0, 1.0)
+                lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+                rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+                wheel_cmds = np.array([rw, lw, lw, rw])
 
             if args.expert_grav:
                 tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
@@ -480,12 +494,15 @@ def main():
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal (MPS) GPU for inference")
+    parser.add_argument("--expert_base", action="store_true",
+                        help="Use expert base controller instead of learned policy")
     parser.add_argument("--retries", type=int, default=0,
                         help="Number of times to restart simulation on crash (default: 0)")
     args = parser.parse_args()
 
     # Determine mode
-    split_mode = args.base_checkpoint is not None and args.arm_checkpoint is not None
+    # --expert_base + --arm_checkpoint is a valid split mode (expert base, learned arm)
+    split_mode = (args.base_checkpoint is not None or args.expert_base) and args.arm_checkpoint is not None
     single_mode = args.checkpoint is not None
     if not split_mode and not single_mode:
         args.checkpoint = "bc_policy_100.pt"
@@ -509,11 +526,15 @@ def main():
         policy_kwargs.update(model=model, mean=mean, std=std,
                              label_mean=label_mean, label_std=label_std)
     else:
-        base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
-            load_policy(args.base_checkpoint, device=device)
+        if args.base_checkpoint is not None:
+            base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
+                load_policy(args.base_checkpoint, device=device)
+        else:
+            base_model = base_mean = base_std = base_lm = base_ls = base_fnames = None
         arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
             load_policy(args.arm_checkpoint, device=device)
-        print(f"Split mode: base={args.base_checkpoint}  arm={args.arm_checkpoint}  "
+        base_desc = "EXPERT" if args.expert_base else args.base_checkpoint
+        print(f"Split mode: base={base_desc}  arm={args.arm_checkpoint}  "
               f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
         policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
                              base_label_mean=base_lm, base_label_std=base_ls,
