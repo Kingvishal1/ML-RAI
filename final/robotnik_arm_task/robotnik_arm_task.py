@@ -111,10 +111,59 @@ def compute_base_goal(target_ee_pos):
     return base_goal_pos, target_bearing
 
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TorqueNoiseParams:
+    """Configuration for DART-style torque perturbation during data collection."""
+    std: float = 1.0              # base noise std (N·m per joint)
+    active_prob: float = 0.5      # probability each segment is noisy vs quiet
+    kick_prob: float = 0.1        # probability an active segment is a larger kick
+    kick_scale: float = 3.0       # kick std = kick_scale * std
+    segment_steps: int = 50       # steps per noise segment
+
+
+class TorqueNoise:
+    """Generates per-step torque perturbation vectors for 7 arm joints."""
+
+    def __init__(self, params: TorqueNoiseParams, rng=None):
+        self.params = params
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self._steps_in_segment = 0
+        self._current_noise = np.zeros(7)
+        self._active = False
+        self._new_segment()
+
+    def _new_segment(self):
+        self._steps_in_segment = 0
+        self._active = self.rng.random() < self.params.active_prob
+        if self._active:
+            scale = self.params.std
+            if self.rng.random() < self.params.kick_prob:
+                scale *= self.params.kick_scale
+            self._current_noise = self.rng.normal(0, scale, size=7)
+        else:
+            self._current_noise = np.zeros(7)
+
+    def sample(self):
+        """Return the noise vector for this step, advancing the segment clock."""
+        self._steps_in_segment += 1
+        if self._steps_in_segment >= self.params.segment_steps:
+            self._new_segment()
+        return self._current_noise
+
+
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                         init_joint_angles, target_finger_angles,
-                        lower_limits, upper_limits, target_ee_pos=None):
+                        lower_limits, upper_limits, target_ee_pos=None,
+                        torque_noise=None, hold_time=0.0):
     """Run the main control loop: base navigation then arm reaching.
+
+    If torque_noise is provided, its perturbation is added to the executed arm
+    torque but the logged labels are the clean expert torques.
+    If hold_time > 0, the loop continues recording for that many seconds after
+    the target is first reached.
 
     Returns a dict of logged data arrays.
     """
@@ -137,6 +186,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
     stop_criteria = StopCriteria(reach_tolerance=REACH_TOLERANCE, max_steps=max_steps)
     cmd = MotorCommands()
+    holding = False
+    hold_start = 0.0
 
     # Data logs
     time_all, ee_pos_all, ee_error_all = [], [], []
@@ -182,9 +233,12 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
             reach_active=base_navigation_done,
         )
 
-        # ---- Send commands ----
+        # ---- Send commands (apply noise to executed torque, log clean torque) ----
+        torque_arm_exec = torque_arm.copy()
+        if torque_noise is not None and base_navigation_done:
+            torque_arm_exec = np.clip(torque_arm_exec + torque_noise.sample(), -30.0, 30.0)
         torque_fingers = np.zeros(6)
-        cmd_all = np.concatenate((wheel_cmds, torque_arm, torque_fingers))
+        cmd_all = np.concatenate((wheel_cmds, torque_arm_exec, torque_fingers))
         control_modes = ["velocity"] * 4 + ["torque"] * 7 + ["torque"] * 6
         cmd.SetControlCmd(cmd_all, control_modes)
         sim.Step(cmd, "torque")
@@ -203,7 +257,15 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         # ---- Stop criteria ----
         stop_message = check_stop(stop_criteria, current_time, time_step, ee_dist_error, base_navigation_done)
         if stop_message:
-            print(stop_message)
+            if hold_time > 0 and "reached" in stop_message.lower() and not holding:
+                holding = True
+                hold_start = current_time
+                print(f"{stop_message}  (holding for {hold_time:.1f}s)")
+            elif not holding:
+                print(stop_message)
+                break
+        if holding and current_time - hold_start >= hold_time:
+            print(f"Hold complete at t={current_time:.2f}s")
             break
 
         # ---- Log data ----
