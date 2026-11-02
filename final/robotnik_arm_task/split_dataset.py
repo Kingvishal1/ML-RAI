@@ -99,6 +99,13 @@ def main():
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     parser.add_argument("--arm_full_torque", action="store_true",
                         help="Use full expert torques as arm labels (includes gravity) instead of residual")
+    parser.add_argument("--heading_threshold", type=float, default=0.15,
+                        help="Heading error (rad) below which base sub-phase is 'drive' "
+                             "(above = 'rotate'). Set to 0 to disable phase feature. (default: 0.15)")
+    parser.add_argument("--phase_by_vcmd", type=float, default=None,
+                        help="Label phase by expert v_cmd magnitude instead of heading error. "
+                             "Samples with |v_cmd| >= this threshold are 'drive', rest are 'rotate'. "
+                             "(e.g. 0.02)")
     args = parser.parse_args()
 
     data = np.load(args.data)
@@ -157,6 +164,30 @@ def main():
     rw = wheel_raw[:, 0]     # front_right == back_right
     lw = wheel_raw[:, 1]     # front_left  == back_left
     v_cmd = (rw + lw) / 2.0 * WHEEL_RADIUS               # m/s
+
+    # Append phase feature (rotate=0, drive=1)
+    if args.phase_by_vcmd is not None:
+        # Label by expert output: drive when expert sends meaningful forward velocity
+        is_drive = np.abs(v_cmd) >= args.phase_by_vcmd
+        phase_col = is_drive.astype(np.float64)[:, None]
+        base_inputs = np.hstack([base_inputs, phase_col])
+        base_names.append("phase")
+        n_drive = is_drive.sum()
+        n_rotate = phase_col.shape[0] - n_drive
+        print(f"Phase feature (by v_cmd): rotate={n_rotate} ({100*n_rotate/phase_col.shape[0]:.1f}%)  "
+              f"drive={n_drive} ({100*n_drive/phase_col.shape[0]:.1f}%)  "
+              f"|v_cmd| threshold={args.phase_by_vcmd}")
+    elif args.heading_threshold > 0:
+        # Label by heading error
+        is_rotate = np.abs(heading_error.flatten()) >= args.heading_threshold
+        phase_col = (~is_rotate).astype(np.float64)[:, None]
+        base_inputs = np.hstack([base_inputs, phase_col])
+        base_names.append("phase")
+        n_rotate = is_rotate.sum()
+        n_drive = phase_col.shape[0] - n_rotate
+        print(f"Phase feature (by heading): rotate={n_rotate} ({100*n_rotate/phase_col.shape[0]:.1f}%)  "
+              f"drive={n_drive} ({100*n_drive/phase_col.shape[0]:.1f}%)  "
+              f"threshold={args.heading_threshold:.3f} rad")
     w_cmd = (rw - lw) / WHEEL_BASE_WIDTH * WHEEL_RADIUS   # rad/s
     base_labels = np.column_stack([v_cmd, w_cmd])         # (N, 2)
     base_metadata = metadata[base_mask]
