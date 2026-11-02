@@ -51,7 +51,7 @@ def generate_random_targets(n=100, seed=42):
     rng = np.random.default_rng(seed)
     xs = rng.uniform(-1, 1, n)
     ys = rng.uniform(-1, 1, n)
-    zs = rng.uniform(0.2, 1.0, n)
+    zs = rng.uniform(0.2, 1.4, n)
     return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
 
 
@@ -227,10 +227,11 @@ def merge_chunks(chunk_paths, out_dir):
     """Load all chunk files, concatenate, save final dataset, and clean up."""
     all_inputs, all_labels, all_meta = [], [], []
     for p in chunk_paths:
-        d = np.load(p)
-        all_inputs.append(d["inputs"])
-        all_labels.append(d["labels"])
-        all_meta.append(d["metadata"])
+        # Close the file before cleanup; Windows cannot delete an open file
+        with np.load(p) as d:
+            all_inputs.append(d["inputs"])
+            all_labels.append(d["labels"])
+            all_meta.append(d["metadata"])
     inputs = np.concatenate(all_inputs)
     labels = np.concatenate(all_labels)
     metadata = np.concatenate(all_meta)
@@ -359,8 +360,8 @@ def main():
                         help="Kick std as a multiple of --noise_std (default: 3.0)")
     parser.add_argument("--clean_frac", type=float, default=0.25,
                         help="Fraction of trajectories collected without noise (default: 0.25)")
-    parser.add_argument("--hold_time", type=float, default=0.0,
-                        help="Seconds to keep recording after the target is first reached (default: 0)")
+    parser.add_argument("--hold_time", type=float, default=2.0,
+                        help="Seconds to keep recording after the target is first reached (default: 2)")
     args = parser.parse_args()
 
     noise_params = None
