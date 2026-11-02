@@ -80,12 +80,27 @@ def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
 
 def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
                            target_ee_pos, feature_names=None):
-    """Assemble base policy observation, optionally filtered by feature_names."""
+    """Assemble base policy observation, optionally filtered by feature_names.
+
+    Linear velocities are rotated into the base frame so that 'forward' and
+    'lateral' are always relative to the robot's heading.
+    """
     delta = target_ee_pos[:2] - base_pos[:2]
     dist_to_target = np.linalg.norm(delta)
     heading_to_target = np.arctan2(delta[1], delta[0])
     heading_error = np.arctan2(np.sin(heading_to_target - base_bearing),
                                np.cos(heading_to_target - base_bearing))
+
+    # Rotate world-frame linear velocity into base frame
+    c, s = np.cos(base_bearing), np.sin(base_bearing)
+    fwd_vel = c * base_lin_vel[0] + s * base_lin_vel[1]   # forward
+    lat_vel = -s * base_lin_vel[0] + c * base_lin_vel[1]   # lateral (left)
+
+    # Target in base frame (Cartesian, position-agnostic)
+    dx = target_ee_pos[0] - base_pos[0]
+    dy = target_ee_pos[1] - base_pos[1]
+    target_in_base_x = c * dx + s * dy    # forward distance
+    target_in_base_y = -s * dx + c * dy   # lateral distance
 
     # All possible base features
     ALL_BASE = {
@@ -103,16 +118,18 @@ def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
         "target_z": target_ee_pos[2],
         "dist_to_target": dist_to_target,
         "heading_error": heading_error,
+        "fwd_vel": fwd_vel,
+        "lat_vel": lat_vel,
+        "target_in_base_x": target_in_base_x,
+        "target_in_base_y": target_in_base_y,
     }
 
     if feature_names is None:
-        # Default 12-dim (no z features)
+        # Default: base-frame velocities + Cartesian target in base frame (5-dim, fully generalizable)
         feature_names = [
-            "base_pos_x", "base_pos_y", "base_bearing",
-            "base_lin_vel_x", "base_lin_vel_y",
-            "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
-            "target_x", "target_y",
-            "dist_to_target", "heading_error",
+            "fwd_vel", "lat_vel",
+            "base_ang_vel_z",
+            "target_in_base_x", "target_in_base_y",
         ]
 
     return np.array([ALL_BASE[name] for name in feature_names])
@@ -129,9 +146,12 @@ def build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
     """
     if base_pos is not None and base_bearing is not None:
         c, s = np.cos(base_bearing), np.sin(base_bearing)
-        R = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
-        ee_rel = R @ (ee_pos - base_pos)
-        tgt_rel = R @ (target_ee_pos - base_pos)
+        # Rotate xy into base frame, keep z as world (base z not in training data)
+        base_xy = base_pos[:2]
+        ee_dx, ee_dy = ee_pos[0] - base_xy[0], ee_pos[1] - base_xy[1]
+        tgt_dx, tgt_dy = target_ee_pos[0] - base_xy[0], target_ee_pos[1] - base_xy[1]
+        ee_rel = np.array([c * ee_dx + s * ee_dy, -s * ee_dx + c * ee_dy, ee_pos[2]])
+        tgt_rel = np.array([c * tgt_dx + s * tgt_dy, -s * tgt_dx + c * tgt_dy, target_ee_pos[2]])
     else:
         ee_rel = ee_pos
         tgt_rel = target_ee_pos
@@ -166,6 +186,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             # split-mode policies
             base_model=None, base_mean=None, base_std=None,
             base_label_mean=None, base_label_std=None, base_feature_names=None,
+            has_base_phases=False,
             arm_model=None, arm_mean=None, arm_std=None,
             arm_label_mean=None, arm_label_std=None, arm_feature_names=None,
             # gravity compensation
@@ -239,6 +260,9 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     arm_best_ee = np.inf
     arm_final_ee = np.inf
     switch_time = None
+
+    # Rotate/drive sub-phase state (persisted across steps for hysteresis)
+    base_sub_phase = "rotate"  # start in rotate
 
     # Track last known good state for the final report on crash
     ee_pos = init_ee_pos.copy()
@@ -355,15 +379,44 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                     base_goal_pos, base_goal_bearing, current_time, base_params,
                 )
             else:
+                # Build base observation (without phase — feature_names minus "phase")
+                obs_feature_names = [n for n in base_feature_names if n != "phase"] \
+                    if has_base_phases else base_feature_names
                 obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
                                                   base_ang_vel, target_ee_pos,
-                                                  feature_names=base_feature_names)
+                                                  feature_names=obs_feature_names)
+
+                # Determine rotate/drive sub-phase with hysteresis
+                if has_base_phases:
+                    delta_base = target_ee_pos[:2] - base_pos[:2]
+                    heading_to_target = np.arctan2(delta_base[1], delta_base[0])
+                    heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
+                                             np.cos(heading_to_target - base_bearing))
+                    abs_herr = abs(heading_err)
+                    # Hysteresis: enter drive at threshold, exit back to rotate at 2x
+                    if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
+                        base_sub_phase = "drive"
+                    elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
+                        base_sub_phase = "rotate"
+                    phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
+                    obs_base = np.append(obs_base, phase_val)
+
                 vw = predict(base_model, base_mean, base_std, obs_base,
                              device=device,
                              label_mean=base_label_mean, label_std=base_label_std)
-                # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
-                v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
-                w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
+
+                # Output masking: enforce phase constraints
+                if has_base_phases:
+                    if base_sub_phase == "rotate":
+                        v_cmd = 0.0
+                        w_cmd = vw[1]
+                    else:  # drive
+                        v_cmd = max(vw[0], 0.0)  # forward only
+                        w_cmd = 0.0
+                else:
+                    v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
+                    w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
+
                 v_cmd = np.clip(v_cmd, -0.25, 0.25)
                 w_cmd = np.clip(w_cmd, -1.0, 1.0)
                 lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
@@ -468,6 +521,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         # ---- Logging ----
         if step % 500 == 0:
             phase_str = f" [{phase}]" if split_mode else ""
+            if phase == "base" and has_base_phases and not getattr(args, "expert_base", False):
+                phase_str = f" [base/{base_sub_phase}]"
             print(f"t={current_time:.2f}s{phase_str} | Base: {np.round(base_pos[:2], 3)} | "
                   f"EE: {np.round(ee_pos, 3)} | EE err: {ee_dist_error:.4f}m | "
                   f"best: {best_ee_error:.4f}m")
@@ -545,6 +600,9 @@ def main():
                         help="Use expert base controller instead of learned policy")
     parser.add_argument("--retries", type=int, default=0,
                         help="Number of times to restart simulation on crash (default: 0)")
+    parser.add_argument("--heading_threshold", type=float, default=0.15,
+                        help="Heading error (rad) for rotate/drive sub-phase transition "
+                             "(only used when base checkpoint has 'phase' feature, default: 0.15)")
     args = parser.parse_args()
 
     # Determine mode
@@ -580,12 +638,16 @@ def main():
             base_model = base_mean = base_std = base_lm = base_ls = base_fnames = None
         arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
             load_policy(args.arm_checkpoint, device=device)
+        has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
         base_desc = "EXPERT" if args.expert_base else args.base_checkpoint
+        phase_desc = f"  phases={'yes (thr={args.heading_threshold:.3f})' if has_base_phases else 'no'}"
         print(f"Split mode: base={base_desc}  arm={args.arm_checkpoint}  "
-              f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
+              f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}"
+              f"{phase_desc}")
         policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
                              base_label_mean=base_lm, base_label_std=base_ls,
                              base_feature_names=base_fnames,
+                             has_base_phases=has_base_phases,
                              arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
                              arm_label_mean=arm_lm, arm_label_std=arm_ls,
                              arm_feature_names=arm_fnames)
