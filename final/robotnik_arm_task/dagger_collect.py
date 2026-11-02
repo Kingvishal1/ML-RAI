@@ -180,26 +180,12 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
 
         # ---- Compute action ----
         if phase == "base":
-            # Build base observation (without phase — feature_names minus "phase")
+            # Build base observation (without phase for both legacy and phase-output models)
             obs_feature_names = [n for n in base_feature_names if n != "phase"] \
                 if has_base_phases else base_feature_names
             obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
                                               base_ang_vel, target_ee_pos,
                                               feature_names=obs_feature_names)
-
-            # Determine rotate/drive sub-phase with hysteresis
-            if has_base_phases:
-                delta_base = target_ee_pos[:2] - base_pos[:2]
-                heading_to_target = np.arctan2(delta_base[1], delta_base[0])
-                heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
-                                         np.cos(heading_to_target - base_bearing))
-                abs_herr = abs(heading_err)
-                if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
-                    base_sub_phase = "drive"
-                elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
-                    base_sub_phase = "rotate"
-                phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
-                obs_base = np.append(obs_base, phase_val)
 
             # Query expert base controller at the policy-visited state
             expert_wheel_cmds = base_controller(
@@ -212,16 +198,29 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
             v_cmd_expert = (rw_expert + lw_expert) / 2.0 * WHEEL_RADIUS
             w_cmd_expert = (rw_expert - lw_expert) / WHEEL_BASE_WIDTH * WHEEL_RADIUS
 
+            if has_base_phases:
+                # Phase as input feature with hysteresis
+                delta_base = target_ee_pos[:2] - base_pos[:2]
+                heading_to_target = np.arctan2(delta_base[1], delta_base[0])
+                heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
+                                         np.cos(heading_to_target - base_bearing))
+                abs_herr = abs(heading_err)
+                if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
+                    base_sub_phase = "drive"
+                elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
+                    base_sub_phase = "rotate"
+                phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
+                obs_base = np.append(obs_base, phase_val)
+
             if args.expert_base:
                 # Expert base mode: skip policy, use expert directly
                 policy_wheel_cmds = expert_wheel_cmds
             else:
-                # Query learned base policy
                 vw = predict(base_model, base_mean, base_std, obs_base,
                              device=device,
                              label_mean=base_label_mean, label_std=base_label_std)
 
-                # Output masking: enforce phase constraints
+                # Hard output masking at inference
                 if has_base_phases:
                     if base_sub_phase == "rotate":
                         v_cmd_policy = 0.0
@@ -239,8 +238,8 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
                 rw_policy = (v_cmd_policy + w_cmd_policy * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
                 policy_wheel_cmds = np.array([rw_policy, lw_policy, lw_policy, rw_policy])
 
-            # Record base DAgger data (obs includes phase feature if applicable)
-            base_obs_list.append(obs_base)
+            # Record base DAgger data (obs WITHOUT phase feature)
+            base_obs_list.append(obs_base if not has_base_phases else obs_base[:-1])
             base_label_list.append([v_cmd_expert, w_cmd_expert])
             base_meta_list.append([target_id, base_step])
             base_step += 1
@@ -422,9 +421,12 @@ def main():
     arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
         load_policy(args.arm_checkpoint, device=device)
 
+    # Detect phase-as-input model (has 'phase' in feature names)
     has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
+
+    phase_info = f"input (thr={args.heading_threshold})" if has_base_phases else "no"
     print(f"Base: {'EXPERT' if args.expert_base else args.base_checkpoint}"
-          f"  phases={'yes (thr=' + str(args.heading_threshold) + ')' if has_base_phases else 'no'}")
+          f"  phases={phase_info}")
     print(f"Arm policy:  {args.arm_checkpoint}")
     print(f"Device: {device}  Beta: {args.beta}  Targets: {args.num_targets}")
     print(f"Full torque labels: {args.arm_full_torque}")
@@ -474,8 +476,9 @@ def main():
     if args.append_to:
         append_base_path, append_arm_path = _out_paths(args.append_to)
 
-    # Resolve feature names
+    # Resolve feature names (exclude "phase" — it's a label, not input, for phase-output models)
     base_fnames_out = list(base_fnames) if base_fnames is not None else list(BASE_FEATURE_NAMES)
+    base_fnames_out = [n for n in base_fnames_out if n != "phase"]
     arm_fnames_out = list(arm_fnames) if arm_fnames is not None else list(ARM_FEATURE_NAMES)
 
     # Save base data

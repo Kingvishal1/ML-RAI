@@ -157,7 +157,6 @@ class MLPRegressor(BaseRegressor):
         num_workers = kwargs.get("num_workers", 0)
         device_name = kwargs.get("device", "cpu")
         on_epoch = kwargs.get("on_epoch", None)
-
         device = torch.device(device_name)
         input_dim = X_train.shape[1]
         output_dim = y_train.shape[1]

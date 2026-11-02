@@ -165,31 +165,29 @@ def main():
     lw = wheel_raw[:, 1]     # front_left  == back_left
     v_cmd = (rw + lw) / 2.0 * WHEEL_RADIUS               # m/s
 
-    # Append phase feature (rotate=0, drive=1)
+    # Compute phase feature (rotate=0, drive=1) — appended as input feature
+    phase_col = None
     if args.phase_by_vcmd is not None:
-        # Label by expert output: drive when expert sends meaningful forward velocity
         is_drive = np.abs(v_cmd) >= args.phase_by_vcmd
-        phase_col = is_drive.astype(np.float64)[:, None]
-        base_inputs = np.hstack([base_inputs, phase_col])
-        base_names.append("phase")
+        phase_col = is_drive.astype(np.float64)
         n_drive = is_drive.sum()
-        n_rotate = phase_col.shape[0] - n_drive
-        print(f"Phase feature (by v_cmd): rotate={n_rotate} ({100*n_rotate/phase_col.shape[0]:.1f}%)  "
-              f"drive={n_drive} ({100*n_drive/phase_col.shape[0]:.1f}%)  "
+        n_rotate = len(phase_col) - n_drive
+        print(f"Phase feature (by v_cmd): rotate={n_rotate} ({100*n_rotate/len(phase_col):.1f}%)  "
+              f"drive={n_drive} ({100*n_drive/len(phase_col):.1f}%)  "
               f"|v_cmd| threshold={args.phase_by_vcmd}")
     elif args.heading_threshold > 0:
-        # Label by heading error
         is_rotate = np.abs(heading_error.flatten()) >= args.heading_threshold
-        phase_col = (~is_rotate).astype(np.float64)[:, None]
-        base_inputs = np.hstack([base_inputs, phase_col])
-        base_names.append("phase")
+        phase_col = (~is_rotate).astype(np.float64)
         n_rotate = is_rotate.sum()
-        n_drive = phase_col.shape[0] - n_rotate
-        print(f"Phase feature (by heading): rotate={n_rotate} ({100*n_rotate/phase_col.shape[0]:.1f}%)  "
-              f"drive={n_drive} ({100*n_drive/phase_col.shape[0]:.1f}%)  "
+        n_drive = len(phase_col) - n_rotate
+        print(f"Phase feature (by heading): rotate={n_rotate} ({100*n_rotate/len(phase_col):.1f}%)  "
+              f"drive={n_drive} ({100*n_drive/len(phase_col):.1f}%)  "
               f"threshold={args.heading_threshold:.3f} rad")
+    if phase_col is not None:
+        base_inputs = np.column_stack([base_inputs, phase_col])
+        base_names.append("phase")
     w_cmd = (rw - lw) / WHEEL_BASE_WIDTH * WHEEL_RADIUS   # rad/s
-    base_labels = np.column_stack([v_cmd, w_cmd])         # (N, 2)
+    base_labels = np.column_stack([v_cmd, w_cmd])             # (N, 2)
     base_metadata = metadata[base_mask]
     base_path = os.path.join(out_dir, "dataset_base.npz")
     np.savez(base_path, inputs=base_inputs, labels=base_labels, metadata=base_metadata,
