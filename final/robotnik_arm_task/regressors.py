@@ -185,64 +185,72 @@ class MLPRegressor(BaseRegressor):
         epochs_without_improvement = 0
         t_start = _time.time()
 
-        for epoch in range(1, epochs + 1):
-            # Train: weighted MAE, gradient clipping
-            model.train()
-            train_loss = 0.0
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                pred = model(xb)
-                loss = ((pred - yb).abs() * loss_weights).mean()
-                optimizer.zero_grad()
-                loss.backward()
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                train_loss += loss.item() * xb.size(0)
-            train_loss /= len(train_ds)
-
-            # Validation: MSE
-            model.eval()
-            val_loss = 0.0
-            val_pred = []
-            with torch.no_grad():
-                for xb, yb in val_loader:
+        try:
+            for epoch in range(1, epochs + 1):
+                # Train: weighted MAE, gradient clipping
+                model.train()
+                train_loss = 0.0
+                for xb, yb in train_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     pred = model(xb)
-                    val_loss += criterion(pred, yb).item() * xb.size(0)
-                    if on_epoch is not None:
-                        val_pred.append(pred.cpu().numpy())
-            val_loss /= len(val_ds)
+                    loss = ((pred - yb).abs() * loss_weights).mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                    train_loss += loss.item() * xb.size(0)
+                train_loss /= len(train_ds)
 
-            if val_loss < best_val - early_stop:
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-            improved = val_loss < best_val
-            if improved:
-                best_val = val_loss
-                best_epoch = epoch
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                # Validation: MSE
+                model.eval()
+                val_loss = 0.0
+                val_pred = []
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb, yb = xb.to(device), yb.to(device)
+                        pred = model(xb)
+                        val_loss += criterion(pred, yb).item() * xb.size(0)
+                        if on_epoch is not None:
+                            val_pred.append(pred.cpu().numpy())
+                val_loss /= len(val_ds)
 
-            if on_epoch is not None:
-                on_epoch(epoch, train_loss, val_loss, np.concatenate(val_pred), improved, model)
-            elif epoch % max(1, epochs // 5) == 0 or epoch == 1:
-                print(f"  [mlp] epoch {epoch}/{epochs}  val_loss={val_loss:.6f}  best={best_val:.6f}")
+                if val_loss < best_val - early_stop:
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                improved = val_loss < best_val
+                if improved:
+                    best_val = val_loss
+                    best_epoch = epoch
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-            if epochs_without_improvement >= patience:
-                print(f"\nEarly stopping: no improvement > {early_stop} for {patience} epochs")
-                break
+                if on_epoch is not None:
+                    on_epoch(epoch, train_loss, val_loss, np.concatenate(val_pred), improved, model)
+                elif epoch % max(1, epochs // 5) == 0 or epoch == 1:
+                    print(f"  [mlp] epoch {epoch}/{epochs}  val_loss={val_loss:.6f}  best={best_val:.6f}")
+
+                if epochs_without_improvement >= patience:
+                    print(f"\nEarly stopping: no improvement > {early_stop} for {patience} epochs")
+                    break
+        except KeyboardInterrupt:
+            print(f"\nInterrupted at epoch {epoch}. Saving best checkpoint (epoch {best_epoch})...")
 
         elapsed = _time.time() - t_start
 
         # Restore best weights and compute final metrics
+        if best_state is None:
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = 0
         model.load_state_dict(best_state)
         model.eval()
         model.to(device)
 
+        # Re-create val loader without workers (original may be dead after interrupt)
+        val_loader_final = DataLoader(val_ds, batch_size=batch_size, num_workers=0)
         all_pred = []
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for xb, yb in val_loader_final:
                 xb = xb.to(device)
                 all_pred.append(model(xb).cpu().numpy())
         all_pred = np.concatenate(all_pred)
