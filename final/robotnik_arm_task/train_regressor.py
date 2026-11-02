@@ -41,7 +41,7 @@ def main():
                         help=f"Model type (default: mlp, available: {available_regressors()})")
     # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument("--batch_size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=3)
@@ -60,9 +60,9 @@ def main():
                         help="DataLoader worker processes for parallel data loading (default: 0)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
-    parser.add_argument("--early_stop", type=float, default=0.0,
+    parser.add_argument("--early_stop", type=float, default=0.00001,
                         help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
-    parser.add_argument("--patience", type=int, default=25,
+    parser.add_argument("--patience", type=int, default=40,
                         help="Number of epochs without improvement before early stopping (default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")

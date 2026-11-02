@@ -152,6 +152,49 @@ def compute_base_goal(target_ee_pos):
     return base_goal_pos, target_bearing
 
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TorqueNoiseParams:
+    """Configuration for DART-style torque perturbation during data collection."""
+    std: float = 1.0              # base noise std (N·m per joint)
+    active_prob: float = 0.5      # probability each segment is noisy vs quiet
+    kick_prob: float = 0.1        # probability an active segment is a larger kick
+    kick_scale: float = 3.0       # kick std = kick_scale * std
+    segment_steps: int = 50       # steps per noise segment
+
+
+class TorqueNoise:
+    """Generates per-step torque perturbation vectors for 7 arm joints."""
+
+    def __init__(self, params: TorqueNoiseParams, rng=None):
+        self.params = params
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self._steps_in_segment = 0
+        self._current_noise = np.zeros(7)
+        self._active = False
+        self._new_segment()
+
+    def _new_segment(self):
+        self._steps_in_segment = 0
+        self._active = self.rng.random() < self.params.active_prob
+        if self._active:
+            scale = self.params.std
+            if self.rng.random() < self.params.kick_prob:
+                scale *= self.params.kick_scale
+            self._current_noise = self.rng.normal(0, scale, size=7)
+        else:
+            self._current_noise = np.zeros(7)
+
+    def sample(self):
+        """Return the noise vector for this step, advancing the segment clock."""
+        self._steps_in_segment += 1
+        if self._steps_in_segment >= self.params.segment_steps:
+            self._new_segment()
+        return self._current_noise
+
+
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                         init_joint_angles, target_finger_angles,
                         lower_limits, upper_limits, target_ee_pos=None,
@@ -268,7 +311,15 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                 elif not (stop_message or "").startswith("Reached step cap"):
                     stop_message = None
         if stop_message:
-            print(stop_message)
+            if hold_time > 0 and "reached" in stop_message.lower() and not holding:
+                holding = True
+                hold_start = current_time
+                print(f"{stop_message}  (holding for {hold_time:.1f}s)")
+            elif not holding:
+                print(stop_message)
+                break
+        if holding and current_time - hold_start >= hold_time:
+            print(f"Hold complete at t={current_time:.2f}s")
             break
 
         # ---- Log data ----

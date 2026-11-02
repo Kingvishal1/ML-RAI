@@ -23,11 +23,9 @@ from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, REACH_TOLERANCE, ARM_REACH_LIMIT,
-    compute_base_goal, BASE_NAV_TIMEOUT,
 )
 from robotnik_arm_control import (
-    ArmControllerParams, BaseControllerParams, BaseNavState,
-    arm_controller, base_controller, configure_gripper_fingers, quaternion2bearing,
+    configure_gripper_fingers, quaternion2bearing,
 )
 from run_policy import load_policy, predict
 from regressors import build_mlp
@@ -58,6 +56,8 @@ def predict_gravity(grav_model, q_mean, q_std, tau_mean, tau_std, q_arm, device=
 # Wheel kinematic constants (from BaseControllerParams)
 WHEEL_RADIUS = 0.11
 WHEEL_BASE_WIDTH = 0.66
+# Approximate height of arm shoulder joint above ground (from robot URDF)
+SHOULDER_HEIGHT = 0.75
 
 
 def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
@@ -80,12 +80,27 @@ def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
 
 def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
                            target_ee_pos, feature_names=None):
-    """Assemble base policy observation, optionally filtered by feature_names."""
+    """Assemble base policy observation, optionally filtered by feature_names.
+
+    Linear velocities are rotated into the base frame so that 'forward' and
+    'lateral' are always relative to the robot's heading.
+    """
     delta = target_ee_pos[:2] - base_pos[:2]
     dist_to_target = np.linalg.norm(delta)
     heading_to_target = np.arctan2(delta[1], delta[0])
     heading_error = np.arctan2(np.sin(heading_to_target - base_bearing),
                                np.cos(heading_to_target - base_bearing))
+
+    # Rotate world-frame linear velocity into base frame
+    c, s = np.cos(base_bearing), np.sin(base_bearing)
+    fwd_vel = c * base_lin_vel[0] + s * base_lin_vel[1]   # forward
+    lat_vel = -s * base_lin_vel[0] + c * base_lin_vel[1]   # lateral (left)
+
+    # Target in base frame (Cartesian, position-agnostic)
+    dx = target_ee_pos[0] - base_pos[0]
+    dy = target_ee_pos[1] - base_pos[1]
+    target_in_base_x = c * dx + s * dy    # forward distance
+    target_in_base_y = -s * dx + c * dy   # lateral distance
 
     # All possible base features
     ALL_BASE = {
@@ -103,16 +118,18 @@ def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
         "target_z": target_ee_pos[2],
         "dist_to_target": dist_to_target,
         "heading_error": heading_error,
+        "fwd_vel": fwd_vel,
+        "lat_vel": lat_vel,
+        "target_in_base_x": target_in_base_x,
+        "target_in_base_y": target_in_base_y,
     }
 
     if feature_names is None:
-        # Default 12-dim (no z features)
+        # Default: base-frame velocities + Cartesian target in base frame (5-dim, fully generalizable)
         feature_names = [
-            "base_pos_x", "base_pos_y", "base_bearing",
-            "base_lin_vel_x", "base_lin_vel_y",
-            "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
-            "target_x", "target_y",
-            "dist_to_target", "heading_error",
+            "fwd_vel", "lat_vel",
+            "base_ang_vel_z",
+            "target_in_base_x", "target_in_base_y",
         ]
 
     return np.array([ALL_BASE[name] for name in feature_names])
@@ -129,9 +146,12 @@ def build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
     """
     if base_pos is not None and base_bearing is not None:
         c, s = np.cos(base_bearing), np.sin(base_bearing)
-        R = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
-        ee_rel = R @ (ee_pos - base_pos)
-        tgt_rel = R @ (target_ee_pos - base_pos)
+        # Rotate xy into base frame, keep z as world (base z not in training data)
+        base_xy = base_pos[:2]
+        ee_dx, ee_dy = ee_pos[0] - base_xy[0], ee_pos[1] - base_xy[1]
+        tgt_dx, tgt_dy = target_ee_pos[0] - base_xy[0], target_ee_pos[1] - base_xy[1]
+        ee_rel = np.array([c * ee_dx + s * ee_dy, -s * ee_dx + c * ee_dy, ee_pos[2]])
+        tgt_rel = np.array([c * tgt_dx + s * tgt_dy, -s * tgt_dx + c * tgt_dy, target_ee_pos[2]])
     else:
         ee_rel = ee_pos
         tgt_rel = target_ee_pos
@@ -166,6 +186,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             # split-mode policies
             base_model=None, base_mean=None, base_std=None,
             base_label_mean=None, base_label_std=None, base_feature_names=None,
+            has_base_phases=False,
             arm_model=None, arm_mean=None, arm_std=None,
             arm_label_mean=None, arm_label_std=None, arm_feature_names=None,
             # gravity compensation
@@ -183,20 +204,6 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     time_step = sim.GetTimeStep()
     current_time = 0.0
     cmd = MotorCommands()
-
-    # Arm hold controller state (for split mode phase 1)
-    arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
-    q_init_arm = init_joint_angles[4:11].copy()
-    q_des_arm = q_init_arm.copy()
-    qd_des_arm = np.zeros(7)
-    arm_lower = np.array(lower_limits[4:11])
-    arm_upper = np.array(upper_limits[4:11])
-
-    # Expert base controller state (used when --expert_base is set)
-    if getattr(args, "expert_base", False):
-        expert_base_state = BaseNavState()
-        base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT)
-        base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
 
     print("=" * 60)
     print(f"Target EE Position : {target_ee_pos}")
@@ -225,10 +232,6 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     held = False
 
     # Phase switch tracking: settle detection
-    best_ee_in_base = np.inf
-    steps_since_ee_improved = 0
-    SETTLE_PATIENCE = 500          # steps without EE improvement
-    SETTLE_SPEED_THRESH = 0.05     # m/s base speed to consider "settled"
 
     # Per-phase tracking
     base_best_ee = np.inf
@@ -239,6 +242,9 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     arm_best_ee = np.inf
     arm_final_ee = np.inf
     switch_time = None
+
+    # Rotate/drive sub-phase state (persisted across steps for hysteresis)
+    base_sub_phase = "rotate"  # start in rotate
 
     # Track last known good state for the final report on crash
     ee_pos = init_ee_pos.copy()
@@ -286,31 +292,10 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             switch = False
             switch_reason = ""
 
-            if getattr(args, "expert_base", False) and expert_base_state.done:
-                # Expert controller finished its own nav sequence
+            base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
+            if base_xy_dist < args.base_threshold:
                 switch = True
-                switch_reason = "expert_done"
-            elif args.base_threshold is not None:
-                # XY distance mode
-                base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
-                if base_xy_dist < args.base_threshold:
-                    switch = True
-                    switch_reason = f"xy_dist={base_xy_dist:.4f}m"
-            else:
-                # Settle detection mode
-                if ee_dist_error < best_ee_in_base - 0.01:
-                    best_ee_in_base = ee_dist_error
-                    steps_since_ee_improved = 0
-                else:
-                    steps_since_ee_improved += 1
-                settled = (steps_since_ee_improved >= SETTLE_PATIENCE
-                           and base_speed < SETTLE_SPEED_THRESH
-                           and current_time > 2.0)
-                if settled:
-                    switch = True
-                    switch_reason = (f"ee_err={ee_dist_error:.4f}m  "
-                                     f"base_speed={base_speed:.4f}m/s  "
-                                     f"best_ee={best_ee_in_base:.4f}m")
+                switch_reason = f"xy_dist={base_xy_dist:.4f}m"
 
             # Track base phase metrics
             if ee_dist_error < base_best_ee:
@@ -349,43 +334,60 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             torque_arm = np.clip(action[4:], -30.0, 30.0)
 
         elif phase == "base":
-            if getattr(args, "expert_base", False):
-                wheel_cmds = base_controller(
-                    expert_base_state, base_pos, base_bearing,
-                    base_goal_pos, base_goal_bearing, current_time, base_params,
-                )
+            # Build base observation (without phase input)
+            obs_feature_names = [n for n in base_feature_names if n != "phase"] \
+                if has_base_phases else base_feature_names
+            obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
+                                              base_ang_vel, target_ee_pos,
+                                              feature_names=obs_feature_names)
+
+            # Heading-based phase switching
+            if has_base_phases:
+                delta_base = target_ee_pos[:2] - base_pos[:2]
+                heading_to_target = np.arctan2(delta_base[1], delta_base[0])
+                heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
+                                         np.cos(heading_to_target - base_bearing))
+                abs_herr = abs(heading_err)
+                if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
+                    base_sub_phase = "drive"
+                elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
+                    base_sub_phase = "rotate"
+                phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
+                obs_base = np.append(obs_base, phase_val)
+
+            vw = predict(base_model, base_mean, base_std, obs_base,
+                         device=device,
+                         label_mean=base_label_mean, label_std=base_label_std)
+
+            # Hard output masking at inference
+            if has_base_phases:
+                if base_sub_phase == "rotate":
+                    v_cmd = 0.0
+                    w_cmd = vw[1]
+                else:  # drive
+                    v_cmd = max(vw[0], 0.0)  # forward only
+                    w_cmd = 0.0
             else:
-                obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
-                                                  base_ang_vel, target_ee_pos,
-                                                  feature_names=base_feature_names)
-                vw = predict(base_model, base_mean, base_std, obs_base,
-                             device=device,
-                             label_mean=base_label_mean, label_std=base_label_std)
-                # Policy outputs [v_cmd, w_cmd] -> convert to [rw, lw, lw, rw]
                 v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
                 w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
-                v_cmd = np.clip(v_cmd, -0.25, 0.25)
-                w_cmd = np.clip(w_cmd, -1.0, 1.0)
-                lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-                rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-                wheel_cmds = np.array([rw, lw, lw, rw])
 
-            if args.expert_grav:
-                tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                pd_torque = 40.0 * (q_init_arm - q_mes[4:11]) - 5.0 * qd_mes[4:11]
-                torque_arm = np.clip(pd_torque + tau_g[6:13], -30.0, 30.0)
-            elif grav_model is not None:
-                torque_arm = predict_gravity(grav_model, grav_q_mean, grav_q_std,
-                                             grav_tau_mean, grav_tau_std,
-                                             q_mes[4:11], device=device)
-                torque_arm = np.clip(torque_arm, -50.0, 50.0)
+            v_cmd = np.clip(v_cmd, -0.25, 0.25)
+            w_cmd = np.clip(w_cmd, -1.0, 1.0)
+            lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+            rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+            wheel_cmds = np.array([rw, lw, lw, rw])
+
+            # Arm hold: run arm policy with target=current EE so it only outputs gravity torques
+            if arm_model is not None:
+                obs_arm_hold = build_arm_observation(q_mes, qd_mes, ee_pos, ee_pos,
+                                                     base_pos=base_pos, base_bearing=base_bearing,
+                                                     feature_names=arm_feature_names)
+                torque_arm = predict(arm_model, arm_mean, arm_std, obs_arm_hold,
+                                     device=device,
+                                     label_mean=arm_label_mean, label_std=arm_label_std)
+                torque_arm = np.clip(torque_arm, -20.0, 20.0)
             else:
-                torque_arm, q_des_arm, qd_des_arm = arm_controller(
-                    dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
-                    q_des_arm, q_init_arm, target_ee_pos, ee_pos,
-                    ee_frame_id, shoulder_frame_id, arm_lower, arm_upper,
-                    time_step, arm_params, reach_active=False,
-                )
+                torque_arm = np.zeros(7)
 
         elif phase == "arm":
             # Arm policy
@@ -395,11 +397,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            # Add gravity compensation if using residual torque model
-            if args.expert_grav:
-                tau_g = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
-                raw_torque = raw_torque + tau_g[6:13]
-            elif grav_model is not None:
+            # Add gravity compensation if using learned gravity network
+            if grav_model is not None:
                 tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
                                            grav_tau_mean, grav_tau_std,
                                            q_mes[4:11], device=device)
@@ -468,6 +467,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
         # ---- Logging ----
         if step % 500 == 0:
             phase_str = f" [{phase}]" if split_mode else ""
+            if phase == "base" and has_base_phases:
+                phase_str = f" [base/{base_sub_phase}]"
             print(f"t={current_time:.2f}s{phase_str} | Base: {np.round(base_pos[:2], 3)} | "
                   f"EE: {np.round(ee_pos, 3)} | EE err: {ee_dist_error:.4f}m | "
                   f"best: {best_ee_error:.4f}m")
@@ -523,8 +524,6 @@ def main():
                         help="Path to base policy .pt checkpoint (split mode)")
     parser.add_argument("--arm_checkpoint", type=str, default=None,
                         help="Path to arm policy .pt checkpoint (split mode)")
-    parser.add_argument("--base_threshold", type=float, default=None,
-                        help="XY distance to target for phase switch. If omitted, uses settle detection (EE plateau + low speed).")
     # Common args
     parser.add_argument("--target", type=float, nargs=3, default=[0.0, 1.1, 0.5],
                         metavar=("X", "Y", "Z"),
@@ -533,23 +532,21 @@ def main():
                         help="Maximum simulation steps")
     parser.add_argument("--gravity_comp", type=str, default=None,
                         help="Path to gravity compensation network checkpoint (adds predicted gravity torques to arm output)")
-    parser.add_argument("--expert_grav", action="store_true",
-                        help="Use analytical (Pinocchio) gravity compensation instead of learned network")
     parser.add_argument("--arm_damping", type=float, default=0.0,
                         help="Velocity damping coefficient for arm joints (default: 0, e.g. 5.0)")
     parser.add_argument("--headless", action="store_true",
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
                         help="Use Apple Metal (MPS) GPU for inference")
-    parser.add_argument("--expert_base", action="store_true",
-                        help="Use expert base controller instead of learned policy")
     parser.add_argument("--retries", type=int, default=0,
                         help="Number of times to restart simulation on crash (default: 0)")
+    parser.add_argument("--heading_threshold", type=float, default=0.15,
+                        help="Heading error (rad) for rotate/drive sub-phase transition "
+                             "(only used when base checkpoint has 'phase' feature, default: 0.15)")
     args = parser.parse_args()
 
     # Determine mode
-    # --expert_base + --arm_checkpoint is a valid split mode (expert base, learned arm)
-    split_mode = (args.base_checkpoint is not None or args.expert_base) and args.arm_checkpoint is not None
+    split_mode = args.base_checkpoint is not None and args.arm_checkpoint is not None
     single_mode = args.checkpoint is not None
     if not split_mode and not single_mode:
         args.checkpoint = "bc_policy_100.pt"
@@ -573,19 +570,24 @@ def main():
         policy_kwargs.update(model=model, mean=mean, std=std,
                              label_mean=label_mean, label_std=label_std)
     else:
-        if args.base_checkpoint is not None:
-            base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
-                load_policy(args.base_checkpoint, device=device)
-        else:
-            base_model = base_mean = base_std = base_lm = base_ls = base_fnames = None
+        base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
+            load_policy(args.base_checkpoint, device=device)
         arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
             load_policy(args.arm_checkpoint, device=device)
-        base_desc = "EXPERT" if args.expert_base else args.base_checkpoint
+        # Detect phase-as-input model (has 'phase' in feature names)
+        has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
+        base_desc = args.base_checkpoint
+        if has_base_phases:
+            phase_desc = f"  phases=input (thr={args.heading_threshold:.3f})"
+        else:
+            phase_desc = "  phases=no"
         print(f"Split mode: base={base_desc}  arm={args.arm_checkpoint}  "
-              f"device={device}  switch={'xy<'+str(args.base_threshold)+'m' if args.base_threshold else 'settle'}")
+              f"device={device}"
+              f"{phase_desc}")
         policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
                              base_label_mean=base_lm, base_label_std=base_ls,
                              base_feature_names=base_fnames,
+                             has_base_phases=has_base_phases,
                              arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
                              arm_label_mean=arm_lm, arm_label_std=arm_ls,
                              arm_feature_names=arm_fnames)
@@ -600,6 +602,17 @@ def main():
                              grav_tau_std=grav_tau_std)
 
     target_ee_pos = np.array(args.target)
+
+    # Compute base_threshold from arm geometry (Pythagorean: horizontal reach given vertical offset)
+    if split_mode:
+        dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
+        if dz < ARM_REACH_LIMIT:
+            base_threshold = 0.75 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
+        else:
+            base_threshold = 0.3  # target z beyond arm reach, get as close as possible
+        args.base_threshold = base_threshold
+        print(f"Base threshold: {base_threshold:.2f}m "
+              f"(arm={ARM_REACH_LIMIT}m, dz={dz:.2f}m)")
 
     # --- Run with retries ---
     max_attempts = 1 + args.retries
