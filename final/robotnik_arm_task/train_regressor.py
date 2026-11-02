@@ -41,7 +41,7 @@ def main():
                         help=f"Model type (default: mlp, available: {available_regressors()})")
     # Defaults follow the selected settings of the 618-run hyperparameter study
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument("--batch_size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=3)
@@ -60,9 +60,9 @@ def main():
                         help="DataLoader worker processes for parallel data loading (default: 0)")
     parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
                         help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
-    parser.add_argument("--early_stop", type=float, default=0.0,
+    parser.add_argument("--early_stop", type=float, default=0.00001,
                         help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
-    parser.add_argument("--patience", type=int, default=25,
+    parser.add_argument("--patience", type=int, default=40,
                         help="Number of epochs without improvement before early stopping (default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
@@ -144,6 +144,16 @@ def main():
         save_path = (f"{next_id:03d}_bc_{mode}_{args.activation}_e{args.epochs}_h{args.hidden_dim}"
                      f"_l{args.num_layers}.pt")
     print(f"Checkpoint: {save_path}")
+
+    # --- Phase-aware metrics (base mode only) ---
+    has_phase = feature_names is not None and "phase" in feature_names
+    if has_phase:
+        phase_idx = feature_names.index("phase")
+        # Use un-normalized phase values (0.0=rotate, 1.0=drive) from original data
+        val_phase = X_val[:, phase_idx]
+        val_rotate_mask = val_phase < 0.5
+        val_drive_mask = ~val_rotate_mask
+        print(f"Phase feature detected: val rotate={val_rotate_mask.sum()}  drive={val_drive_mask.sum()}")
 
     # --- Per-epoch reporting callback (for models that support on_epoch) ---
     t_start = _time.time()
@@ -228,6 +238,31 @@ def main():
             print(f"         p90:      {p90_s}")
             print(f"         sign_acc: {sign_s}")
             print(f"         zero_acc: {zero_s}")
+
+            # Per-phase metrics (base mode with phase feature)
+            if has_phase and mode == "base":
+                for phase_name, mask in [("rotate", val_rotate_mask), ("drive", val_drive_mask)]:
+                    if mask.sum() == 0:
+                        continue
+                    p_pred = all_pred_orig[mask]
+                    p_label = all_label_orig[mask]
+                    p_err = np.abs(p_pred - p_label)
+                    p_mae = p_err.mean(axis=0)
+                    p_p90 = np.percentile(p_err, 90, axis=0)
+                    # Zero accuracy per phase
+                    p_expert_zero = np.abs(p_label) < near_zero_thresh
+                    p_pred_zero = np.abs(p_pred) < near_zero_thresh
+                    p_zero_acc = np.array([
+                        p_pred_zero[p_expert_zero[:, d], d].mean() * 100
+                        if p_expert_zero[:, d].any() else 100.0
+                        for d in range(ACTION_DIM)
+                    ])
+                    phase_mae_s = "  ".join(f"{dim_names[d]}={p_mae[d]:.4f}" for d in range(ACTION_DIM))
+                    phase_p90_s = "  ".join(f"{dim_names[d]}={p_p90[d]:.4f}" for d in range(ACTION_DIM))
+                    phase_zero_s = "  ".join(f"{dim_names[d]}={p_zero_acc[d]:.1f}%" for d in range(ACTION_DIM))
+                    print(f"         [{phase_name:6s}] n={mask.sum():>7d}  MAE: {phase_mae_s}  "
+                          f"p90: {phase_p90_s}")
+                    print(f"         [{phase_name:6s}] zero_acc: {phase_zero_s}")
 
     # --- Training (shared trainer in regressors.py) ---
     regressor = get_regressor(args.model)()
