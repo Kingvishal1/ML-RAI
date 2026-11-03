@@ -189,16 +189,28 @@ def random_obstacles(rng, start_xy, goal_xy, n=2, max_tries=1000):
     return obstacles
 
 
-def compute_base_goal(target_ee_pos):
+def compute_base_goal(target_ee_pos, base_xy=None):
     """Compute the base standoff pose (position + bearing) for a given target.
+
+    base_xy: if provided, the standoff is placed on the line from base_xy to target
+        (so the robot faces the target from its current approach direction). If None,
+        the standoff is on the line from the world origin to the target.
 
     Returns (base_goal_pos, base_goal_bearing).
     """
     standoff = float(np.interp(target_ee_pos[2], STANDOFF_Z_POINTS, STANDOFF_POINTS))
     target_xy = target_ee_pos[:2]
-    target_bearing = np.arctan2(target_xy[1], target_xy[0]) if np.linalg.norm(target_xy) > 1e-4 else 0.0
-    base_goal_pos = target_xy - standoff * np.array([np.cos(target_bearing), np.sin(target_bearing)])
-    return base_goal_pos, target_bearing
+    if base_xy is not None:
+        approach = target_xy - base_xy
+        dist = np.linalg.norm(approach)
+        if dist > 1e-4:
+            approach_bearing = np.arctan2(approach[1], approach[0])
+        else:
+            approach_bearing = np.arctan2(target_xy[1], target_xy[0]) if np.linalg.norm(target_xy) > 1e-4 else 0.0
+    else:
+        approach_bearing = np.arctan2(target_xy[1], target_xy[0]) if np.linalg.norm(target_xy) > 1e-4 else 0.0
+    base_goal_pos = target_xy - standoff * np.array([np.cos(approach_bearing), np.sin(approach_bearing)])
+    return base_goal_pos, approach_bearing
 
 
 from dataclasses import dataclass, field
@@ -269,6 +281,9 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     base_state = BaseNavState()
     # Detours make the drive longer, so obstacle runs get more time
     base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT * (2 if obstacle_ids is not None else 1))
+    # With obstacles the approach direction may differ from origin→target;
+    # recompute the standoff each time the robot finishes turning (align→drive).
+    _prev_base_phase = base_state.phase
 
     arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
     q_init_arm = init_joint_angles[4:11].copy()
@@ -332,6 +347,11 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
             lidar=lidar, base_lin_vel=base_lin_vel,
         )
         base_navigation_done = base_state.done
+
+        # ---- Recompute standoff when robot finishes turning (align→drive) ----
+        if obstacle_ids is not None and _prev_base_phase == "align" and base_state.phase == "drive":
+            base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos, base_xy=base_pos[:2])
+        _prev_base_phase = base_state.phase
 
         # ---- Arm control ----
         torque_arm, q_des_arm, qd_des_arm = arm_controller(

@@ -38,13 +38,11 @@ from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 #  34,35,36  target_x/y/z
 #  37..43    tau_gravity_1..7
 
-BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 6, 7, 8, 34, 35]             # 10 raw dims + 2 computed
+BASE_INPUT_INDICES = [3, 4, 6, 7, 8]                               # 5 velocity dims + 2 computed
 
 BASE_FEATURE_NAMES = [
-    "base_pos_x", "base_pos_y", "base_bearing",
     "base_lin_vel_x", "base_lin_vel_y",
     "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
-    "target_x", "target_y",
     "dist_to_target", "heading_error",
 ]
 
@@ -128,9 +126,9 @@ def main():
 
     out_dir = args.out_dir or os.path.dirname(args.data)
 
-    # Base dataset: 13 inputs -> 2 outputs (v_cmd, w_cmd)
-    # Raw features from full observation
-    base_raw = inputs[base_mask][:, BASE_INPUT_INDICES]   # (N, 11)
+    # Base dataset: 7 inputs -> 2 outputs (v_cmd, w_cmd)
+    # Raw features from full observation (velocities only – no absolute positions)
+    base_raw = inputs[base_mask][:, BASE_INPUT_INDICES]   # (N, 5)
     # Computed goal-relative features
     base_pos_xy = inputs[base_mask][:, :2]                # cols 0,1
     bearing = inputs[base_mask][:, 2]                     # col 2
