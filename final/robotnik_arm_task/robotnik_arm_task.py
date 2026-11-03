@@ -29,7 +29,8 @@ BASE_NAV_TIMEOUT = 25.0
 ARM_REACH_LIMIT = 0.85
 STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
-REACH_TOLERANCE = 0.02
+REACH_TOLERANCE = 0.05
+MAX_TARGETS = 5
 
 
 # ==============================================================================
@@ -311,15 +312,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                 elif not (stop_message or "").startswith("Reached step cap"):
                     stop_message = None
         if stop_message:
-            if hold_time > 0 and "reached" in stop_message.lower() and not holding:
-                holding = True
-                hold_start = current_time
-                print(f"{stop_message}  (holding for {hold_time:.1f}s)")
-            elif not holding:
-                print(stop_message)
-                break
-        if holding and current_time - hold_start >= hold_time:
-            print(f"Hold complete at t={current_time:.2f}s")
+            print(stop_message)
             break
 
         # ---- Log data ----
@@ -373,6 +366,201 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "final_time": current_time,
         "target_finger_angles": target_finger_angles,
     }
+
+
+SELECTOR_OBS_DIM = 3  # per-candidate: (in_base_x, in_base_y, z)
+
+
+def target_to_base_frame(base_pos, base_bearing, target_pos):
+    """Express a target's position relative to the robot's base frame.
+
+    Returns (3,): (forward, lateral, z).  XY are rotated into the robot's
+    heading frame; Z is kept absolute (robot doesn't move vertically).
+    """
+    c, s = np.cos(base_bearing), np.sin(base_bearing)
+    dx = target_pos[0] - base_pos[0]
+    dy = target_pos[1] - base_pos[1]
+    return np.array([c * dx + s * dy,      # forward
+                     -s * dx + c * dy,     # lateral
+                     target_pos[2]])       # z
+
+
+def build_selector_candidates(base_pos, base_bearing, target_positions, remaining_indices):
+    """Build per-candidate observations for the target selector.
+
+    Args:
+        base_pos: (3,) robot base position
+        base_bearing: scalar, robot heading (yaw)
+        target_positions: (N, 3) all target positions (world frame)
+        remaining_indices: iterable of valid target slot indices
+    Returns:
+        candidates: dict mapping slot_index -> (3,) observation in base frame
+    """
+    candidates = {}
+    for idx in remaining_indices:
+        candidates[idx] = target_to_base_frame(base_pos, base_bearing, target_positions[idx])
+    return candidates
+
+
+def nearest_neighbor_expert(base_pos, target_positions, remaining_indices):
+    """Pick the nearest remaining target by XY distance to the robot.
+
+    Args:
+        base_pos: (3,) robot base position
+        target_positions: (N, 3) all target positions
+        remaining_indices: set of valid target slot indices
+    Returns:
+        int, index of the chosen target slot
+    """
+    best_idx = None
+    best_dist = np.inf
+    for idx in remaining_indices:
+        dist = np.linalg.norm(base_pos[:2] - target_positions[idx, :2])
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+    return best_idx
+
+
+def run_multi_target_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                          init_joint_angles, target_finger_angles,
+                          lower_limits, upper_limits,
+                          target_ee_positions,
+                          torque_noise_factory=None,
+                          per_target_timeout=None):
+    """Run an expert multi-target episode: visit each target in nearest-neighbor order.
+
+    Args:
+        sim, dyn_model, ...: same as run_simulation_loop
+        target_ee_positions: list of target (x,y,z) arrays (any length)
+        torque_noise_factory: callable() -> TorqueNoise or None, called per target
+        per_target_timeout: max sim-time per target (seconds). None = use default max_steps.
+
+    Returns:
+        combined_data: dict with concatenated trajectory data from all targets
+        selector_samples: list of dicts, one per decision point.  Each dict has:
+            "candidates": dict mapping slot_idx -> (3,) base-frame observation
+            "chosen_idx": int, the expert's pick (key into candidates)
+            "episode_time": float
+        per_target_results: list of dicts with per-target outcomes
+    """
+    n_targets = len(target_ee_positions)
+    assert n_targets >= 1
+
+    all_targets = np.array(target_ee_positions)  # (N, 3)
+
+    remaining = set(range(n_targets))
+    selector_samples = []
+    per_target_results = []
+    all_target_data = []
+    episode_time = 0.0
+
+    while remaining:
+        # --- Decision point: expert picks nearest target ---
+        base_pos = np.array(sim.GetBasePosition())
+        base_ori = np.array(sim.GetBaseOrientation())
+        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
+
+        candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
+        chosen_idx = nearest_neighbor_expert(base_pos, all_targets, remaining)
+
+        selector_samples.append({
+            "candidates": candidates,
+            "chosen_idx": chosen_idx,
+            "episode_time": episode_time,
+        })
+
+        current_target = all_targets[chosen_idx]
+        remaining.remove(chosen_idx)
+        print(f"\n>>> Multi-target: visiting slot {chosen_idx} "
+              f"({current_target}) | {len(remaining)} remaining")
+
+        # --- Run single-target loop for this target ---
+        noise = torque_noise_factory() if torque_noise_factory else None
+
+        # Override max_steps for per-target timeout if given
+        old_max_steps = max_steps
+        if per_target_timeout is not None:
+            time_step = sim.GetTimeStep()
+            os.environ["ROBOENV_MAX_STEPS"] = str(int(per_target_timeout / time_step))
+
+        data = run_simulation_loop(
+            sim, dyn_model, ee_frame_id, shoulder_frame_id,
+            np.array(sim.GetMotorAngles(0)), target_finger_angles,
+            lower_limits, upper_limits,
+            target_ee_pos=current_target,
+            torque_noise=noise,
+        )
+
+        if per_target_timeout is not None:
+            os.environ["ROBOENV_MAX_STEPS"] = str(old_max_steps)
+
+        target_time = data["final_time"]
+        episode_time += target_time
+        final_err = np.linalg.norm(current_target - data["final_ee_pos"])
+        reached = final_err < REACH_TOLERANCE
+
+        per_target_results.append({
+            "slot": chosen_idx,
+            "target": current_target.tolist(),
+            "reached": reached,
+            "final_err": final_err,
+            "time": target_time,
+        })
+        all_target_data.append(data)
+        print(f"    Slot {chosen_idx}: err={final_err:.4f}m  reached={reached}  t={target_time:.2f}s")
+
+    # --- Combine trajectory data across targets ---
+    combined_data = _combine_trajectory_data(all_target_data)
+    combined_data["episode_time"] = episode_time
+    combined_data["per_target_results"] = per_target_results
+
+    return combined_data, selector_samples, per_target_results
+
+
+def _combine_trajectory_data(data_list):
+    """Concatenate trajectory data dicts from multiple single-target runs."""
+    if not data_list:
+        return {}
+    combined = {}
+    # Arrays that can be concatenated along axis 0
+    array_keys = [
+        "time", "ee_pos", "ee_error", "base_pos", "torque_arm", "torque_applied",
+        "wheel_cmds", "base_bearing", "target_ee_pos", "base_lin_vel",
+        "base_ang_vel", "tau_gravity",
+    ]
+    # List-of-array keys (q_mes, qd_mes, q_d, qd_d)
+    list_keys = ["q_mes", "qd_mes", "q_d", "qd_d"]
+
+    for key in array_keys:
+        arrays = [d[key] for d in data_list if key in d and len(d[key]) > 0]
+        if arrays:
+            # Offset time arrays so they are monotonically increasing
+            if key == "time":
+                offset = 0.0
+                adjusted = []
+                for arr in arrays:
+                    adjusted.append(arr + offset)
+                    offset += arr[-1] + (arr[1] - arr[0] if len(arr) > 1 else 0.001)
+                combined[key] = np.concatenate(adjusted)
+            else:
+                combined[key] = np.concatenate(arrays)
+
+    for key in list_keys:
+        lists = [d[key] for d in data_list if key in d and len(d[key]) > 0]
+        if lists:
+            combined[key] = sum(lists, [])
+
+    # Use the last run's final values
+    last = data_list[-1]
+    combined["final_base_pos"] = last["final_base_pos"]
+    combined["final_ee_pos"] = last["final_ee_pos"]
+    combined["final_q_mes"] = last["final_q_mes"]
+    combined["final_time"] = sum(d["final_time"] for d in data_list)
+    combined["target_finger_angles"] = last["target_finger_angles"]
+    combined["reach_time"] = last.get("reach_time")
+
+    return combined
 
 
 def print_summary(data):

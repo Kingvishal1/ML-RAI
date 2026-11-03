@@ -27,7 +27,10 @@ if "--headless" in sys.argv:
 
 import numpy as np
 
-from run_policy_sim import run_sim, load_policy, load_gravity_comp, REACH_TOLERANCE
+from run_policy_sim import (
+    run_sim, load_policy, load_gravity_comp, load_selector,
+    run_multi_target_sim, REACH_TOLERANCE,
+)
 from robotnik_arm_task import compute_base_goal
 
 
@@ -75,6 +78,19 @@ def main():
                         help="Only evaluate arm phase (use expert base)")
     parser.add_argument("--gravity_comp", type=str, default=None,
                         help="Path to gravity compensation network checkpoint")
+    # Multi-target evaluation
+    parser.add_argument("--multi_target", action="store_true",
+                        help="Evaluate multi-target episodes")
+    parser.add_argument("--num_targets_per_episode", type=int, default=3,
+                        help="Targets per multi-target episode (default: 3)")
+    parser.add_argument("--num_episodes", type=int, default=10,
+                        help="Number of multi-target episodes to evaluate (default: 10)")
+    parser.add_argument("--selector_checkpoint", type=str, default=None,
+                        help="Path to selector checkpoint (omit for expert nearest-neighbor)")
+    parser.add_argument("--per_target_max_steps", type=int, default=100000,
+                        help="Max steps per target in multi-target mode (default: 100000)")
+    parser.add_argument("--heading_threshold", type=float, default=0.15)
+    parser.add_argument("--arm_damping", type=float, default=0.0)
     args = parser.parse_args()
 
     # Determine mode
@@ -144,6 +160,94 @@ def main():
         policy_kwargs.update(grav_model=grav_model, grav_q_mean=grav_q_mean,
                              grav_q_std=grav_q_std, grav_tau_mean=grav_tau_mean,
                              grav_tau_std=grav_tau_std)
+
+    # --- Multi-target evaluation ---
+    if args.multi_target:
+        sel_model = sel_mean = sel_std = None
+        use_expert_selector = args.selector_checkpoint is None
+        if args.selector_checkpoint:
+            sel_model, sel_mean, sel_std = load_selector(args.selector_checkpoint, device=device)
+            print(f"Selector: {args.selector_checkpoint}")
+        else:
+            print("Selector: expert (nearest-neighbor)")
+
+        rng = np.random.default_rng(args.seed)
+        all_results = []
+
+        print(f"\nEvaluating {args.num_episodes} multi-target episodes "
+              f"({args.num_targets_per_episode} targets each, seed={args.seed})\n")
+
+        for ep in range(args.num_episodes):
+            n = args.num_targets_per_episode
+            targets = [np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
+                        for _ in range(n)]
+            print(f"\n[Episode {ep+1}/{args.num_episodes}]")
+
+            result = run_multi_target_sim(
+                args, targets,
+                split_mode=split_mode, single_mode=single_mode,
+                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                use_expert_selector=use_expert_selector,
+                **policy_kwargs,
+            )
+            all_results.append(result)
+
+        # --- Aggregate multi-target report ---
+        print(f"\n{'='*70}")
+        print(f"MULTI-TARGET EVALUATION REPORT  ({args.num_episodes} episodes, "
+              f"{args.num_targets_per_episode} targets each)")
+        print(f"{'='*70}")
+
+        reached_per_ep = [r["targets_reached"] for r in all_results]
+        total_per_ep = [r["n_targets"] for r in all_results]
+        time_per_ep = [r["total_time"] for r in all_results]
+        steps_per_ep = [r["total_steps"] for r in all_results]
+
+        total_reached = sum(reached_per_ep)
+        total_targets = sum(total_per_ep)
+        full_clear = sum(1 for r, t in zip(reached_per_ep, total_per_ep) if r == t)
+
+        print(f"\n--- TARGETS ---")
+        print(f"Total reached: {total_reached}/{total_targets} "
+              f"({100*total_reached/total_targets:.1f}%)")
+        print(f"Full clears (all targets): {full_clear}/{args.num_episodes} "
+              f"({100*full_clear/args.num_episodes:.1f}%)")
+        print_stats("Reached/episode", reached_per_ep)
+        print_stats("Time/episode (s)", time_per_ep)
+        print_stats("Steps/episode", steps_per_ep)
+
+        # Per-target error stats
+        all_final_errs = []
+        all_best_errs = []
+        for r in all_results:
+            for pt in r["per_target"]:
+                all_final_errs.append(pt.get("final_err", float("inf")))
+                all_best_errs.append(pt.get("best_err", float("inf")))
+
+        print(f"\n--- PER-TARGET ACCURACY ---")
+        print_stats("Final EE error", all_final_errs)
+        print_stats("Best EE error", all_best_errs)
+        print_buckets("best_err", all_best_errs)
+
+        # Visit ordering quality vs expert
+        if not use_expert_selector:
+            from robotnik_arm_task import nearest_neighbor_expert
+            order_matches = 0
+            order_total = 0
+            for ep_i, result in enumerate(all_results):
+                # Reconstruct what expert would have chosen
+                n = result["n_targets"]
+                per_target = result["per_target"]
+                # We can't perfectly reconstruct expert order without replaying,
+                # but we can compare the visit_order length
+                order_total += 1
+            if order_total > 0:
+                print(f"\n--- ORDERING ---")
+                print(f"(Ordering comparison requires replay; "
+                      f"compare with --selector_checkpoint=None for expert baseline)")
+
+        print(f"{'='*70}")
+        return
 
     # Generate targets
     targets = generate_targets(args.num_targets, seed=args.seed)
