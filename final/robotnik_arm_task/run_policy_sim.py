@@ -607,7 +607,7 @@ def main():
     if split_mode:
         dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
         if dz < ARM_REACH_LIMIT:
-            base_threshold = 0.75 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
+            base_threshold = 0.85 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
         else:
             base_threshold = 0.3  # target z beyond arm reach, get as close as possible
         args.base_threshold = base_threshold
