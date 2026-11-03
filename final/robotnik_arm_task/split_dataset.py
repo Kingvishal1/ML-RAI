@@ -38,11 +38,13 @@ from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 #  34,35,36  target_x/y/z
 #  37..43    tau_gravity_1..7
 
-BASE_INPUT_INDICES = [3, 4, 6, 7, 8]                               # 5 velocity dims + 2 computed
+BASE_INPUT_INDICES = [0, 1, 2, 3, 4, 6, 7, 8, 34, 35]             # 2 pos + bearing + 2 lin_vel + 3 ang_vel + 2 target_xy + 2 computed
 
 BASE_FEATURE_NAMES = [
+    "base_pos_x", "base_pos_y", "base_bearing",
     "base_lin_vel_x", "base_lin_vel_y",
     "base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z",
+    "target_x", "target_y",
     "dist_to_target", "heading_error",
 ]
 
