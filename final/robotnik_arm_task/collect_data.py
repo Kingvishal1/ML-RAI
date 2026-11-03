@@ -429,10 +429,7 @@ def main():
     n_obstacles = args.n_obstacles if args.obstacles else 0
 
     # Generate targets
-    if args.obstacles:
-        # Obstacle mode: use the fixed far target for all trajectories
-        targets = [OBSTACLE_DEMO_TARGET.copy() for _ in range(args.num_targets)]
-    elif args.mode == "grid":
+    if args.mode == "grid":
         targets = generate_grid_targets(n=args.num_targets)
     else:
         targets = generate_random_targets(n=args.num_targets, seed=args.seed)
