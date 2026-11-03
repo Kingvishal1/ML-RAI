@@ -161,13 +161,67 @@ class BaseControllerParams:
 
 @dataclass
 class BaseNavState:
-    """Navigation phases: align (turn in place toward goal) -> drive -> orient (face target) -> done."""
+    """Navigation phases: align (turn in place toward goal) -> drive -> orient (face target) -> done.
+    With obstacles, each detour waypoint is visited first (align -> drive per waypoint)."""
     phase: str = "align"
     done: bool = False
+    waypoints: list = None         # detour waypoints still to visit; None = not planned yet
 
 
-def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, current_time, params):
+ROBOT_RADIUS = 0.47                # m, chassis half-diagonal
+OBSTACLE_MARGIN = 0.15             # m, extra gap kept between chassis and obstacle
+
+
+def lidar_scan(client, base_pos, base_bearing, n_rays=72, max_range=3.0, min_range=0.5, height=0.2):
+    """Planar lidar: distances (m) of n_rays horizontal rays around the base, from straight ahead
+    counter-clockwise. Rays start outside the chassis so they never hit the robot. A miss reads max_range."""
+    angles = base_bearing + np.linspace(-np.pi, np.pi, n_rays, endpoint=False)
+    dirs = np.stack([np.cos(angles), np.sin(angles), np.zeros(n_rays)], axis=1)
+    origin = np.array([base_pos[0], base_pos[1], height])
+    hits = client.rayTestBatch((origin + min_range * dirs).tolist(), (origin + max_range * dirs).tolist())
+    return min_range + np.array([h[2] for h in hits]) * (max_range - min_range)
+
+
+def plan_path(obstacles, start, goal):
+    """Waypoints from start to goal around circular obstacles [(x, y, radius)].
+
+    Each obstacle becomes a no-go circle for the base centre (radius + robot radius + margin). Candidate
+    waypoints are 8 corners around every circle; the shortest chain of clear straight lines from start
+    to goal is found with Dijkstra. Returns the waypoints in between (empty if the straight line is clear).
+    """
+    zones = [(np.array([x, y]), r + ROBOT_RADIUS + OBSTACLE_MARGIN) for x, y, r in obstacles]
+
+    def clear(a, b):
+        d = b - a
+        return all(np.linalg.norm(a + np.clip((c - a) @ d / (d @ d), 0, 1) * d - c) >= rad for c, rad in zones)
+
+    corners = [c + (rad / np.cos(np.pi / 8) + 0.02) * np.array([np.cos(t), np.sin(t)])
+               for c, rad in zones for t in np.arange(8) * np.pi / 4]
+    nodes = [start, goal] + [p for p in corners if all(np.linalg.norm(p - c) > rad for c, rad in zones)]
+
+    dist, prev, todo = {0: 0.0}, {}, set(range(len(nodes)))
+    while 1 in todo:
+        i = min((n for n in todo if n in dist), key=dist.get, default=None)
+        if i is None:
+            return []          # no path: just head for the goal
+        todo.remove(i)
+        for j in todo:
+            d = dist[i] + np.linalg.norm(nodes[j] - nodes[i])
+            if d < dist.get(j, np.inf) and clear(nodes[i], nodes[j]):
+                dist[j], prev[j] = d, i
+    path, i = [], prev.get(1, 0)
+    while i != 0:
+        path.append(nodes[i])
+        i = prev[i]
+    return path[::-1]
+
+
+def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, current_time, params, obstacles=None):
     """Skid-steer base navigation to a goal pose; updates state in place.
+
+    obstacles: optional [(x, y, radius)]. A path around them is planned once and driven waypoint by
+        waypoint, each leg with the same turn-in-place + straight drive (the wheels have almost no lateral
+        grip, so turning while moving makes the base slide).
 
     Returns the wheel velocity commands [front_right, front_left, back_left, back_right] (rad/s).
     Once navigation is done the base holds position (zero wheel velocities).
@@ -175,25 +229,37 @@ def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, curre
     if state.done:
         return np.zeros(4)
 
-    dist_to_goal = np.linalg.norm(base_pos[:2] - goal_pos)
-    to_goal = goal_pos - base_pos[:2]
+    if state.waypoints is None:
+        state.waypoints = plan_path(obstacles, base_pos[:2], goal_pos) if obstacles else []
+    target = state.waypoints[0] if state.waypoints else goal_pos
+    # Waypoints 15 cm. Goal 8 cm, or 20 cm after a detour: turning in place shifts the base centre a
+    # little, so chasing 8 cm can orbit the goal; the arm covers the extra offset.
+    tol = 0.15 if state.waypoints else (0.2 if obstacles else params.pos_tol)
+    dist_to_goal = np.linalg.norm(base_pos[:2] - target)
+    to_goal = target - base_pos[:2]
     heading_to_goal = np.arctan2(to_goal[1], to_goal[0])
     v_cmd, w_cmd = 0.0, 0.0
     if state.phase == "align":
         err = wrap_angle(heading_to_goal - base_bearing)
-        if dist_to_goal < params.pos_tol or abs(err) < params.ang_tol:
-            state.phase = "drive" if dist_to_goal >= params.pos_tol else "orient"
+        if dist_to_goal < tol or abs(err) < params.ang_tol:
+            state.phase = "drive" if dist_to_goal >= tol else "orient"
         else:
             w_cmd = np.clip(params.kp_ori * err, -params.max_ang_vel, params.max_ang_vel)
     if state.phase == "drive":
         err = wrap_angle(heading_to_goal - base_bearing)
         passed_goal = dist_to_goal < 0.15 and np.cos(err) < 0.0
-        if dist_to_goal < params.pos_tol or passed_goal:
+        if dist_to_goal < tol or passed_goal:
             state.phase = "orient"
+        elif obstacles and abs(err) > 0.35:
+            # Slipped off the line: stop and turn in place rather than curving (which slides more)
+            state.phase = "align"
         else:
             # Gentle steering while driving: skid-steer slips a lot when turning hard, so keep it mostly straight
             v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel) * max(0.0, np.cos(err))
             w_cmd = np.clip(1.5 * err, -0.3, 0.3)
+    if state.phase == "orient" and state.waypoints:
+        state.waypoints.pop(0)     # waypoint reached: head for the next one (or the goal)
+        state.phase = "align"
     if state.phase == "orient":
         err = wrap_angle(goal_bearing - base_bearing)
         if abs(err) < params.ang_tol:

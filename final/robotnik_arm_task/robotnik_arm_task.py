@@ -1,6 +1,7 @@
 import numpy as np
 import time
 import os
+import sys
 from dataclasses import dataclass
 
 # Headless mode and step cap for CI / direct runs
@@ -16,7 +17,7 @@ import pinocchio as pin
 from simulation_and_control import pb, MotorCommands, PinWrapper
 from robotnik_arm_control import (
     ArmControllerParams, BaseControllerParams, BaseNavState, StopCriteria,
-    arm_controller, base_controller, check_stop, configure_gripper_fingers, quaternion2bearing,
+    arm_controller, base_controller, check_stop, configure_gripper_fingers, lidar_scan, quaternion2bearing,
 )
 
 
@@ -30,6 +31,9 @@ ARM_REACH_LIMIT = 0.85
 STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
 REACH_TOLERANCE = 0.02
+
+# Obstacle demo (run with --obstacles [--n-obstacles K] [--seed S]): a far target with random cylinders
+OBSTACLE_DEMO_TARGET = np.array([3.0, 0.0, 0.5])
 
 
 # ==============================================================================
@@ -140,6 +144,36 @@ def add_target_visual(client, target_pos):
     client.addUserDebugPoints(pointPositions=[pos_list], pointColorsRGB=[[1.0, 0.0, 0.0]], pointSize=10)
 
 
+def add_obstacles(client, obstacles, height=0.6):
+    """Spawn static cylinders from a list of (x, y, radius). Returns their body ids."""
+    ids = []
+    for x, y, r in obstacles:
+        col = client.createCollisionShape(p.GEOM_CYLINDER, radius=r, height=height)
+        vis = client.createVisualShape(p.GEOM_CYLINDER, radius=r, length=height, rgbaColor=[0.2, 0.4, 0.9, 1.0])
+        ids.append(client.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                          basePosition=[x, y, height / 2]))
+    return ids
+
+
+def random_obstacles(rng, start_xy, goal_xy, n=2):
+    """n random cylinders (x, y, radius) around the straight path start -> goal; the first one sits on the
+    path so the base always has to detour. Each keeps clear of the start, the goal and the others."""
+    u = goal_xy - start_xy
+    perp = np.array([-u[1], u[0]]) / np.linalg.norm(u)
+    obstacles = []
+    while len(obstacles) < n:
+        r = rng.uniform(0.15, 0.25)
+        if obstacles:
+            xy = start_xy + rng.uniform(0.2, 0.85) * u + rng.uniform(-1.2, 1.2) * perp
+        else:
+            xy = start_xy + rng.uniform(0.35, 0.6) * u + rng.uniform(-0.2, 0.2) * perp
+        gaps = [np.linalg.norm(xy - start_xy) - r - 0.8, np.linalg.norm(xy - goal_xy) - r - 0.7]
+        gaps += [np.linalg.norm(xy - (ox, oy)) - r - orad - 0.15 for ox, oy, orad in obstacles]
+        if min(gaps) > 0:
+            obstacles.append((float(xy[0]), float(xy[1]), float(r)))
+    return obstacles
+
+
 def compute_base_goal(target_ee_pos):
     """Compute the base standoff pose (position + bearing) for a given target.
 
@@ -198,8 +232,12 @@ class TorqueNoise:
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                         init_joint_angles, target_finger_angles,
                         lower_limits, upper_limits, target_ee_pos=None,
-                        torque_noise=None, hold_time=0.0):
+                        torque_noise=None, hold_time=0.0, obstacles=None):
     """Run the main control loop: base navigation then arm reaching.
+
+    obstacles: optional [(x, y, radius)] cylinders, spawned for this run and removed afterwards. The
+        expert plans around their true positions; lidar ranges (the policy's view of them) and
+        obstacle contacts are logged.
 
     torque_noise: optional TorqueNoise. While the arm is reaching, its value is added to the
         torque sent to the sim; the logged torque_arm stays the clean expert command.
@@ -215,7 +253,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
     base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
     base_state = BaseNavState()
-    base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT)
+    # Detours make the drive longer, so obstacle runs get more time
+    base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT * (2 if obstacles else 1))
 
     arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
     q_init_arm = init_joint_angles[4:11].copy()
@@ -236,6 +275,11 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     base_lin_vel_all, base_ang_vel_all = [], []
     tau_gravity_all = []
     torque_applied_all = []
+    lidar_all = []
+    collision_steps = 0
+    client = sim.pybullet_client
+    rid = sim.bot[0].bot_pybullet
+    obstacle_ids = add_obstacles(client, obstacles) if obstacles else []
 
     while True:
         # ---- Sense ----
@@ -260,9 +304,17 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         tau_g_full = pin.computeGeneralizedGravity(dyn_model.pin_model, dyn_model.pin_data, q_pin)
         tau_gravity_arm = tau_g_full[6:13].copy()  # 7 arm joints
 
+        # ---- Lidar + obstacle contacts ----
+        lidar = None
+        if obstacles:
+            lidar = lidar_scan(client, base_pos, base_bearing)
+            if any(client.getContactPoints(rid, oid) for oid in obstacle_ids):
+                collision_steps += 1
+
         # ---- Base control ----
         wheel_cmds = base_controller(
             base_state, base_pos, base_bearing, base_goal_pos, base_goal_bearing, current_time, base_params,
+            obstacles=obstacles,
         )
         base_navigation_done = base_state.done
 
@@ -311,15 +363,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                 elif not (stop_message or "").startswith("Reached step cap"):
                     stop_message = None
         if stop_message:
-            if hold_time > 0 and "reached" in stop_message.lower() and not holding:
-                holding = True
-                hold_start = current_time
-                print(f"{stop_message}  (holding for {hold_time:.1f}s)")
-            elif not holding:
-                print(stop_message)
-                break
-        if holding and current_time - hold_start >= hold_time:
-            print(f"Hold complete at t={current_time:.2f}s")
+            print(stop_message)
             break
 
         # ---- Log data ----
@@ -339,6 +383,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         base_lin_vel_all.append(base_lin_vel)
         base_ang_vel_all.append(base_ang_vel)
         tau_gravity_all.append(tau_gravity_arm)
+        if lidar is not None:
+            lidar_all.append(lidar)
 
         if not headless:
             time.sleep(0.001)
@@ -348,6 +394,9 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
             print(f"t={current_time:.2f}s | Base pos: {np.round(base_pos[:2], 3)} | "
                   f"EE pos: {np.round(ee_pos, 3)} | EE error: {ee_dist_error:.4f}m | "
                   f"yaw {base_bearing:.2f} phase {base_state.phase} nav_done {base_navigation_done}")
+
+    for oid in obstacle_ids:
+        client.removeBody(oid)
 
     return {
         "time": np.array(time_all),
@@ -367,6 +416,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "base_lin_vel": np.array(base_lin_vel_all),
         "base_ang_vel": np.array(base_ang_vel_all),
         "tau_gravity": np.array(tau_gravity_all),
+        "lidar": np.array(lidar_all),
+        "collision_steps": collision_steps,
         "final_base_pos": base_pos,
         "final_ee_pos": ee_pos,
         "final_q_mes": q_mes,
@@ -379,11 +430,13 @@ def print_summary(data):
     """Print final simulation results."""
     target_finger_angles = data["target_finger_angles"]
     q_mes = data["final_q_mes"]
+    target = data["target_ee_pos"][-1]
     print("==================================================================")
     print(f"Final Base Position          : {np.round(data['final_base_pos'][:2], 4)}")
     print(f"Final End-Effector Position  : {np.round(data['final_ee_pos'], 4)}")
-    print(f"Target End-Effector Position : {TARGET_EE_POS}")
-    print(f"Final Cartesian Error (m)    : {np.linalg.norm(TARGET_EE_POS - data['final_ee_pos']):.4f}")
+    print(f"Target End-Effector Position : {target}")
+    print(f"Final Cartesian Error (m)    : {np.linalg.norm(target - data['final_ee_pos']):.4f}")
+    print(f"Obstacle Contact Steps       : {data['collision_steps']}")
     print(f"Fixed Finger Angles          : {np.round(target_finger_angles, 4)}")
     print(f"Final Finger Angles          : {np.round(q_mes[11:17], 4)}")
     print(f"Max Finger Deviation (rad)   : {np.max(np.abs(q_mes[11:17] - target_finger_angles)):.6f}")
@@ -439,25 +492,38 @@ def plot_results(data):
 
 
 def main():
+    def arg_value(name, default):
+        return type(default)(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+    use_obstacles = "--obstacles" in sys.argv
+    target_ee_pos = OBSTACLE_DEMO_TARGET if use_obstacles else TARGET_EE_POS
+
     # Setup
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
-    add_target_visual(client, TARGET_EE_POS)
+    add_target_visual(client, target_ee_pos)
+    obstacles = None
+    if use_obstacles:
+        seed = arg_value("--seed", int(np.random.SeedSequence().entropy % 100000))
+        start_xy = np.array(sim.GetBasePosition())[:2]
+        obstacles = random_obstacles(np.random.default_rng(seed), start_xy, compute_base_goal(target_ee_pos)[0],
+                                     n=arg_value("--n-obstacles", 2))
+        print(f"Obstacles (seed {seed}): {[tuple(round(v, 2) for v in o) for o in obstacles]}")
 
     dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
 
     print("==================================================================")
-    print(f"Target Cartesian EE Position : {TARGET_EE_POS}")
+    print(f"Target Cartesian EE Position : {target_ee_pos}")
     print(f"Initial Cartesian EE Position: {np.round(init_ee_pos, 4)}")
-    print(f"Initial Cartesian Error (m)  : {np.linalg.norm(TARGET_EE_POS - init_ee_pos):.4f}")
+    print(f"Initial Cartesian Error (m)  : {np.linalg.norm(target_ee_pos - init_ee_pos):.4f}")
     print("==================================================================")
 
     # Run
     data = run_simulation_loop(
         sim, dyn_model, ee_frame_id, shoulder_frame_id,
         init_joint_angles, target_finger_angles,
-        lower_limits, upper_limits,
+        lower_limits, upper_limits, target_ee_pos=target_ee_pos, obstacles=obstacles,
     )
 
 
