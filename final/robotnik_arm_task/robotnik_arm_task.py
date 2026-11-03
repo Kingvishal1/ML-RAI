@@ -16,7 +16,7 @@ import pybullet as p
 import pinocchio as pin
 from simulation_and_control import pb, MotorCommands, PinWrapper
 from robotnik_arm_control import (
-    ArmControllerParams, BaseControllerParams, BaseNavState, StopCriteria,
+    ArmControllerParams, BaseControllerParams, BaseNavState, LidarParams, StopCriteria,
     arm_controller, base_controller, check_stop, configure_gripper_fingers, lidar_scan, quaternion2bearing,
 )
 
@@ -32,8 +32,13 @@ STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
 REACH_TOLERANCE = 0.02
 
-# Obstacle demo (run with --obstacles [--n-obstacles K] [--seed S]): a far target with random cylinders
+# Obstacle demo (run with --obstacles [--n-obstacles K] [--seed S]): a far target with randomly
+# placed cylinders, the first one always on the straight path
 OBSTACLE_DEMO_TARGET = np.array([3.0, 0.0, 0.5])
+OBSTACLE_RADIUS_RANGE = (0.15, 0.25)  # m
+OBSTACLE_START_CLEARANCE = 0.8        # m, min distance from the base start to an obstacle surface
+OBSTACLE_GOAL_CLEARANCE = 0.7         # m, min distance from the base goal to an obstacle surface
+OBSTACLE_GAP = 0.15                   # m, min gap between two obstacle surfaces
 
 
 # ==============================================================================
@@ -155,22 +160,32 @@ def add_obstacles(client, obstacles, height=0.6):
     return ids
 
 
-def random_obstacles(rng, start_xy, goal_xy, n=2):
-    """n random cylinders (x, y, radius) around the straight path start -> goal; the first one sits on the
-    path so the base always has to detour. Each keeps clear of the start, the goal and the others."""
-    u = goal_xy - start_xy
-    perp = np.array([-u[1], u[0]]) / np.linalg.norm(u)
+def random_obstacles(rng, start_xy, goal_xy, n=2, max_tries=1000):
+    """Randomly place n cylinders (x, y, radius) around the straight path start -> goal.
+
+    The first one sits on the path so the base always has to detour; the rest are spread around it.
+    Obstacles keep clear of the start, the goal and each other.
+    """
+    path = goal_xy - start_xy
+    length = np.linalg.norm(path)
+    u = path / length
+    perp = np.array([-u[1], u[0]])
     obstacles = []
-    while len(obstacles) < n:
-        r = rng.uniform(0.15, 0.25)
-        if obstacles:
-            xy = start_xy + rng.uniform(0.2, 0.85) * u + rng.uniform(-1.2, 1.2) * perp
-        else:
-            xy = start_xy + rng.uniform(0.35, 0.6) * u + rng.uniform(-0.2, 0.2) * perp
-        gaps = [np.linalg.norm(xy - start_xy) - r - 0.8, np.linalg.norm(xy - goal_xy) - r - 0.7]
-        gaps += [np.linalg.norm(xy - (ox, oy)) - r - orad - 0.15 for ox, oy, orad in obstacles]
-        if min(gaps) > 0:
-            obstacles.append((float(xy[0]), float(xy[1]), float(r)))
+    for _ in range(max_tries):
+        if len(obstacles) == n:
+            break
+        r = rng.uniform(*OBSTACLE_RADIUS_RANGE)
+        on_path = len(obstacles) == 0
+        along = rng.uniform(0.35, 0.6) if on_path else rng.uniform(0.2, 0.85)
+        lateral = rng.uniform(-0.2, 0.2) if on_path else rng.uniform(-1.2, 1.2)
+        xy = start_xy + along * length * u + lateral * perp
+        if np.linalg.norm(xy - start_xy) - r < OBSTACLE_START_CLEARANCE:
+            continue
+        if np.linalg.norm(xy - goal_xy) - r < OBSTACLE_GOAL_CLEARANCE:
+            continue
+        if any(np.linalg.norm(xy - np.array([ox, oy])) - r - orad < OBSTACLE_GAP for ox, oy, orad in obstacles):
+            continue
+        obstacles.append((float(xy[0]), float(xy[1]), float(r)))
     return obstacles
 
 
@@ -232,12 +247,11 @@ class TorqueNoise:
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                         init_joint_angles, target_finger_angles,
                         lower_limits, upper_limits, target_ee_pos=None,
-                        torque_noise=None, hold_time=0.0, obstacles=None):
+                        torque_noise=None, hold_time=0.0, obstacle_ids=None, lidar_params=None):
     """Run the main control loop: base navigation then arm reaching.
 
-    obstacles: optional [(x, y, radius)] cylinders, spawned for this run and removed afterwards. The
-        expert plans around their true positions; lidar ranges (the policy's view of them) and
-        obstacle contacts are logged.
+    obstacle_ids: optional body ids of obstacles. When given, the base scans with a 2D lidar and
+        steers around them; lidar ranges and obstacle contacts are logged.
 
     torque_noise: optional TorqueNoise. While the arm is reaching, its value is added to the
         torque sent to the sim; the logged torque_arm stays the clean expert command.
@@ -254,7 +268,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
     base_state = BaseNavState()
     # Detours make the drive longer, so obstacle runs get more time
-    base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT * (2 if obstacles else 1))
+    base_params = BaseControllerParams(nav_timeout=BASE_NAV_TIMEOUT * (2 if obstacle_ids is not None else 1))
 
     arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
     q_init_arm = init_joint_angles[4:11].copy()
@@ -279,7 +293,8 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     collision_steps = 0
     client = sim.pybullet_client
     rid = sim.bot[0].bot_pybullet
-    obstacle_ids = add_obstacles(client, obstacles) if obstacles else []
+    if obstacle_ids is not None and lidar_params is None:
+        lidar_params = LidarParams()
 
     while True:
         # ---- Sense ----
@@ -306,15 +321,15 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
         # ---- Lidar + obstacle contacts ----
         lidar = None
-        if obstacles:
-            lidar = lidar_scan(client, base_pos, base_bearing)
+        if obstacle_ids is not None:
+            lidar = lidar_scan(client, base_pos, base_bearing, lidar_params)
             if any(client.getContactPoints(rid, oid) for oid in obstacle_ids):
                 collision_steps += 1
 
         # ---- Base control ----
         wheel_cmds = base_controller(
             base_state, base_pos, base_bearing, base_goal_pos, base_goal_bearing, current_time, base_params,
-            obstacles=obstacles,
+            lidar=lidar,
         )
         base_navigation_done = base_state.done
 
@@ -384,7 +399,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         base_ang_vel_all.append(base_ang_vel)
         tau_gravity_all.append(tau_gravity_arm)
         if lidar is not None:
-            lidar_all.append(lidar)
+            lidar_all.append(lidar[0])
 
         if not headless:
             time.sleep(0.001)
@@ -394,9 +409,6 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
             print(f"t={current_time:.2f}s | Base pos: {np.round(base_pos[:2], 3)} | "
                   f"EE pos: {np.round(ee_pos, 3)} | EE error: {ee_dist_error:.4f}m | "
                   f"yaw {base_bearing:.2f} phase {base_state.phase} nav_done {base_navigation_done}")
-
-    for oid in obstacle_ids:
-        client.removeBody(oid)
 
     return {
         "time": np.array(time_all),
@@ -502,13 +514,14 @@ def main():
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
     add_target_visual(client, target_ee_pos)
-    obstacles = None
+    obstacle_ids = None
     if use_obstacles:
         seed = arg_value("--seed", int(np.random.SeedSequence().entropy % 100000))
         start_xy = np.array(sim.GetBasePosition())[:2]
         obstacles = random_obstacles(np.random.default_rng(seed), start_xy, compute_base_goal(target_ee_pos)[0],
                                      n=arg_value("--n-obstacles", 2))
         print(f"Obstacles (seed {seed}): {[tuple(round(v, 2) for v in o) for o in obstacles]}")
+        obstacle_ids = add_obstacles(client, obstacles)
 
     dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
@@ -523,7 +536,7 @@ def main():
     data = run_simulation_loop(
         sim, dyn_model, ee_frame_id, shoulder_frame_id,
         init_joint_angles, target_finger_angles,
-        lower_limits, upper_limits, target_ee_pos=target_ee_pos, obstacles=obstacles,
+        lower_limits, upper_limits, target_ee_pos=target_ee_pos, obstacle_ids=obstacle_ids,
     )
 
 
