@@ -329,7 +329,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         # ---- Base control ----
         wheel_cmds = base_controller(
             base_state, base_pos, base_bearing, base_goal_pos, base_goal_bearing, current_time, base_params,
-            lidar=lidar,
+            lidar=lidar, base_lin_vel=base_lin_vel,
         )
         base_navigation_done = base_state.done
 

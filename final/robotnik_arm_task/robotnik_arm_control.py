@@ -161,16 +161,12 @@ class BaseControllerParams:
 
 @dataclass
 class BaseNavState:
-    """Navigation phases: align (turn in place toward goal) -> drive -> orient (face target) -> done.
-
-    With lidar, a leg can go to a detour waypoint first: align -> drive to the waypoint, then
-    align -> drive to the goal (replanning at the start of every leg).
-    """
+    """Navigation phases: align (turn in place toward goal) -> drive -> orient (face target) -> done."""
     phase: str = "align"
     done: bool = False
-    waypoint: np.ndarray = None    # current detour waypoint (world xy), None = heading for the goal
-    leg_planned: bool = False      # the current leg has been checked against the lidar
-    n_plans: int = 0
+    gap_side: int = 0              # +1/-1: side of the goal direction the last detour went, 0 = none
+    heading: float = None          # world heading aimed at for the current step (lidar mode)
+    step_start: np.ndarray = None  # base xy where the current step started (lidar mode)
 
 
 @dataclass
@@ -196,131 +192,68 @@ def lidar_scan(client, base_pos, base_bearing, params):
 
 
 @dataclass
-class AvoidParams:
-    """Lidar path planning: obstacles are passed via waypoints around them."""
+class GapParams:
+    """Follow-the-gap obstacle avoidance."""
     robot_radius: float = 0.47     # m, chassis half-diagonal
-    margin: float = 0.15           # m, extra clearance kept between chassis and obstacle
-    max_plans: int = 100
-    cluster_gap: float = 0.3       # m, lidar hits closer than this belong to one obstacle
-    nodes_per_obstacle: int = 8
-    min_obstacle_radius: float = 0.25  # m, lidar sees only the near side, so never assume smaller
-    replan_slack: float = 0.06     # m, clearance given up before a driving leg counts as blocked
-    waypoint_tol: float = 0.15     # m, a waypoint counts as reached within this distance
-    realign_err: float = 0.35      # rad, heading error while driving that triggers a turn in place
+    margin: float = 0.15           # m, extra gap kept between chassis and obstacle
+    lookahead: float = 1.5         # m, hits further than this (or than the goal) are ignored
+    step_len: float = 0.5          # m, distance driven per step before stopping to rescan and re-aim
     # m, goal tolerance with lidar. Turning in place also shifts the base centre, so chasing the
     # plain 8 cm tolerance after a detour can orbit the goal; the arm covers the extra offset.
     goal_tol: float = 0.2
-    max_range: float = 3.0         # m, must match LidarParams.max_range (misses are ignored)
+    stop_speed: float = 0.03       # m/s, the base must be slower than this before it turns in place
 
 
-def lidar_obstacles(base_xy, base_bearing, ranges, angles, params):
-    """Group the lidar hits into obstacles, each modelled as a circle. Returns [(centre, radius)].
-
-    Adjacent rays whose hits are close belong to one obstacle. Only the near side is seen, so the
-    centre is pushed back from the visible arc and the radius is padded by a ray spacing.
-    """
-    hit = ranges < params.max_range - 1e-3
-    world = angles + base_bearing
-    pts = base_xy + ranges[:, None] * np.stack([np.cos(world), np.sin(world)], axis=1)
-    clusters, cur = [], []
-    for i in range(len(ranges)):
-        if hit[i] and cur and np.linalg.norm(pts[i] - pts[cur[-1]]) < params.cluster_gap:
-            cur.append(i)
-        else:
-            if cur:
-                clusters.append(cur)
-            cur = [i] if hit[i] else []
-    if cur:
-        clusters.append(cur)
-    # The scan wraps around: join the last run onto the first if they touch
-    if len(clusters) > 1 and clusters[0][0] == 0 and clusters[-1][-1] == len(ranges) - 1 \
-            and np.linalg.norm(pts[0] - pts[-1]) < params.cluster_gap:
-        clusters[0] = clusters.pop() + clusters[0]
-
-    ray_spacing = 2 * np.pi / len(ranges)
-    circles = []
-    for c in clusters:
-        p = pts[c]
-        extent = np.linalg.norm(p[:, None] - p[None], axis=2).max()
-        radius = max(params.min_obstacle_radius, extent / 2 + ranges[c].min() * ray_spacing)
-        away = p.mean(axis=0) - base_xy
-        away /= np.linalg.norm(away)
-        circles.append((p.mean(axis=0) + 0.7 * radius * away, radius))
-    return circles
+def _safe_dirs(dirs, ranges, angles, reach, half_width):
+    """Mask of the directions `dirs` the robot could drive along. Driving along a direction sweeps a
+    corridor as wide as the robot; it is blocked if any lidar hit within `reach` lies ahead in that
+    corridor (less than half_width to the side). A gap between two obstacles narrower than the robot
+    therefore closes up, while hits beside or behind the robot do not block moving away from them."""
+    near = ranges < reach
+    delta = wrap_angle(dirs[:, None] - angles[None, near])
+    ahead = np.cos(delta) > -0.25   # slightly behind-beside too, so the base does not hug what it passes
+    beside = ranges[None, near] * np.abs(np.sin(delta)) < half_width
+    return ~np.any(ahead & beside, axis=1)
 
 
-def _segment_hits(zones, a, b, slack=0.0):
-    """True if the segment a->b enters any keep-out zone (centre, radius) shrunk by `slack`."""
-    d = b - a
-    length2 = d @ d
-    for centre, radius in zones:
-        s = np.clip((centre - a) @ d / length2, 0.0, 1.0) if length2 > 1e-12 else 0.0
-        if np.linalg.norm(a + s * d - centre) < radius - slack:
-            return True
-    return False
+def gap_heading(ranges, angles, goal_err, dist_to_goal, state, params):
+    """Robot-frame direction to drive along: the goal itself if it is safe, otherwise the safe lidar
+    ray closest to it. Once a detour has picked a side of the goal direction it sticks to that side until
+    the goal is clear again (switching only if that side has no safe ray), so it cannot dither between
+    going left and right of an obstacle."""
+    reach = min(params.lookahead, dist_to_goal)
+    half_width = params.robot_radius + params.margin
+    safe = _safe_dirs(angles, ranges, angles, reach, half_width)
+    if not safe.any():
+        # Already closer than the margin to something: drop the margin to find a way out
+        safe = _safe_dirs(angles, ranges, angles, reach, params.robot_radius)
+    if not safe.any():
+        return wrap_angle(angles[np.argmin(ranges)] + np.pi)    # boxed in: back away from the nearest hit
 
-
-def _keep_out(circles, start, goal, clearance):
-    """Inflate obstacles by `clearance` into keep-out zones for the robot centre.
-
-    If the robot (after slipping) or the goal is already inside a full zone, that zone is shrunk to
-    just exclude it. Dropping the obstacle instead would let the planner drive straight through it.
-    """
-    return [(c, max(0.05, min(r + clearance, np.linalg.norm(start - c) - 0.05, np.linalg.norm(goal - c) - 0.05)))
-            for c, r in circles]
-
-
-def plan_path(circles, start, goal, params):
-    """Shortest collision-free path start -> goal as a list of points (goal last).
-
-    Visibility graph: nodes on a polygon around each inflated obstacle, edges wherever the straight
-    segment is clear, then Dijkstra. Falls back to [goal] if no path exists.
-    """
-    zones = _keep_out(circles, start, goal, params.robot_radius + params.margin)
-    nodes = [start, goal]
-    k = params.nodes_per_obstacle
-    ring = np.stack([np.cos(np.linspace(0, 2 * np.pi, k, endpoint=False)),
-                     np.sin(np.linspace(0, 2 * np.pi, k, endpoint=False))], axis=1)
-    for centre, radius in zones:
-        # Polygon just outside the zone, so its edges stay clear of it
-        for n in centre + (radius / np.cos(np.pi / k) + 0.02) * ring:
-            if all(np.linalg.norm(n - c) > r for c, r in zones):
-                nodes.append(n)
-
-    n_nodes = len(nodes)
-    dist = np.full(n_nodes, np.inf)
-    prev = np.full(n_nodes, -1)
-    done = np.zeros(n_nodes, dtype=bool)
-    dist[0] = 0.0
-    while True:
-        i = int(np.argmin(np.where(done, np.inf, dist)))
-        if done[i] or not np.isfinite(dist[i]):
-            return [goal]
-        if i == 1:
-            break
-        done[i] = True
-        for j in range(n_nodes):
-            if done[j]:
-                continue
-            step = np.linalg.norm(nodes[j] - nodes[i])
-            if dist[i] + step < dist[j] and not _segment_hits(zones, nodes[i], nodes[j]):
-                dist[j] = dist[i] + step
-                prev[j] = i
-    path, i = [], 1
-    while i != 0:
-        path.append(nodes[i])
-        i = prev[i]
-    return path[::-1]
+    goal_safe = _safe_dirs(np.array([goal_err]), ranges, angles, reach, half_width)[0]
+    if goal_safe:
+        state.gap_side = 0
+        return goal_err
+    offset = wrap_angle(angles[safe] - goal_err)
+    on_side = np.sign(offset) == state.gap_side
+    if state.gap_side != 0 and on_side.any():
+        offset = offset[on_side]
+    best = offset[np.argmin(np.abs(offset))]
+    state.gap_side = int(np.sign(best))
+    return wrap_angle(goal_err + best)
 
 
 def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, current_time, params,
-                    lidar=None, avoid_params=None):
+                    lidar=None, gap_params=None, base_lin_vel=None):
     """Skid-steer base navigation to a goal pose; updates state in place.
 
-    lidar: optional (ranges, angles) from lidar_scan. When given, the path is checked against the scan
-        and detour waypoints are planned around the obstacles on it. Every leg is still driven with the
-        plain turn-in-place + straight drive: the wheels have almost no lateral grip, so turning while
-        moving makes the base slide.
+    lidar: optional (ranges, angles) from lidar_scan. When given, the base moves in steps:
+        1. align: brake to a stop (needs base_lin_vel), pick a direction from the scan (follow the gap:
+           the goal if it is clear, else the clear direction closest to it), turn in place to face it
+        2. drive: go straight for step_len (holding that heading), stopping early if the way ahead
+           becomes blocked or the goal is reached
+        then back to 1. Turning only while stopped matters: the wheels have almost no lateral grip, so
+        turning while rolling converts the forward motion into a sideways slide.
 
     Returns the wheel velocity commands [front_right, front_left, back_left, back_right] (rad/s).
     Once navigation is done the base holds position (zero wheel velocities).
@@ -328,58 +261,52 @@ def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, curre
     if state.done:
         return np.zeros(4)
 
-    ap = avoid_params or AvoidParams()
-    base_xy = base_pos[:2]
-    if lidar is not None and state.phase in ("align", "drive"):
-        leg_target = state.waypoint if state.waypoint is not None else goal_pos
-        circles = lidar_obstacles(base_xy, base_bearing, lidar[0], lidar[1], ap)
-        # Plan at the start of each leg toward the goal, and replan whenever the current leg is blocked.
-        # The blocked check uses a slightly smaller clearance than planning, so a leg that just grazes
-        # the margin does not trigger a replan on every step as the obstacle estimates jitter.
-        new_leg = state.waypoint is None and not state.leg_planned
-        zones = _keep_out(circles, base_xy, leg_target, ap.robot_radius + ap.margin)
-        blocked = _segment_hits(zones, base_xy, leg_target, ap.replan_slack)
-        if (new_leg or blocked) and state.n_plans < ap.max_plans:
-            state.leg_planned = True
-            state.n_plans += 1
-            # Skip path points that already count as reached, or the next step would replan again
-            path = [p for p in plan_path(circles, base_xy, goal_pos, ap)[:-1]
-                    if np.linalg.norm(p - base_xy) > 2 * ap.waypoint_tol]
-            state.waypoint = path[0] if path else None
-            state.phase = "align"
-
-    target = state.waypoint if state.waypoint is not None else goal_pos
-    if state.waypoint is not None:
-        tol = ap.waypoint_tol
-    else:
-        tol = ap.goal_tol if lidar is not None else params.pos_tol
-    dist_to_goal = np.linalg.norm(base_xy - target)
-    to_goal = target - base_xy
-    heading_to_goal = np.arctan2(to_goal[1], to_goal[0])
+    gp = gap_params or GapParams()
+    tol = gp.goal_tol if lidar is not None else params.pos_tol
+    dist_to_goal = np.linalg.norm(base_pos[:2] - goal_pos)
+    to_goal = goal_pos - base_pos[:2]
+    goal_err = wrap_angle(np.arctan2(to_goal[1], to_goal[0]) - base_bearing)
     v_cmd, w_cmd = 0.0, 0.0
-    if state.phase == "align":
-        err = wrap_angle(heading_to_goal - base_bearing)
-        if dist_to_goal < tol or abs(err) < params.ang_tol:
+    if lidar is not None and state.phase in ("align", "drive"):
+        ranges, angles = lidar
+        if dist_to_goal < tol:
+            state.phase = "orient"
+        elif state.phase == "align":
+            stopped = base_lin_vel is None or np.linalg.norm(base_lin_vel[:2]) < gp.stop_speed
+            if stopped:            # else brake (zero wheel speeds) until the base stands still
+                if state.heading is None:
+                    # Aim once, from a scan taken while standing still
+                    state.heading = wrap_angle(base_bearing + gap_heading(ranges, angles, goal_err, dist_to_goal, state, gp))
+                err = wrap_angle(state.heading - base_bearing)
+                if abs(err) < params.ang_tol:
+                    state.phase = "drive"
+                    state.step_start = base_pos[:2].copy()
+                else:
+                    w_cmd = np.clip(params.kp_ori * err, -params.max_ang_vel, params.max_ang_vel)
+        else:
+            err = wrap_angle(state.heading - base_bearing)
+            travelled = np.linalg.norm(base_pos[:2] - state.step_start)
+            reach = min(gp.lookahead, dist_to_goal)
+            ahead_clear = _safe_dirs(np.array([err]), ranges, angles, reach, gp.robot_radius + gp.margin)[0]
+            if travelled >= min(gp.step_len, dist_to_goal) or not ahead_clear:
+                state.phase = "align"      # step done (or way blocked): stop, rescan, re-aim
+                state.heading = None
+            else:
+                v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel)
+                w_cmd = np.clip(1.5 * err, -0.3, 0.3)     # only holds the aimed heading
+    elif state.phase == "align":
+        if dist_to_goal < tol or abs(goal_err) < params.ang_tol:
             state.phase = "drive" if dist_to_goal >= tol else "orient"
         else:
-            w_cmd = np.clip(params.kp_ori * err, -params.max_ang_vel, params.max_ang_vel)
-    if state.phase == "drive":
-        err = wrap_angle(heading_to_goal - base_bearing)
-        passed_goal = dist_to_goal < 0.15 and np.cos(err) < 0.0
+            w_cmd = np.clip(params.kp_ori * goal_err, -params.max_ang_vel, params.max_ang_vel)
+    if lidar is None and state.phase == "drive":
+        passed_goal = dist_to_goal < 0.15 and np.cos(goal_err) < 0.0
         if dist_to_goal < tol or passed_goal:
             state.phase = "orient"
-        elif lidar is not None and abs(err) > ap.realign_err:
-            # Slipped off the line: stop and turn in place rather than curving (which slides more)
-            state.phase = "align"
         else:
             # Gentle steering while driving: skid-steer slips a lot when turning hard, so keep it mostly straight
-            v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel) * max(0.0, np.cos(err))
-            w_cmd = np.clip(1.5 * err, -0.3, 0.3)
-    if state.phase == "orient" and state.waypoint is not None:
-        # Waypoint reached: start the next leg toward the goal
-        state.waypoint = None
-        state.leg_planned = False
-        state.phase = "align"
+            v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel) * max(0.0, np.cos(goal_err))
+            w_cmd = np.clip(1.5 * goal_err, -0.3, 0.3)
     if state.phase == "orient":
         err = wrap_angle(goal_bearing - base_bearing)
         if abs(err) < params.ang_tol:
