@@ -363,7 +363,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         # ---- Torque noise (executed only, never logged as the label) ----
         torque_applied = torque_arm
         if torque_noise is not None and base_navigation_done:
-            torque_applied = np.clip(torque_arm + torque_noise.sample(current_time),
+            torque_applied = np.clip(torque_arm + torque_noise.sample(),
                                      -arm_params.max_torque, arm_params.max_torque)
 
         # ---- Send commands ----
