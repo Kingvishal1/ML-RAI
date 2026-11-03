@@ -23,9 +23,11 @@ from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, REACH_TOLERANCE, ARM_REACH_LIMIT,
+    add_obstacles, random_obstacles, compute_base_goal,
 )
 from robotnik_arm_control import (
     configure_gripper_fingers, quaternion2bearing,
+    lidar_scan, LidarParams,
 )
 from run_policy import load_policy, predict
 from regressors import build_mlp
@@ -79,7 +81,7 @@ def build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
 
 
 def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
-                           target_ee_pos, feature_names=None):
+                           target_ee_pos, feature_names=None, lidar_ranges=None):
     """Assemble base policy observation, optionally filtered by feature_names.
 
     Linear velocities are rotated into the base frame so that 'forward' and
@@ -123,6 +125,11 @@ def build_base_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
         "target_in_base_x": target_in_base_x,
         "target_in_base_y": target_in_base_y,
     }
+
+    # Add lidar features when ranges are provided
+    if lidar_ranges is not None:
+        for i, r in enumerate(lidar_ranges):
+            ALL_BASE[f"lidar_{i}"] = r
 
     if feature_names is None:
         # Default: base-frame velocities + Cartesian target in base frame (5-dim, fully generalizable)
@@ -197,6 +204,18 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
     add_target_visual(client, target_ee_pos)
+
+    # Spawn obstacles if requested
+    _pb = sim.GetPyBulletClient()
+    has_lidar = base_feature_names is not None and any(n.startswith("lidar_") for n in base_feature_names)
+    lidar_params = LidarParams() if has_lidar else None
+    if getattr(args, "obstacles", 0) > 0:
+        obs_rng = np.random.RandomState(args.obstacle_seed)
+        start_xy = np.array([0.0, 0.0])  # robot starts at origin
+        goal_xy = target_ee_pos[:2]
+        obstacle_list = random_obstacles(obs_rng, start_xy, goal_xy, n=args.obstacles)
+        add_obstacles(_pb, obstacle_list)
+        print(f"Spawned {len(obstacle_list)} obstacles")
 
     dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
@@ -334,12 +353,19 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             torque_arm = np.clip(action[4:], -30.0, 30.0)
 
         elif phase == "base":
+            # Scan lidar if model expects it
+            lidar_ranges = None
+            if has_lidar:
+                ranges, _angles = lidar_scan(_pb, base_pos, base_bearing, lidar_params)
+                lidar_ranges = ranges / lidar_params.max_range  # normalise to [0, 1]
+
             # Build base observation (without phase input)
             obs_feature_names = [n for n in base_feature_names if n != "phase"] \
                 if has_base_phases else base_feature_names
             obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
                                               base_ang_vel, target_ee_pos,
-                                              feature_names=obs_feature_names)
+                                              feature_names=obs_feature_names,
+                                              lidar_ranges=lidar_ranges)
 
             # Heading-based phase switching
             if has_base_phases:
@@ -543,6 +569,10 @@ def main():
     parser.add_argument("--heading_threshold", type=float, default=0.15,
                         help="Heading error (rad) for rotate/drive sub-phase transition "
                              "(only used when base checkpoint has 'phase' feature, default: 0.15)")
+    parser.add_argument("--obstacles", type=int, default=0,
+                        help="Number of obstacles to spawn (default: 0)")
+    parser.add_argument("--obstacle_seed", type=int, default=None,
+                        help="Random seed for obstacle placement (default: random)")
     args = parser.parse_args()
 
     # Determine mode

@@ -36,15 +36,17 @@ from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, ARM_REACH_LIMIT,
     compute_base_goal, BASE_NAV_TIMEOUT,
+    add_obstacles, random_obstacles,
 )
 from robotnik_arm_control import (
     ArmControllerParams, BaseControllerParams, BaseNavState,
     arm_controller, base_controller, configure_gripper_fingers, quaternion2bearing,
+    lidar_scan, LidarParams, GapParams,
 )
 from run_policy import load_policy, predict
 from run_policy_sim import build_base_observation, build_arm_observation, WHEEL_RADIUS, WHEEL_BASE_WIDTH
 from evaluate import generate_targets
-from split_dataset import ARM_FEATURE_NAMES, BASE_FEATURE_NAMES
+from split_dataset import ARM_FEATURE_NAMES, BASE_FEATURE_NAMES, LIDAR_FEATURE_NAMES
 
 
 def _out_paths(out_arg):
@@ -67,6 +69,19 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
     add_target_visual(client, target_ee_pos)
+
+    # Spawn obstacles if requested
+    _pb = sim.GetPyBulletClient()
+    has_lidar = base_feature_names is not None and any(n.startswith("lidar_") for n in base_feature_names)
+    lidar_params = LidarParams() if (has_lidar or getattr(args, "obstacles", 0) > 0) else None
+    gap_params = GapParams() if getattr(args, "obstacles", 0) > 0 else None
+    if getattr(args, "obstacles", 0) > 0:
+        obs_rng = np.random.RandomState(
+            args.obstacle_seed + target_id if args.obstacle_seed is not None else None)
+        start_xy = np.array([0.0, 0.0])
+        goal_xy = target_ee_pos[:2]
+        obstacle_list = random_obstacles(obs_rng, start_xy, goal_xy, n=args.obstacles)
+        add_obstacles(_pb, obstacle_list)
 
     dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
@@ -180,17 +195,27 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
 
         # ---- Compute action ----
         if phase == "base":
+            # Scan lidar if model expects it or obstacles are present
+            lidar_ranges = None
+            lidar_data = None
+            if lidar_params is not None:
+                ranges, angles = lidar_scan(_pb, base_pos, base_bearing, lidar_params)
+                lidar_data = (ranges, angles)
+                lidar_ranges = ranges / lidar_params.max_range  # normalise to [0, 1]
+
             # Build base observation (without phase for both legacy and phase-output models)
             obs_feature_names = [n for n in base_feature_names if n != "phase"] \
                 if has_base_phases else base_feature_names
             obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
                                               base_ang_vel, target_ee_pos,
-                                              feature_names=obs_feature_names)
+                                              feature_names=obs_feature_names,
+                                              lidar_ranges=lidar_ranges if has_lidar else None)
 
             # Query expert base controller at the policy-visited state
             expert_wheel_cmds = base_controller(
                 expert_base_state, base_pos, base_bearing,
                 base_goal_pos, base_goal_bearing, current_time, base_params,
+                lidar=lidar_data, gap_params=gap_params, base_lin_vel=base_lin_vel,
             )
             # Convert expert wheel cmds [rw, lw, lw, rw] -> [v_cmd, w_cmd]
             rw_expert = expert_wheel_cmds[0]
@@ -239,7 +264,11 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
                 policy_wheel_cmds = np.array([rw_policy, lw_policy, lw_policy, rw_policy])
 
             # Record base DAgger data (obs WITHOUT phase feature)
-            base_obs_list.append(obs_base if not has_base_phases else obs_base[:-1])
+            obs_record = obs_base if not has_base_phases else obs_base[:-1]
+            # Append lidar to recorded observation if scanning but model doesn't have lidar yet
+            if lidar_ranges is not None and not has_lidar:
+                obs_record = np.concatenate([obs_record, lidar_ranges])
+            base_obs_list.append(obs_record)
             base_label_list.append([v_cmd_expert, w_cmd_expert])
             base_meta_list.append([target_id, base_step])
             base_step += 1
@@ -398,6 +427,10 @@ def main():
     parser.add_argument("--heading_threshold", type=float, default=0.15,
                         help="Heading error (rad) for rotate/drive sub-phase transition "
                              "(only used when base checkpoint has 'phase' feature, default: 0.15)")
+    parser.add_argument("--obstacles", type=int, default=0,
+                        help="Number of obstacles to spawn per episode (default: 0)")
+    parser.add_argument("--obstacle_seed", type=int, default=None,
+                        help="Random seed for obstacle placement (default: random)")
     args = parser.parse_args()
 
     if not args.expert_base and args.base_checkpoint is None:
@@ -479,6 +512,10 @@ def main():
     # Resolve feature names (exclude "phase" — it's a label, not input, for phase-output models)
     base_fnames_out = list(base_fnames) if base_fnames is not None else list(BASE_FEATURE_NAMES)
     base_fnames_out = [n for n in base_fnames_out if n != "phase"]
+    # Include lidar features if obstacles were used but model didn't already have them
+    has_lidar_in_model = any(n.startswith("lidar_") for n in base_fnames_out)
+    if args.obstacles > 0 and not has_lidar_in_model:
+        base_fnames_out.extend(LIDAR_FEATURE_NAMES)
     arm_fnames_out = list(arm_fnames) if arm_fnames is not None else list(ARM_FEATURE_NAMES)
 
     # Save base data

@@ -46,6 +46,8 @@ BASE_FEATURE_NAMES = [
     "dist_to_target", "heading_error",
 ]
 
+LIDAR_FEATURE_NAMES = [f"lidar_{i}" for i in range(72)]
+
 ARM_FEATURE_NAMES = (
     [f"q_arm_{i}" for i in range(1, 8)]
     + [f"qd_arm_{i}" for i in range(1, 8)]
@@ -97,13 +99,6 @@ def main():
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     parser.add_argument("--arm_full_torque", action="store_true",
                         help="Use full expert torques as arm labels (includes gravity) instead of residual")
-    parser.add_argument("--heading_threshold", type=float, default=0.15,
-                        help="Heading error (rad) below which base sub-phase is 'drive' "
-                             "(above = 'rotate'). Set to 0 to disable phase feature. (default: 0.15)")
-    parser.add_argument("--phase_by_vcmd", type=float, default=None,
-                        help="Label phase by expert v_cmd magnitude instead of heading error. "
-                             "Samples with |v_cmd| >= this threshold are 'drive', rest are 'rotate'. "
-                             "(e.g. 0.02)")
     args = parser.parse_args()
 
     data = np.load(args.data)
@@ -138,8 +133,16 @@ def main():
     heading_to_target = np.arctan2(delta[:, 1], delta[:, 0])                # (N,)
     heading_error = np.arctan2(np.sin(heading_to_target - bearing),
                                np.cos(heading_to_target - bearing))[:, None]  # (N, 1) wrapped
-    base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 14)
+    base_inputs = np.hstack([base_raw, dist_to_target, heading_error])      # (N, 7)
     base_names = list(BASE_FEATURE_NAMES)
+
+    # Append lidar columns if present (cols 44:116 = 72 normalised lidar rays)
+    has_lidar = inputs.shape[1] > 44
+    if has_lidar:
+        lidar_cols = inputs[base_mask][:, 44:116]                          # (N, 72)
+        base_inputs = np.hstack([base_inputs, lidar_cols])
+        base_names.extend(LIDAR_FEATURE_NAMES)
+        print(f"Lidar detected ({lidar_cols.shape[1]} rays) — base inputs now {base_inputs.shape[1]} dims")
 
     # Drop requested base features
     if args.drop_base:
@@ -164,26 +167,16 @@ def main():
     v_cmd = (rw + lw) / 2.0 * WHEEL_RADIUS               # m/s
 
     # Compute phase feature (rotate=0, drive=1) — appended as input feature
-    phase_col = None
-    if args.phase_by_vcmd is not None:
-        is_drive = np.abs(v_cmd) >= args.phase_by_vcmd
-        phase_col = is_drive.astype(np.float64)
-        n_drive = is_drive.sum()
-        n_rotate = len(phase_col) - n_drive
-        print(f"Phase feature (by v_cmd): rotate={n_rotate} ({100*n_rotate/len(phase_col):.1f}%)  "
-              f"drive={n_drive} ({100*n_drive/len(phase_col):.1f}%)  "
-              f"|v_cmd| threshold={args.phase_by_vcmd}")
-    elif args.heading_threshold > 0:
-        is_rotate = np.abs(heading_error.flatten()) >= args.heading_threshold
-        phase_col = (~is_rotate).astype(np.float64)
-        n_rotate = is_rotate.sum()
-        n_drive = len(phase_col) - n_rotate
-        print(f"Phase feature (by heading): rotate={n_rotate} ({100*n_rotate/len(phase_col):.1f}%)  "
-              f"drive={n_drive} ({100*n_drive/len(phase_col):.1f}%)  "
-              f"threshold={args.heading_threshold:.3f} rad")
-    if phase_col is not None:
-        base_inputs = np.column_stack([base_inputs, phase_col])
-        base_names.append("phase")
+    HEADING_THRESHOLD = np.radians(9.0)  # fixed at 9 deg
+    is_rotate = np.abs(heading_error.flatten()) >= HEADING_THRESHOLD
+    phase_col = (~is_rotate).astype(np.float64)
+    n_rotate = is_rotate.sum()
+    n_drive = len(phase_col) - n_rotate
+    print(f"Phase feature (by heading): rotate={n_rotate} ({100*n_rotate/len(phase_col):.1f}%)  "
+          f"drive={n_drive} ({100*n_drive/len(phase_col):.1f}%)  "
+          f"threshold={np.degrees(HEADING_THRESHOLD):.0f} deg")
+    base_inputs = np.column_stack([base_inputs, phase_col])
+    base_names.append("phase")
     w_cmd = (rw - lw) / WHEEL_BASE_WIDTH * WHEEL_RADIUS   # rad/s
     base_labels = np.column_stack([v_cmd, w_cmd])             # (N, 2)
     base_metadata = metadata[base_mask]
