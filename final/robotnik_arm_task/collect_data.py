@@ -20,8 +20,11 @@ from robotnik_arm_task import (
     setup_simulation,
     setup_kinematics,
     run_simulation_loop,
+    add_obstacles,
+    random_obstacles,
+    OBSTACLE_DEMO_TARGET,
 )
-from robotnik_arm_control import configure_gripper_fingers
+from robotnik_arm_control import configure_gripper_fingers, LidarParams
 
 
 # ==============================================================================
@@ -63,7 +66,8 @@ def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
                           shoulder_frame_id, init_joint_angles,
                           lower_limits, upper_limits,
                           target_ee_pos, vary_init=False, rng=None,
-                          torque_noise=None, hold_time=0.0):
+                          torque_noise=None, hold_time=0.0,
+                          n_obstacles=0, obstacle_rng=None):
     """Reset the sim and run one trajectory for a given target.
 
     Returns the data dict from run_simulation_loop or None on failure.
@@ -85,6 +89,16 @@ def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
             sim.bot[0].bot_pybullet, base_pos, new_ori,
         )
 
+    # Spawn obstacles for this trajectory
+    obstacle_ids = None
+    lidar_params = None
+    if n_obstacles > 0 and obstacle_rng is not None:
+        start_xy = np.array(sim.GetBasePosition())[:2]
+        goal_xy = target_ee_pos[:2]
+        obs_list = random_obstacles(obstacle_rng, start_xy, goal_xy, n=n_obstacles)
+        obstacle_ids = add_obstacles(client, obs_list)
+        lidar_params = LidarParams()
+
     # Re-configure gripper fingers
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
 
@@ -99,27 +113,37 @@ def run_single_trajectory(sim, client, rid, dyn_model, ee_frame_id,
             target_ee_pos=target_ee_pos,
             torque_noise=torque_noise,
             hold_time=hold_time,
+            obstacle_ids=obstacle_ids,
+            lidar_params=lidar_params,
         )
         return data
     except Exception as e:
         print(f"  [WARN] Trajectory failed for target {target_ee_pos}: {e}")
         return None
+    finally:
+        # Remove obstacles so next trajectory starts clean
+        if obstacle_ids is not None:
+            for oid in obstacle_ids:
+                client.removeBody(oid)
 
 
 # ==============================================================================
 # Data assembly
 # ==============================================================================
 
+LIDAR_COLS = [f"lidar_{i}" for i in range(72)]
+
+
 def assemble_dataset(all_trajectory_data):
     """Assemble per-timestep rows from all trajectories.
 
     Returns (inputs, labels, metadata) as numpy arrays.
-      inputs:   (N, 44) — base_pos_x, base_pos_y, base_bearing,
-                           base_lin_vel_x/y/z, base_ang_vel_x/y/z,
-                           q_base_1..4, qd_base_1..4,
-                           q_arm_1..7, qd_arm_1..7,
-                           ee_pos_x/y/z, target_x, target_y, target_z,
-                           tau_gravity_1..7
+      inputs:   (N, 44) without lidar, or (N, 116) when lidar data is present.
+                The first 44 columns are: base_pos_x, base_pos_y, base_bearing,
+                base_lin_vel_x/y/z, base_ang_vel_x/y/z,
+                q_base_1..4, qd_base_1..4, q_arm_1..7, qd_arm_1..7,
+                ee_pos_x/y/z, target_x/y/z, tau_gravity_1..7.
+                When lidar is present, columns 44-115 are lidar_0..71 (normalised by max_range).
       labels:   (N, 11) — wheel_cmd_1..4, torque_arm_1..7
       metadata: (N, 2)  — trajectory_id, time
     """
@@ -127,9 +151,19 @@ def assemble_dataset(all_trajectory_data):
     label_rows = []
     meta_rows = []
 
+    # Detect whether any trajectory has lidar data
+    has_lidar = any(
+        "lidar" in d and len(d["lidar"]) == len(d["time"]) and d["lidar"].shape[0] > 0
+        for d in all_trajectory_data
+    )
+
     for traj_id, data in enumerate(all_trajectory_data):
         n_steps = len(data["time"])
         has_gravity = "tau_gravity" in data and len(data["tau_gravity"]) == n_steps
+        traj_has_lidar = (has_lidar and "lidar" in data
+                          and len(data["lidar"]) == n_steps
+                          and data["lidar"].shape[0] > 0)
+
         for i in range(n_steps):
             base_pos_xy = data["base_pos"][i, :2]            # 2
             base_bearing = data["base_bearing"][i]            # 1
@@ -145,7 +179,7 @@ def assemble_dataset(all_trajectory_data):
             target = data["target_ee_pos"][i]                  # 3
             tau_grav = data["tau_gravity"][i] if has_gravity else np.zeros(7)  # 7
 
-            inp = np.concatenate([
+            parts = [
                 base_pos_xy,
                 [base_bearing],
                 base_lin_vel,
@@ -157,8 +191,18 @@ def assemble_dataset(all_trajectory_data):
                 ee_pos,
                 target,
                 tau_grav,
-            ])  # 44 features
+            ]  # 44 features
 
+            if has_lidar:
+                if traj_has_lidar:
+                    # Normalise ranges to [0, 1] by max_range (default 3.0)
+                    lidar_ranges = data["lidar"][i] / 3.0
+                else:
+                    # Pad with 1.0 (max range = clear) if this traj has no lidar
+                    lidar_ranges = np.ones(72)
+                parts.append(lidar_ranges)  # +72 → 116
+
+            inp = np.concatenate(parts)
             wheel_cmds = data["wheel_cmds"][i]                 # 4
             torque_arm = data["torque_arm"][i]                  # 7
             lbl = np.concatenate([wheel_cmds, torque_arm])     # 11 outputs
@@ -179,7 +223,7 @@ def assemble_dataset(all_trajectory_data):
 # Saving
 # ==============================================================================
 
-INPUT_COLS = (
+INPUT_COLS_BASE = (
     ["base_pos_x", "base_pos_y", "base_bearing"]
     + ["base_lin_vel_x", "base_lin_vel_y", "base_lin_vel_z"]
     + ["base_ang_vel_x", "base_ang_vel_y", "base_ang_vel_z"]
@@ -262,6 +306,11 @@ def save_dataset(inputs, labels, metadata, out_dir):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # Determine column names based on input width
+    input_cols = list(INPUT_COLS_BASE)
+    if inputs.shape[1] > 44:
+        input_cols += LIDAR_COLS  # 44 + 72 = 116
+
     # .npz
     npz_path = os.path.join(out_dir, f"dataset_{timestamp}.npz")
     np.savez(npz_path, inputs=inputs, labels=labels, metadata=metadata)
@@ -269,7 +318,7 @@ def save_dataset(inputs, labels, metadata, out_dir):
 
     # .csv
     csv_path = os.path.join(out_dir, f"dataset_{timestamp}.csv")
-    all_cols = META_COLS + INPUT_COLS + LABEL_COLS
+    all_cols = META_COLS + input_cols + LABEL_COLS
     all_data = np.hstack([metadata, inputs, labels])
     header = ",".join(all_cols)
     np.savetxt(csv_path, all_data, delimiter=",", header=header, comments="")
@@ -281,7 +330,8 @@ def save_dataset(inputs, labels, metadata, out_dir):
 # ==============================================================================
 
 def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir,
-                    noise_params=None, clean_frac=0.0, hold_time=0.0):
+                    noise_params=None, clean_frac=0.0, hold_time=0.0,
+                    n_obstacles=0):
     """Run a batch of trajectories in an independent sim instance.
 
     Returns list of chunk file paths written to disk.
@@ -292,6 +342,7 @@ def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir,
 
     rng = np.random.default_rng(seed + worker_id) if vary_init else None
     noise_rng = np.random.default_rng(seed + 1000 + worker_id)
+    obstacle_rng = np.random.default_rng(seed + 2000 + worker_id) if n_obstacles > 0 else None
 
     all_data = []
     chunk_paths = []
@@ -305,6 +356,7 @@ def _worker_collect(worker_id, targets, vary_init, seed, flush_every, out_dir,
             init_joint_angles, lower_limits, upper_limits,
             target_ee_pos=target, vary_init=vary_init, rng=rng,
             torque_noise=torque_noise, hold_time=hold_time,
+            n_obstacles=n_obstacles, obstacle_rng=obstacle_rng,
         )
         if data is not None and len(data["time"]) > 0:
             all_data.append(data)
@@ -362,6 +414,10 @@ def main():
                         help="Fraction of trajectories collected without noise (default: 0.25)")
     parser.add_argument("--hold_time", type=float, default=2.0,
                         help="Seconds to keep recording after the target is first reached (default: 2)")
+    parser.add_argument("--obstacles", action="store_true",
+                        help="Enable obstacle mode: spawn random obstacles per trajectory")
+    parser.add_argument("--n_obstacles", type=int, default=2,
+                        help="Number of obstacles per trajectory (default: 2)")
     args = parser.parse_args()
 
     noise_params = None
@@ -369,6 +425,8 @@ def main():
         noise_params = TorqueNoiseParams(std=args.noise_std, active_prob=args.noise_prob,
                                          kick_prob=args.noise_kick_prob,
                                          kick_scale=args.noise_kick_scale)
+
+    n_obstacles = args.n_obstacles if args.obstacles else 0
 
     # Generate targets
     if args.mode == "grid":
@@ -378,6 +436,8 @@ def main():
 
     print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init}, "
           f"workers={args.workers})")
+    if args.obstacles:
+        print(f"Obstacle mode: {n_obstacles} obstacles/traj, target={OBSTACLE_DEMO_TARGET}")
     if noise_params:
         print(f"Torque noise: {noise_params}  clean_frac={args.clean_frac}")
     if args.hold_time > 0:
@@ -391,6 +451,7 @@ def main():
 
         rng = np.random.default_rng(args.seed) if args.vary_init else None
         noise_rng = np.random.default_rng(args.seed + 1000)
+        obstacle_rng = np.random.default_rng(args.seed + 2000) if n_obstacles > 0 else None
 
         all_data = []
         chunk_paths = []
@@ -404,6 +465,7 @@ def main():
                 init_joint_angles, lower_limits, upper_limits,
                 target_ee_pos=target, vary_init=args.vary_init, rng=rng,
                 torque_noise=torque_noise, hold_time=args.hold_time,
+                n_obstacles=n_obstacles, obstacle_rng=obstacle_rng,
             )
             if data is not None and len(data["time"]) > 0:
                 all_data.append(data)
@@ -437,6 +499,7 @@ def main():
                     _worker_collect, wid, list(map(np.array, split)),
                     args.vary_init, args.seed, args.flush_every, args.out_dir,
                     noise_params, args.clean_frac, args.hold_time,
+                    n_obstacles,
                 ): wid
                 for wid, split in enumerate(splits) if len(split) > 0
             }

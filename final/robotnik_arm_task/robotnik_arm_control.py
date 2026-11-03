@@ -164,10 +164,96 @@ class BaseNavState:
     """Navigation phases: align (turn in place toward goal) -> drive -> orient (face target) -> done."""
     phase: str = "align"
     done: bool = False
+    gap_side: int = 0              # +1/-1: side of the goal direction the last detour went, 0 = none
+    heading: float = None          # world heading aimed at for the current step (lidar mode)
+    step_start: np.ndarray = None  # base xy where the current step started (lidar mode)
 
 
-def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, current_time, params):
+@dataclass
+class LidarParams:
+    """Planar 2D lidar on the base: horizontal rays all around at a fixed height."""
+    n_rays: int = 72
+    max_range: float = 3.0         # m, measured from the base centre
+    min_range: float = 0.5         # m, rays start outside the chassis so they never hit the robot itself
+    height: float = 0.2            # m, scan plane above the floor
+
+
+def lidar_scan(client, base_pos, base_bearing, params):
+    """Cast the lidar rays. Returns (ranges, angles): ranges in m from the base centre,
+    angles in the robot frame (0 = straight ahead). A miss reads max_range."""
+    angles = np.linspace(-np.pi, np.pi, params.n_rays, endpoint=False)
+    world = angles + base_bearing
+    dirs = np.stack([np.cos(world), np.sin(world), np.zeros_like(world)], axis=1)
+    origin = np.array([base_pos[0], base_pos[1], params.height])
+    hits = client.rayTestBatch((origin + params.min_range * dirs).tolist(),
+                               (origin + params.max_range * dirs).tolist())
+    fractions = np.array([h[2] for h in hits])
+    return params.min_range + fractions * (params.max_range - params.min_range), angles
+
+
+@dataclass
+class GapParams:
+    """Follow-the-gap obstacle avoidance."""
+    robot_radius: float = 0.47     # m, chassis half-diagonal
+    margin: float = 0.15           # m, extra gap kept between chassis and obstacle
+    lookahead: float = 1.5         # m, hits further than this (or than the goal) are ignored
+    step_len: float = 0.5          # m, distance driven per step before stopping to rescan and re-aim
+    # m, goal tolerance with lidar. Turning in place also shifts the base centre, so chasing the
+    # plain 8 cm tolerance after a detour can orbit the goal; the arm covers the extra offset.
+    goal_tol: float = 0.2
+    stop_speed: float = 0.03       # m/s, the base must be slower than this before it turns in place
+
+
+def _safe_dirs(dirs, ranges, angles, reach, half_width):
+    """Mask of the directions `dirs` the robot could drive along. Driving along a direction sweeps a
+    corridor as wide as the robot; it is blocked if any lidar hit within `reach` lies ahead in that
+    corridor (less than half_width to the side). A gap between two obstacles narrower than the robot
+    therefore closes up, while hits beside or behind the robot do not block moving away from them."""
+    near = ranges < reach
+    delta = wrap_angle(dirs[:, None] - angles[None, near])
+    ahead = np.cos(delta) > -0.25   # slightly behind-beside too, so the base does not hug what it passes
+    beside = ranges[None, near] * np.abs(np.sin(delta)) < half_width
+    return ~np.any(ahead & beside, axis=1)
+
+
+def gap_heading(ranges, angles, goal_err, dist_to_goal, state, params):
+    """Robot-frame direction to drive along: the goal itself if it is safe, otherwise the safe lidar
+    ray closest to it. Once a detour has picked a side of the goal direction it sticks to that side until
+    the goal is clear again (switching only if that side has no safe ray), so it cannot dither between
+    going left and right of an obstacle."""
+    reach = min(params.lookahead, dist_to_goal)
+    half_width = params.robot_radius + params.margin
+    safe = _safe_dirs(angles, ranges, angles, reach, half_width)
+    if not safe.any():
+        # Already closer than the margin to something: drop the margin to find a way out
+        safe = _safe_dirs(angles, ranges, angles, reach, params.robot_radius)
+    if not safe.any():
+        return wrap_angle(angles[np.argmin(ranges)] + np.pi)    # boxed in: back away from the nearest hit
+
+    goal_safe = _safe_dirs(np.array([goal_err]), ranges, angles, reach, half_width)[0]
+    if goal_safe:
+        state.gap_side = 0
+        return goal_err
+    offset = wrap_angle(angles[safe] - goal_err)
+    on_side = np.sign(offset) == state.gap_side
+    if state.gap_side != 0 and on_side.any():
+        offset = offset[on_side]
+    best = offset[np.argmin(np.abs(offset))]
+    state.gap_side = int(np.sign(best))
+    return wrap_angle(goal_err + best)
+
+
+def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, current_time, params,
+                    lidar=None, gap_params=None, base_lin_vel=None):
     """Skid-steer base navigation to a goal pose; updates state in place.
+
+    lidar: optional (ranges, angles) from lidar_scan. When given, the base moves in steps:
+        1. align: brake to a stop (needs base_lin_vel), pick a direction from the scan (follow the gap:
+           the goal if it is clear, else the clear direction closest to it), turn in place to face it
+        2. drive: go straight for step_len (holding that heading), stopping early if the way ahead
+           becomes blocked or the goal is reached
+        then back to 1. Turning only while stopped matters: the wheels have almost no lateral grip, so
+        turning while rolling converts the forward motion into a sideways slide.
 
     Returns the wheel velocity commands [front_right, front_left, back_left, back_right] (rad/s).
     Once navigation is done the base holds position (zero wheel velocities).
@@ -175,25 +261,52 @@ def base_controller(state, base_pos, base_bearing, goal_pos, goal_bearing, curre
     if state.done:
         return np.zeros(4)
 
+    gp = gap_params or GapParams()
+    tol = gp.goal_tol if lidar is not None else params.pos_tol
     dist_to_goal = np.linalg.norm(base_pos[:2] - goal_pos)
     to_goal = goal_pos - base_pos[:2]
-    heading_to_goal = np.arctan2(to_goal[1], to_goal[0])
+    goal_err = wrap_angle(np.arctan2(to_goal[1], to_goal[0]) - base_bearing)
     v_cmd, w_cmd = 0.0, 0.0
-    if state.phase == "align":
-        err = wrap_angle(heading_to_goal - base_bearing)
-        if dist_to_goal < params.pos_tol or abs(err) < params.ang_tol:
-            state.phase = "drive" if dist_to_goal >= params.pos_tol else "orient"
+    if lidar is not None and state.phase in ("align", "drive"):
+        ranges, angles = lidar
+        if dist_to_goal < tol:
+            state.phase = "orient"
+        elif state.phase == "align":
+            stopped = base_lin_vel is None or np.linalg.norm(base_lin_vel[:2]) < gp.stop_speed
+            if stopped:            # else brake (zero wheel speeds) until the base stands still
+                if state.heading is None:
+                    # Aim once, from a scan taken while standing still
+                    state.heading = wrap_angle(base_bearing + gap_heading(ranges, angles, goal_err, dist_to_goal, state, gp))
+                err = wrap_angle(state.heading - base_bearing)
+                if abs(err) < params.ang_tol:
+                    state.phase = "drive"
+                    state.step_start = base_pos[:2].copy()
+                else:
+                    w_cmd = np.clip(params.kp_ori * err, -params.max_ang_vel, params.max_ang_vel)
         else:
-            w_cmd = np.clip(params.kp_ori * err, -params.max_ang_vel, params.max_ang_vel)
-    if state.phase == "drive":
-        err = wrap_angle(heading_to_goal - base_bearing)
-        passed_goal = dist_to_goal < 0.15 and np.cos(err) < 0.0
-        if dist_to_goal < params.pos_tol or passed_goal:
+            err = wrap_angle(state.heading - base_bearing)
+            travelled = np.linalg.norm(base_pos[:2] - state.step_start)
+            reach = min(gp.lookahead, dist_to_goal)
+            ahead_clear = _safe_dirs(np.array([err]), ranges, angles, reach, gp.robot_radius + gp.margin)[0]
+            if travelled >= min(gp.step_len, dist_to_goal) or not ahead_clear:
+                state.phase = "align"      # step done (or way blocked): stop, rescan, re-aim
+                state.heading = None
+            else:
+                v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel)
+                w_cmd = np.clip(1.5 * err, -0.3, 0.3)     # only holds the aimed heading
+    elif state.phase == "align":
+        if dist_to_goal < tol or abs(goal_err) < params.ang_tol:
+            state.phase = "drive" if dist_to_goal >= tol else "orient"
+        else:
+            w_cmd = np.clip(params.kp_ori * goal_err, -params.max_ang_vel, params.max_ang_vel)
+    if lidar is None and state.phase == "drive":
+        passed_goal = dist_to_goal < 0.15 and np.cos(goal_err) < 0.0
+        if dist_to_goal < tol or passed_goal:
             state.phase = "orient"
         else:
             # Gentle steering while driving: skid-steer slips a lot when turning hard, so keep it mostly straight
-            v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel) * max(0.0, np.cos(err))
-            w_cmd = np.clip(1.5 * err, -0.3, 0.3)
+            v_cmd = np.clip(params.kp_pos * dist_to_goal, params.min_lin_vel, params.max_lin_vel) * max(0.0, np.cos(goal_err))
+            w_cmd = np.clip(1.5 * goal_err, -0.3, 0.3)
     if state.phase == "orient":
         err = wrap_angle(goal_bearing - base_bearing)
         if abs(err) < params.ang_tol:
