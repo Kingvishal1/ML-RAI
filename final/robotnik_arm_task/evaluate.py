@@ -87,6 +87,8 @@ def main():
                         help="Number of multi-target episodes to evaluate (default: 10)")
     parser.add_argument("--selector_checkpoint", type=str, default=None,
                         help="Path to selector checkpoint (omit for expert nearest-neighbor)")
+    parser.add_argument("--selector_only", action="store_true",
+                        help="Evaluate selector decisions only (no simulation)")
     parser.add_argument("--per_target_max_steps", type=int, default=100000,
                         help="Max steps per target in multi-target mode (default: 100000)")
     parser.add_argument("--heading_threshold", type=float, default=0.15)
@@ -115,7 +117,7 @@ def main():
         if not args.base_checkpoint:
             args.base_checkpoint = None
 
-    if not split_mode and not single_mode:
+    if not split_mode and not single_mode and not args.selector_only:
         parser.error("Specify --checkpoint or --base_checkpoint/--arm_checkpoint")
 
     # Load policies
@@ -160,6 +162,90 @@ def main():
         policy_kwargs.update(grav_model=grav_model, grav_q_mean=grav_q_mean,
                              grav_q_std=grav_q_std, grav_tau_mean=grav_tau_mean,
                              grav_tau_std=grav_tau_std)
+
+    # --- Selector-only evaluation (no simulation) ---
+    if args.selector_only:
+        from robotnik_arm_task import shortest_path_expert, build_selector_scene
+        from run_policy_sim import predict_selector
+
+        if not args.selector_checkpoint:
+            parser.error("--selector_only requires --selector_checkpoint")
+
+        sel_model, sel_mean, sel_std = load_selector(args.selector_checkpoint, device=device)
+        print(f"Selector: {args.selector_checkpoint}  device={device}")
+
+        rng = np.random.default_rng(args.seed)
+        n_per_ep = args.num_targets_per_episode
+
+        total_decisions = 0
+        correct_decisions = 0
+        expert_total_dist = 0.0
+        model_total_dist = 0.0
+
+        for ep in range(args.num_episodes):
+            targets = np.array([[rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)]
+                                for _ in range(n_per_ep)])
+
+            robot_pos = np.array([0.0, 0.0, 0.0])
+            robot_bearing = 0.0
+            remaining = set(range(n_per_ep))
+
+            ep_model_dist = 0.0
+
+            while len(remaining) > 1:
+                # Expert choice
+                expert_idx, _ = shortest_path_expert(robot_pos, targets, remaining)
+
+                # Model choice
+                scene_obs, slot_order = build_selector_scene(robot_pos, robot_bearing, targets, remaining)
+                model_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
+
+                if model_idx == expert_idx:
+                    correct_decisions += 1
+                total_decisions += 1
+
+                ep_model_dist += np.linalg.norm(robot_pos[:2] - targets[model_idx, :2])
+
+                # Move robot to MODEL's choice
+                remaining.remove(model_idx)
+                robot_pos = targets[model_idx].copy()
+                robot_bearing = rng.uniform(-np.pi, np.pi)
+
+            # Last remaining target
+            if remaining:
+                last = remaining.pop()
+                ep_model_dist += np.linalg.norm(robot_pos[:2] - targets[last, :2])
+
+            # Compute expert total distance (full optimal path from origin)
+            _, full_order = shortest_path_expert(np.array([0, 0, 0]), targets, set(range(n_per_ep)))
+            ep_expert_dist_full = 0.0
+            pos = np.array([0.0, 0.0])
+            for idx in full_order:
+                ep_expert_dist_full += np.linalg.norm(pos - targets[idx, :2])
+                pos = targets[idx, :2].copy()
+
+            expert_total_dist += ep_expert_dist_full
+            model_total_dist += ep_model_dist
+
+            if (ep + 1) % max(1, args.num_episodes // 10) == 0 or ep == 0:
+                print(f"  Episode {ep+1}/{args.num_episodes}  "
+                      f"model_dist={ep_model_dist:.2f}  expert_dist={ep_expert_dist_full:.2f}")
+
+        acc = 100.0 * correct_decisions / max(total_decisions, 1)
+        avg_expert = expert_total_dist / args.num_episodes
+        avg_model = model_total_dist / args.num_episodes
+        overhead = 100.0 * (avg_model - avg_expert) / max(avg_expert, 1e-6)
+
+        print(f"\n{'='*60}")
+        print(f"SELECTOR-ONLY EVALUATION  ({args.num_episodes} episodes, "
+              f"{n_per_ep} targets each)")
+        print(f"{'='*60}")
+        print(f"Decision accuracy:     {correct_decisions}/{total_decisions} ({acc:.1f}%)")
+        print(f"Avg expert distance:   {avg_expert:.2f}")
+        print(f"Avg model distance:    {avg_model:.2f}")
+        print(f"Distance overhead:     {overhead:+.1f}%")
+        print(f"{'='*60}")
+        return
 
     # --- Multi-target evaluation ---
     if args.multi_target:
@@ -231,7 +317,7 @@ def main():
 
         # Visit ordering quality vs expert
         if not use_expert_selector:
-            from robotnik_arm_task import nearest_neighbor_expert
+            from robotnik_arm_task import shortest_path_expert
             order_matches = 0
             order_total = 0
             for ep_i, result in enumerate(all_results):

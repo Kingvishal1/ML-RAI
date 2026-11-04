@@ -2,6 +2,7 @@ import numpy as np
 import time
 import os
 from dataclasses import dataclass
+from itertools import permutations
 
 # Headless mode and step cap for CI / direct runs
 headless = os.environ.get("ROBOENV_HEADLESS", "").strip().lower() in ("1", "true", "yes")
@@ -369,6 +370,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
 
 SELECTOR_OBS_DIM = 3  # per-candidate: (in_base_x, in_base_y, z)
+SELECTOR_INPUT_DIM = MAX_TARGETS * SELECTOR_OBS_DIM + MAX_TARGETS  # 5*3 + 5 = 20
 
 
 def target_to_base_frame(base_pos, base_bearing, target_pos):
@@ -402,6 +404,35 @@ def build_selector_candidates(base_pos, base_bearing, target_positions, remainin
     return candidates
 
 
+def build_selector_scene(base_pos, base_bearing, target_positions, remaining_indices):
+    """Build a fixed-size scene observation for the target selector.
+
+    Packs all remaining candidates into MAX_TARGETS slots (sorted by slot index)
+    with a validity mask.  Empty slots are zero-padded.
+
+    Args:
+        base_pos: (3,) robot base position
+        base_bearing: scalar, robot heading (yaw)
+        target_positions: (N, 3) all target positions (world frame)
+        remaining_indices: iterable of valid target slot indices
+    Returns:
+        obs: (SELECTOR_INPUT_DIM,) = (MAX_TARGETS*3 + MAX_TARGETS,) flattened
+        slot_order: list of slot indices in the order they appear in obs
+    """
+    remaining = sorted(remaining_indices)
+    obs_block = np.zeros(MAX_TARGETS * SELECTOR_OBS_DIM)
+    mask = np.zeros(MAX_TARGETS)
+    slot_order = []
+
+    for i, idx in enumerate(remaining):
+        bf = target_to_base_frame(base_pos, base_bearing, target_positions[idx])
+        obs_block[i * SELECTOR_OBS_DIM:(i + 1) * SELECTOR_OBS_DIM] = bf
+        mask[i] = 1.0
+        slot_order.append(idx)
+
+    return np.concatenate([obs_block, mask]), slot_order
+
+
 def nearest_neighbor_expert(base_pos, target_positions, remaining_indices):
     """Pick the nearest remaining target by XY distance to the robot.
 
@@ -420,6 +451,37 @@ def nearest_neighbor_expert(base_pos, target_positions, remaining_indices):
             best_dist = dist
             best_idx = idx
     return best_idx
+
+
+def shortest_path_expert(base_pos, target_positions, remaining_indices):
+    """Solve TSP over remaining targets by brute-force to minimise total XY distance.
+
+    Starting from base_pos, evaluate every permutation of remaining targets and
+    return the full visit order (list) plus the first target to visit.
+
+    Args:
+        base_pos: (3,) robot base position
+        target_positions: (N, 3) all target positions
+        remaining_indices: set of valid target slot indices
+    Returns:
+        chosen_idx: int, the first target to visit in the optimal order
+        full_order: list[int], complete optimal visit sequence
+    """
+    remaining = list(remaining_indices)
+    if len(remaining) == 1:
+        return remaining[0], remaining
+
+    best_dist = np.inf
+    best_order = None
+    for perm in permutations(remaining):
+        d = np.linalg.norm(base_pos[:2] - target_positions[perm[0], :2])
+        for i in range(len(perm) - 1):
+            d += np.linalg.norm(target_positions[perm[i], :2] - target_positions[perm[i + 1], :2])
+        if d < best_dist:
+            best_dist = d
+            best_order = list(perm)
+
+    return best_order[0], best_order
 
 
 def run_multi_target_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
@@ -462,7 +524,7 @@ def run_multi_target_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
 
         candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
-        chosen_idx = nearest_neighbor_expert(base_pos, all_targets, remaining)
+        chosen_idx, _ = shortest_path_expert(base_pos, all_targets, remaining)
 
         selector_samples.append({
             "candidates": candidates,

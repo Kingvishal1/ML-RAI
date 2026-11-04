@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Train a target-selector MLP scorer on expert nearest-neighbor data.
+"""Train a target-selector MLP on expert shortest-path data.
 
-The model scores individual candidate targets (3-dim input: target position in
-the robot's base frame) and outputs a single scalar score.  At each decision
-point the expert-chosen candidate should score highest among the remaining set.
-
-Training uses per-decision-point cross-entropy: for each group of candidates
-belonging to one decision, softmax over their scores and penalise if the
-expert's choice doesn't get the highest probability.
-
-The model is fully general — it works with any number of targets.
+The model takes a fixed-size scene observation (all remaining candidates packed
+into MAX_TARGETS slots with a validity mask, 20-dim total) and outputs one
+score per slot (MAX_TARGETS outputs).  Training uses masked cross-entropy:
+softmax is computed only over valid (mask=1) slots, and the label is the
+slot the expert chose.
 
 Usage:
     python train_selector.py --data data/dataset_selector_*.npz --epochs 100
@@ -23,73 +19,34 @@ import time as _time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 from regressors import build_mlp
+from robotnik_arm_task import MAX_TARGETS, SELECTOR_OBS_DIM, SELECTOR_INPUT_DIM
 
 
-# ---------------------------------------------------------------------------
-# Dataset that yields (candidate_obs, chosen_flag, decision_id)
-# ---------------------------------------------------------------------------
-class SelectorDataset(torch.utils.data.Dataset):
-    def __init__(self, inputs, chosen, decision_ids):
-        self.inputs = torch.tensor(inputs, dtype=torch.float32)
-        self.chosen = torch.tensor(chosen, dtype=torch.long)
-        self.decision_ids = torch.tensor(decision_ids, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.inputs)
-
-    def __getitem__(self, idx):
-        return self.inputs[idx], self.chosen[idx], self.decision_ids[idx]
-
-
-# ---------------------------------------------------------------------------
-# Grouped cross-entropy: softmax over candidates within each decision group
-# ---------------------------------------------------------------------------
-def grouped_cross_entropy(scores, chosen, decision_ids):
-    """Cross-entropy computed per decision group.
+def masked_cross_entropy(logits, labels, masks):
+    """Cross-entropy over valid slots only.
 
     Args:
-        scores: (N,) scalar score per candidate
-        chosen: (N,) 1 for the expert-chosen candidate, 0 for others
-        decision_ids: (N,) integer grouping candidates into decision points
+        logits: (B, MAX_TARGETS) raw scores
+        labels: (B,) int index of expert choice within valid slots
+        masks: (B, MAX_TARGETS) 1.0 for valid, 0.0 for padding
     Returns:
-        scalar loss (mean over decisions)
+        loss: scalar (mean over batch)
+        correct: int
+        total: int
     """
-    unique_ids = decision_ids.unique()
-    loss = torch.tensor(0.0, device=scores.device)
-    correct = 0
-    total = 0
-    for did in unique_ids:
-        mask = decision_ids == did
-        group_scores = scores[mask]          # (K,)
-        group_chosen = chosen[mask]          # (K,) with exactly one 1
-        label = group_chosen.argmax()        # index of the chosen one within group
+    # Set invalid slots to -inf so they get zero probability
+    logits = logits.clone()
+    logits[masks == 0] = -1e9
 
-        # Cross-entropy: log_softmax over the group, pick the label
-        log_probs = torch.nn.functional.log_softmax(group_scores, dim=0)
-        loss = loss - log_probs[label]
-
-        # Accuracy
-        if group_scores.argmax() == label:
-            correct += 1
-        total += 1
-
-    return loss / max(total, 1), correct, total
-
-
-# ---------------------------------------------------------------------------
-# Batched version: process decisions that fit in a batch
-# ---------------------------------------------------------------------------
-def batched_grouped_cross_entropy(model, inputs, chosen, decision_ids, device):
-    """Run model and compute grouped CE for a batch of candidates."""
-    inputs = inputs.to(device)
-    chosen = chosen.to(device)
-    decision_ids = decision_ids.to(device)
-    scores = model(inputs).squeeze(-1)  # (N,)
-    return grouped_cross_entropy(scores, chosen, decision_ids)
+    loss = F.cross_entropy(logits, labels, reduction="mean")
+    preds = logits.argmax(dim=1)
+    correct = int((preds == labels).sum().item())
+    total = len(labels)
+    return loss, correct, total
 
 
 def split_by_episode(metadata, val_frac=0.2, seed=42):
@@ -104,48 +61,46 @@ def split_by_episode(metadata, val_frac=0.2, seed=42):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train target-selector scorer")
+    parser = argparse.ArgumentParser(description="Train target-selector (scene-level)")
     parser.add_argument("--data", type=str, required=True, help="Path to dataset_selector_*.npz")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS))
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--out", type=str, default=None, help="Checkpoint save path")
     parser.add_argument("--mps", action="store_true")
     args = parser.parse_args()
 
     # Load data
     data = np.load(args.data)
-    inputs = data["inputs"]       # (N, 3)
-    chosen = data["chosen"]       # (N,) int  1=expert picked, 0=not
+    inputs = data["inputs"]       # (N, SELECTOR_INPUT_DIM=20)
+    labels = data["labels"]       # (N,) int — index in packed slot order
     metadata = data["metadata"]   # (N, 2)  episode_id, decision_id
 
-    decision_ids = metadata[:, 1].astype(np.int64)
-    n_decisions = len(np.unique(decision_ids))
+    print(f"Loaded {inputs.shape[0]} decisions, input_dim={inputs.shape[1]}")
 
-    print(f"Loaded {inputs.shape[0]} candidate rows, {n_decisions} decisions, "
-          f"input_dim={inputs.shape[1]}, chosen_ratio={chosen.mean():.3f}")
+    # Extract masks from inputs (last MAX_TARGETS columns)
+    masks = inputs[:, -MAX_TARGETS:]  # (N, 5)
+    obs = inputs[:, :-MAX_TARGETS]    # (N, 15)
 
     # Split by episode
     train_mask, val_mask = split_by_episode(metadata)
-    X_train, ch_train, did_train = inputs[train_mask], chosen[train_mask], decision_ids[train_mask]
-    X_val, ch_val, did_val = inputs[val_mask], chosen[val_mask], decision_ids[val_mask]
+    X_train, lbl_train, m_train = inputs[train_mask], labels[train_mask], masks[train_mask]
+    X_val, lbl_val, m_val = inputs[val_mask], labels[val_mask], masks[val_mask]
 
-    # Re-index val decision_ids to be contiguous (for efficient grouping)
-    _, did_train = np.unique(did_train, return_inverse=True)
-    _, did_val = np.unique(did_val, return_inverse=True)
+    print(f"Train: {X_train.shape[0]} decisions")
+    print(f"Val:   {X_val.shape[0]} decisions")
 
-    print(f"Train: {X_train.shape[0]} rows, {len(np.unique(did_train))} decisions")
-    print(f"Val:   {X_val.shape[0]} rows, {len(np.unique(did_val))} decisions")
-
-    # Normalize inputs
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0) + 1e-8
-    X_train_norm = (X_train - mean) / std
-    X_val_norm = (X_val - mean) / std
+    # Normalize inputs (obs part only, not mask)
+    obs_train = X_train[:, :-MAX_TARGETS]
+    mean = obs_train.mean(axis=0)
+    std = obs_train.std(axis=0) + 1e-8
+    X_train_norm = np.hstack([(X_train[:, :-MAX_TARGETS] - mean) / std, m_train])
+    X_val_norm = np.hstack([(X_val[:, :-MAX_TARGETS] - mean) / std, m_val])
 
     # Device
     if args.mps and torch.backends.mps.is_available():
@@ -155,21 +110,22 @@ def main():
     else:
         device = "cpu"
 
-    # Build model: 3 inputs -> 1 score
-    input_dim = X_train.shape[1]
-    model = build_mlp(input_dim, 1, args.hidden_dim, args.num_layers, args.activation)
+    # Build model: SELECTOR_INPUT_DIM (20) -> MAX_TARGETS (5) scores
+    input_dim = SELECTOR_INPUT_DIM
+    output_dim = MAX_TARGETS
+    model = build_mlp(input_dim, output_dim, args.hidden_dim, args.num_layers, args.activation)
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # Tensors (small enough to fit in memory — process all at once per epoch)
+    # Tensors
     t_X_train = torch.tensor(X_train_norm, dtype=torch.float32).to(device)
-    t_ch_train = torch.tensor(ch_train, dtype=torch.long).to(device)
-    t_did_train = torch.tensor(did_train, dtype=torch.long).to(device)
+    t_lbl_train = torch.tensor(lbl_train, dtype=torch.long).to(device)
+    t_m_train = torch.tensor(m_train, dtype=torch.float32).to(device)
 
     t_X_val = torch.tensor(X_val_norm, dtype=torch.float32).to(device)
-    t_ch_val = torch.tensor(ch_val, dtype=torch.long).to(device)
-    t_did_val = torch.tensor(did_val, dtype=torch.long).to(device)
+    t_lbl_val = torch.tensor(lbl_val, dtype=torch.long).to(device)
+    t_m_val = torch.tensor(m_val, dtype=torch.float32).to(device)
 
     best_val_loss = float("inf")
     best_state = None
@@ -183,9 +139,9 @@ def main():
             # --- Train ---
             model.train()
             optimizer.zero_grad()
-            scores = model(t_X_train).squeeze(-1)
-            train_loss, train_correct, train_total = grouped_cross_entropy(
-                scores, t_ch_train, t_did_train)
+            logits = model(t_X_train)  # (N, 5)
+            train_loss, train_correct, train_total = masked_cross_entropy(
+                logits, t_lbl_train, t_m_train)
             train_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -194,9 +150,9 @@ def main():
             # --- Validate ---
             model.eval()
             with torch.no_grad():
-                val_scores = model(t_X_val).squeeze(-1)
-                val_loss, val_correct, val_total = grouped_cross_entropy(
-                    val_scores, t_ch_val, t_did_val)
+                val_logits = model(t_X_val)
+                val_loss, val_correct, val_total = masked_cross_entropy(
+                    val_logits, t_lbl_val, t_m_val)
             val_loss_f = val_loss.item()
             val_acc = 100.0 * val_correct / max(val_total, 1)
 
@@ -238,15 +194,16 @@ def main():
         next_id = max(counters, default=0) + 1
         save_path = f"{next_id:03d}_selector_{args.activation}_e{args.epochs}_h{args.hidden_dim}_l{args.num_layers}.pt"
 
+    # Save mean/std for obs part only (not mask)
     torch.save({
-        "model_type": "selector",
+        "model_type": "selector_scene",
         "model_state_dict": best_state,
         "input_dim": input_dim,
-        "output_dim": 1,
+        "output_dim": output_dim,
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
         "activation": args.activation,
-        "input_mean": mean,
+        "input_mean": mean,  # (15,) obs part only
         "input_std": std,
         "best_val_loss": best_val_loss,
         "best_val_acc": best_val_acc,

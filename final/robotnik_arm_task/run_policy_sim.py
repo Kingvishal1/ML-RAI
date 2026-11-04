@@ -530,22 +530,29 @@ def load_selector(checkpoint_path, device="cpu"):
     return model, ckpt["input_mean"], ckpt["input_std"]
 
 
-def predict_selector(sel_model, sel_mean, sel_std, candidates, device="cpu"):
-    """Score each candidate target and return the highest-scoring slot index.
+def predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device="cpu"):
+    """Pick the best target using the scene-level selector.
 
     Args:
-        candidates: dict mapping slot_index -> (3,) base-frame observation
+        scene_obs: (SELECTOR_INPUT_DIM,) full scene observation
+        slot_order: list of slot indices matching packed order
     Returns:
         int, chosen target slot index
     """
-    indices = list(candidates.keys())
-    obs = np.array([candidates[i] for i in indices])  # (K, 3)
-    obs_norm = (obs - sel_mean) / sel_std
-    x = torch.tensor(obs_norm, dtype=torch.float32).to(device)
+    from robotnik_arm_task import MAX_TARGETS
+    obs_part = scene_obs[:-MAX_TARGETS]
+    mask = scene_obs[-MAX_TARGETS:]
+
+    obs_norm = (obs_part - sel_mean) / sel_std
+    x = np.concatenate([obs_norm, mask])
+    x_t = torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
-        scores = sel_model(x).squeeze(-1).cpu().numpy()  # (K,)
-    best = int(np.argmax(scores))
-    return indices[best]
+        logits = sel_model(x_t).squeeze(0).cpu().numpy()  # (MAX_TARGETS,)
+
+    # Mask invalid slots
+    logits[mask == 0] = -np.inf
+    best_packed_idx = int(np.argmax(logits))
+    return slot_order[best_packed_idx]
 
 
 def compute_base_threshold_for_target(target_ee_pos):
@@ -573,7 +580,7 @@ def run_multi_target_sim(args, target_ee_positions, device,
         dict with per-target results and episode-level metrics
     """
     from robotnik_arm_task import (
-        build_selector_candidates, nearest_neighbor_expert,
+        shortest_path_expert,
         setup_simulation, setup_kinematics, add_target_visual,
     )
     from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
@@ -614,10 +621,12 @@ def run_multi_target_sim(args, target_ee_positions, device,
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
 
         if use_expert_selector:
-            chosen_idx = nearest_neighbor_expert(base_pos, all_targets, remaining)
+            chosen_idx, full_order = shortest_path_expert(base_pos, all_targets, remaining)
+            print(f"    Optimal order: {full_order} (total dist: shortest path)")
         else:
-            candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
-            chosen_idx = predict_selector(sel_model, sel_mean, sel_std, candidates, device)
+            from robotnik_arm_task import build_selector_scene
+            scene_obs, slot_order = build_selector_scene(base_pos, base_bearing, all_targets, remaining)
+            chosen_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
 
         current_target = all_targets[chosen_idx]
         remaining.remove(chosen_idx)
