@@ -29,9 +29,16 @@ import numpy as np
 
 from run_policy_sim import (
     run_sim, load_policy, load_gravity_comp, load_selector,
-    run_multi_target_sim, REACH_TOLERANCE,
+    run_multi_target_sim, run_multi_target_pick_and_place_sim,
+    run_sequential_pick_and_place_sim,
+    run_multi_drop_pick_and_place_sim,
+    REACH_TOLERANCE,
 )
-from robotnik_arm_task import compute_base_goal
+from robotnik_arm_task import (
+    compute_base_goal, DROP_ZONES_DEFAULT, NUM_DROP_ZONES,
+    shortest_path_expert_multi_drop, build_selector_scene_multi_drop,
+    generate_random_drop_zones,
+)
 
 
 def generate_targets(n, seed=42):
@@ -93,6 +100,18 @@ def main():
                         help="Max steps per target in multi-target mode (default: 100000)")
     parser.add_argument("--heading_threshold", type=float, default=0.15)
     parser.add_argument("--arm_damping", type=float, default=0.0)
+    # Pick-and-place evaluation
+    parser.add_argument("--pick_and_place", action="store_true",
+                        help="Evaluate pick-and-place mode (grip + deliver balls)")
+    parser.add_argument("--drop_zone", type=float, nargs=3, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Drop zone position for pick-and-place (default: 0.0 0.0 0.5)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Sequential pick-and-place: pick ball_i, carry to ball_{i+1}")
+    parser.add_argument("--multi_drop_zone", action="store_true",
+                        help="Multi-drop-zone mode: balls assigned to 3 different drop zones")
+    parser.add_argument("--xy_range", type=float, default=5.0,
+                        help="XY workspace half-extent for target/zone generation (default: 5.0, training uses 5.0)")
     args = parser.parse_args()
 
     # Determine mode
@@ -177,52 +196,99 @@ def main():
         rng = np.random.default_rng(args.seed)
         n_per_ep = args.num_targets_per_episode
 
+        is_mdz = args.multi_drop_zone
+        xy_r = args.xy_range
+        if is_mdz:
+            print(f"Mode: multi-drop-zone (randomized zones per episode, xy_range={xy_r})")
+        elif xy_r != 5.0:
+            print(f"xy_range={xy_r}")
+
         total_decisions = 0
         correct_decisions = 0
         expert_total_dist = 0.0
         model_total_dist = 0.0
 
         for ep in range(args.num_episodes):
-            targets = np.array([[rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)]
+            targets = np.array([[rng.uniform(-xy_r, xy_r), rng.uniform(-xy_r, xy_r),
+                                 rng.uniform(0.2, 1.0)]
                                 for _ in range(n_per_ep)])
 
             robot_pos = np.array([0.0, 0.0, 0.0])
             robot_bearing = 0.0
             remaining = set(range(n_per_ep))
 
+            # Per-episode random zones and assignments for multi-drop mode
+            if is_mdz:
+                mdz_zones = generate_random_drop_zones(rng, xy_range=xy_r)
+                ball_zone_assignments = [int(rng.integers(0, len(mdz_zones)))
+                                         for _ in range(n_per_ep)]
+
             ep_model_dist = 0.0
 
             while len(remaining) > 1:
-                # Expert choice
-                expert_idx, _ = shortest_path_expert(robot_pos, targets, remaining)
+                if is_mdz:
+                    # Expert choice (multi-drop TSP)
+                    expert_idx, _ = shortest_path_expert_multi_drop(
+                        robot_pos, targets, remaining, mdz_zones, ball_zone_assignments)
+                    # Model choice
+                    scene_obs, slot_order = build_selector_scene_multi_drop(
+                        robot_pos, robot_bearing, targets, remaining,
+                        mdz_zones, ball_zone_assignments)
+                else:
+                    expert_idx, _ = shortest_path_expert(robot_pos, targets, remaining)
+                    scene_obs, slot_order = build_selector_scene(
+                        robot_pos, robot_bearing, targets, remaining)
 
-                # Model choice
-                scene_obs, slot_order = build_selector_scene(robot_pos, robot_bearing, targets, remaining)
-                model_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
+                model_idx = predict_selector(sel_model, sel_mean, sel_std,
+                                             scene_obs, slot_order, device)
 
                 if model_idx == expert_idx:
                     correct_decisions += 1
                 total_decisions += 1
 
+                # Compute leg distance for model's choice
                 ep_model_dist += np.linalg.norm(robot_pos[:2] - targets[model_idx, :2])
+                if is_mdz:
+                    # Add ball -> drop zone leg
+                    dz = mdz_zones[ball_zone_assignments[model_idx]]
+                    ep_model_dist += np.linalg.norm(targets[model_idx, :2] - dz[:2])
 
-                # Move robot to MODEL's choice
+                # Move robot to next position
                 remaining.remove(model_idx)
-                robot_pos = targets[model_idx].copy()
+                if is_mdz:
+                    # After delivery, robot is at the assigned drop zone
+                    robot_pos = mdz_zones[ball_zone_assignments[model_idx]].copy()
+                else:
+                    robot_pos = targets[model_idx].copy()
                 robot_bearing = rng.uniform(-np.pi, np.pi)
 
-            # Last remaining target
+            # Last remaining target (no decision needed, just add distance)
             if remaining:
                 last = remaining.pop()
                 ep_model_dist += np.linalg.norm(robot_pos[:2] - targets[last, :2])
+                if is_mdz:
+                    dz = mdz_zones[ball_zone_assignments[last]]
+                    ep_model_dist += np.linalg.norm(targets[last, :2] - dz[:2])
 
             # Compute expert total distance (full optimal path from origin)
-            _, full_order = shortest_path_expert(np.array([0, 0, 0]), targets, set(range(n_per_ep)))
+            if is_mdz:
+                _, full_order = shortest_path_expert_multi_drop(
+                    np.array([0, 0, 0]), targets, set(range(n_per_ep)),
+                    mdz_zones, ball_zone_assignments)
+            else:
+                _, full_order = shortest_path_expert(
+                    np.array([0, 0, 0]), targets, set(range(n_per_ep)))
+
             ep_expert_dist_full = 0.0
-            pos = np.array([0.0, 0.0])
-            for idx in full_order:
-                ep_expert_dist_full += np.linalg.norm(pos - targets[idx, :2])
-                pos = targets[idx, :2].copy()
+            pos = np.array([0.0, 0.0, 0.0])
+            for oi, idx in enumerate(full_order):
+                ep_expert_dist_full += np.linalg.norm(pos[:2] - targets[idx, :2])
+                if is_mdz:
+                    dz = mdz_zones[ball_zone_assignments[idx]]
+                    ep_expert_dist_full += np.linalg.norm(targets[idx, :2] - dz[:2])
+                    pos = dz.copy()
+                else:
+                    pos = targets[idx].copy()
 
             expert_total_dist += ep_expert_dist_full
             model_total_dist += ep_model_dist
@@ -236,8 +302,9 @@ def main():
         avg_model = model_total_dist / args.num_episodes
         overhead = 100.0 * (avg_model - avg_expert) / max(avg_expert, 1e-6)
 
+        mode_str = "MULTI-DROP-ZONE " if is_mdz else ""
         print(f"\n{'='*60}")
-        print(f"SELECTOR-ONLY EVALUATION  ({args.num_episodes} episodes, "
+        print(f"{mode_str}SELECTOR-ONLY EVALUATION  ({args.num_episodes} episodes, "
               f"{n_per_ep} targets each)")
         print(f"{'='*60}")
         print(f"Decision accuracy:     {correct_decisions}/{total_decisions} ({acc:.1f}%)")
@@ -260,7 +327,15 @@ def main():
         rng = np.random.default_rng(args.seed)
         all_results = []
 
-        print(f"\nEvaluating {args.num_episodes} multi-target episodes "
+        if args.multi_drop_zone:
+            mode_label = "multi-drop-zone"
+        elif args.sequential:
+            mode_label = "sequential pick-and-place"
+        elif args.pick_and_place:
+            mode_label = "pick-and-place"
+        else:
+            mode_label = "multi-target"
+        print(f"\nEvaluating {args.num_episodes} {mode_label} episodes "
               f"({args.num_targets_per_episode} targets each, seed={args.seed})\n")
 
         for ep in range(args.num_episodes):
@@ -269,16 +344,128 @@ def main():
                         for _ in range(n)]
             print(f"\n[Episode {ep+1}/{args.num_episodes}]")
 
-            result = run_multi_target_sim(
-                args, targets,
-                split_mode=split_mode, single_mode=single_mode,
-                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-                use_expert_selector=use_expert_selector,
-                **policy_kwargs,
-            )
+            if args.multi_drop_zone:
+                mdz_zones = generate_random_drop_zones(rng)
+                ball_zone_assignments = [int(rng.integers(0, len(mdz_zones))) for _ in range(n)]
+                result = run_multi_drop_pick_and_place_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    drop_zones=mdz_zones,
+                    ball_zone_assignments=ball_zone_assignments,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
+            elif args.sequential:
+                drop_zone = np.array(args.drop_zone) if args.drop_zone else None
+                result = run_sequential_pick_and_place_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    drop_zone=drop_zone,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
+            elif args.pick_and_place:
+                drop_zone = np.array(args.drop_zone) if args.drop_zone else None
+                result = run_multi_target_pick_and_place_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    drop_zone=drop_zone,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
+            else:
+                result = run_multi_target_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
             all_results.append(result)
 
-        # --- Aggregate multi-target report ---
+        # --- Aggregate report ---
+        if args.pick_and_place or args.sequential or args.multi_drop_zone:
+            # Pick-and-place / multi-drop-zone report
+            print(f"\n{'='*70}")
+            print(f"{mode_label.upper()} EVALUATION REPORT  ({args.num_episodes} episodes, "
+                  f"{args.num_targets_per_episode} balls each)")
+            print(f"{'='*70}")
+
+            gripped_per_ep = [r.get("balls_gripped", 0) for r in all_results]
+            delivered_per_ep = [r.get("balls_delivered", 0) for r in all_results]
+            n_balls_per_ep = [r.get("n_balls", 0) for r in all_results]
+            time_per_ep = [r.get("total_time", 0.0) for r in all_results]
+            steps_per_ep = [r.get("total_steps", 0) for r in all_results]
+
+            total_gripped = sum(gripped_per_ep)
+            total_delivered = sum(delivered_per_ep)
+            total_balls = sum(n_balls_per_ep)
+            full_deliver = sum(1 for g, n in zip(delivered_per_ep, n_balls_per_ep) if g == n)
+
+            print(f"\n--- GRIP SUCCESS ---")
+            print(f"Total gripped: {total_gripped}/{total_balls} "
+                  f"({100*total_gripped/max(total_balls,1):.1f}%)")
+            print_stats("Gripped/episode", gripped_per_ep)
+
+            print(f"\n--- DELIVERY SUCCESS ---")
+            print(f"Total delivered: {total_delivered}/{total_balls} "
+                  f"({100*total_delivered/max(total_balls,1):.1f}%)")
+            print(f"Full deliveries (all balls): {full_deliver}/{args.num_episodes} "
+                  f"({100*full_deliver/max(args.num_episodes,1):.1f}%)")
+            print_stats("Delivered/episode", delivered_per_ep)
+
+            # Per-zone delivery counts (multi-drop-zone only)
+            if args.multi_drop_zone:
+                zone_delivered = {}
+                zone_total = {}
+                for r in all_results:
+                    for pb in r.get("per_ball", []):
+                        zi = pb.get("drop_zone_idx", 0)
+                        zone_total[zi] = zone_total.get(zi, 0) + 1
+                        if pb.get("delivered", False):
+                            zone_delivered[zi] = zone_delivered.get(zi, 0) + 1
+                print(f"\n--- PER-ZONE DELIVERY ---")
+                for zi in sorted(zone_total):
+                    d = zone_delivered.get(zi, 0)
+                    t = zone_total[zi]
+                    print(f"  Zone {zi}: {d}/{t} delivered ({100*d/max(t,1):.1f}%)")
+
+            print(f"\n--- TIMING ---")
+            print_stats("Time/episode (s)", time_per_ep)
+            print_stats("Steps/episode", steps_per_ep)
+
+            # Per-ball breakdown
+            all_grip_dists = []
+            all_drop_dists = []
+            for r in all_results:
+                for pb in r.get("per_ball", []):
+                    if "grip_dist" in pb:
+                        all_grip_dists.append(pb["grip_dist"])
+                    if "drop_dist" in pb:
+                        all_drop_dists.append(pb["drop_dist"])
+
+            if all_grip_dists:
+                print(f"\n--- PER-BALL ACCURACY ---")
+                print_stats("Grip distance", all_grip_dists)
+                print_buckets("grip_dist", all_grip_dists,
+                              thresholds=(0.05, 0.08, 0.1, 0.2, 0.5))
+            if all_drop_dists:
+                print_stats("Drop distance", all_drop_dists)
+                print_buckets("drop_dist", all_drop_dists,
+                              thresholds=(0.05, 0.08, 0.1, 0.2, 0.5))
+
+            # Distance overhead vs optimal (multi-drop-zone selector evaluation)
+            if args.multi_drop_zone and not use_expert_selector:
+                print(f"\n--- SELECTOR QUALITY ---")
+                print(f"(Compare visit order distance vs optimal multi-drop TSP)")
+
+            print(f"{'='*70}")
+            return
+
+        # Standard multi-target report
         print(f"\n{'='*70}")
         print(f"MULTI-TARGET EVALUATION REPORT  ({args.num_episodes} episodes, "
               f"{args.num_targets_per_episode} targets each)")
@@ -321,11 +508,8 @@ def main():
             order_matches = 0
             order_total = 0
             for ep_i, result in enumerate(all_results):
-                # Reconstruct what expert would have chosen
                 n = result["n_targets"]
                 per_target = result["per_target"]
-                # We can't perfectly reconstruct expert order without replaying,
-                # but we can compare the visit_order length
                 order_total += 1
             if order_total > 0:
                 print(f"\n--- ORDERING ---")

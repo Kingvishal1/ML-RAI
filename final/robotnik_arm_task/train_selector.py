@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 from regressors import build_mlp
-from robotnik_arm_task import MAX_TARGETS, SELECTOR_OBS_DIM, SELECTOR_INPUT_DIM
+from robotnik_arm_task import MAX_TARGETS
 
 
 def masked_cross_entropy(logits, labels, masks):
@@ -110,8 +110,8 @@ def main():
     else:
         device = "cpu"
 
-    # Build model: SELECTOR_INPUT_DIM (20) -> MAX_TARGETS (5) scores
-    input_dim = SELECTOR_INPUT_DIM
+    # Build model: input_dim auto-sized from data (20 for basic, 35 for multi-drop-zone)
+    input_dim = inputs.shape[1]
     output_dim = MAX_TARGETS
     model = build_mlp(input_dim, output_dim, args.hidden_dim, args.num_layers, args.activation)
     model.to(device)

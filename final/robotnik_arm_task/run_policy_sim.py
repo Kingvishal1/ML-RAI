@@ -24,6 +24,14 @@ from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, REACH_TOLERANCE, ARM_REACH_LIMIT,
+    GRIP_TOLERANCE, DROP_ZONE_DEFAULT, GripState,
+    NUM_DROP_ZONES, DROP_ZONES_DEFAULT, DROP_ZONE_COLORS,
+    spawn_ball, add_drop_zone_visual, find_ee_link_id,
+    auto_grip, auto_release,
+    shortest_path_expert_sequential,
+    shortest_path_expert_multi_drop,
+    build_selector_scene_multi_drop,
+    generate_random_drop_zones,
 )
 from robotnik_arm_control import (
     configure_gripper_fingers, quaternion2bearing,
@@ -916,6 +924,498 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
     }
 
 
+def _run_pick_and_place_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                                      init_joint_angles, target_finger_angles,
+                                      lower_limits, upper_limits,
+                                      ball_pos, drop_zone, grip_state,
+                                      device, split_mode, single_mode,
+                                      **policy_kwargs):
+    """Run a single-ball pick-and-place cycle: nav_to_ball -> reach_ball -> nav_to_drop -> reach_drop.
+
+    Uses learned policies for navigation/reaching, auto-grip/release for manipulation.
+    Returns dict with per-ball results.
+    """
+    client = sim.GetPyBulletClient()
+    rid = sim.bot[0].bot_pybullet
+    ee_link_id = find_ee_link_id(client, rid)
+
+    total_steps = 0
+    total_time = 0.0
+
+    # --- Phase 1+2: Navigate to ball and reach it ---
+    args.base_threshold = compute_base_threshold_for_target(ball_pos)
+    result_ball = _run_single_target_inline(
+        args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+        init_joint_angles, target_finger_angles,
+        lower_limits, upper_limits,
+        ball_pos, device, split_mode, single_mode,
+        **policy_kwargs,
+    )
+    total_steps += result_ball.get("steps", 0)
+    total_time += result_ball.get("time", 0.0)
+
+    if not result_ball.get("ok", True):
+        return {"ok": False, "gripped": False, "delivered": False,
+                "steps": total_steps, "time": total_time}
+
+    # --- Auto-grip check ---
+    import pinocchio as pin
+    base_pos = np.array(sim.GetBasePosition())
+    base_ori = np.array(sim.GetBaseOrientation())
+    q_mes = np.array(sim.GetMotorAngles(0))
+    q_all = np.concatenate((base_pos, base_ori, q_mes))
+    q_pin = dyn_model.ReoderJoints2PinVec(q_all, "pos")
+    pin.forwardKinematics(dyn_model.pin_model, dyn_model.pin_data, q_pin)
+    pin.updateFramePlacements(dyn_model.pin_model, dyn_model.pin_data)
+    ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
+
+    ball_world_pos, _ = client.getBasePositionAndOrientation(grip_state.ball_id)
+    grip_dist = np.linalg.norm(ee_pos - np.array(ball_world_pos))
+    gripped = grip_dist < GRIP_TOLERANCE
+    if gripped:
+        auto_grip(client, rid, ee_link_id, grip_state)
+        print(f"    Auto-gripped (dist={grip_dist:.4f}m)")
+    else:
+        print(f"    Grip failed (dist={grip_dist:.4f}m)")
+        return {"ok": True, "gripped": False, "delivered": False,
+                "grip_dist": grip_dist,
+                "steps": total_steps, "time": total_time}
+
+    # --- Phase 3+4: Navigate to drop zone and release ---
+    args.base_threshold = compute_base_threshold_for_target(drop_zone)
+    result_drop = _run_single_target_inline(
+        args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+        init_joint_angles, target_finger_angles,
+        lower_limits, upper_limits,
+        drop_zone, device, split_mode, single_mode,
+        **policy_kwargs,
+    )
+    total_steps += result_drop.get("steps", 0)
+    total_time += result_drop.get("time", 0.0)
+
+    # --- Auto-release check ---
+    base_pos = np.array(sim.GetBasePosition())
+    base_ori = np.array(sim.GetBaseOrientation())
+    q_mes = np.array(sim.GetMotorAngles(0))
+    q_all = np.concatenate((base_pos, base_ori, q_mes))
+    q_pin = dyn_model.ReoderJoints2PinVec(q_all, "pos")
+    pin.forwardKinematics(dyn_model.pin_model, dyn_model.pin_data, q_pin)
+    pin.updateFramePlacements(dyn_model.pin_model, dyn_model.pin_data)
+    ee_pos_drop = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
+
+    drop_dist = np.linalg.norm(ee_pos_drop - drop_zone)
+    auto_release(client, grip_state)  # always release
+    delivered = drop_dist < GRIP_TOLERANCE
+    print(f"    Released at drop zone (dist={drop_dist:.4f}m, delivered={delivered})")
+
+    return {
+        "ok": result_drop.get("ok", True),
+        "gripped": True,
+        "delivered": delivered,
+        "grip_dist": grip_dist,
+        "drop_dist": drop_dist,
+        "steps": total_steps,
+        "time": total_time,
+    }
+
+
+def run_multi_target_pick_and_place_sim(args, target_ee_positions, device,
+                                         split_mode, single_mode,
+                                         drop_zone=None,
+                                         sel_model=None, sel_mean=None, sel_std=None,
+                                         use_expert_selector=False,
+                                         **policy_kwargs):
+    """Run a multi-ball pick-and-place episode using learned (or expert) selector.
+
+    Spawns balls at each target position. For each ball: navigate, grip, carry to
+    drop zone, release. Selector picks which ball to visit next.
+    """
+    from robotnik_arm_task import (
+        shortest_path_expert_pnp, build_selector_scene,
+        setup_simulation, setup_kinematics, add_target_visual,
+    )
+    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
+
+    if drop_zone is None:
+        drop_zone = DROP_ZONE_DEFAULT.copy()
+    else:
+        drop_zone = np.array(drop_zone)
+
+    n_balls = len(target_ee_positions)
+    all_targets = np.array(target_ee_positions)
+
+    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+    target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array([0.1]*6))
+
+    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
+        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+    # Spawn balls and drop zone
+    ee_link_id = find_ee_link_id(client, rid)
+    grip_states = []
+    for i, t in enumerate(target_ee_positions):
+        ball_id = spawn_ball(client, t)
+        grip_states.append(GripState(ball_id=ball_id))
+        add_target_visual(client, t)
+    add_drop_zone_visual(client, drop_zone)
+
+    remaining = set(range(n_balls))
+    per_ball_results = []
+    visit_order = []
+    total_steps = 0
+    total_time = 0.0
+
+    print(f"\n{'='*60}")
+    print(f"Pick-and-place episode: {n_balls} balls, drop zone={np.round(drop_zone, 3)}")
+    for i, t in enumerate(target_ee_positions):
+        print(f"  Ball {i}: {np.round(t, 3)}")
+    print(f"{'='*60}")
+
+    while remaining:
+        base_pos = np.array(sim.GetBasePosition())
+        base_ori = np.array(sim.GetBaseOrientation())
+        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
+
+        if use_expert_selector:
+            chosen_idx, full_order = shortest_path_expert_pnp(base_pos, all_targets, remaining, drop_zone)
+        else:
+            scene_obs, slot_order = build_selector_scene(base_pos, base_bearing, all_targets, remaining)
+            chosen_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
+
+        ball_pos = all_targets[chosen_idx]
+        remaining.remove(chosen_idx)
+        visit_order.append(chosen_idx)
+
+        print(f"\n>>> Selector chose ball {chosen_idx} ({np.round(ball_pos, 3)}) | "
+              f"{len(remaining)} remaining")
+
+        result = _run_pick_and_place_target_inline(
+            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles, target_finger_angles,
+            lower_limits, upper_limits,
+            ball_pos, drop_zone, grip_states[chosen_idx],
+            device, split_mode, single_mode,
+            **policy_kwargs,
+        )
+
+        total_steps += result.get("steps", 0)
+        total_time += result.get("time", 0.0)
+
+        per_ball_results.append({
+            "slot": chosen_idx,
+            "ball_pos": ball_pos.tolist(),
+            **result,
+        })
+
+        if not result.get("ok", True):
+            break
+
+    # Summary
+    n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
+    n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
+    print(f"\n{'='*60}")
+    print(f"Pick-and-place complete: {n_gripped}/{n_balls} gripped, "
+          f"{n_delivered}/{n_balls} delivered")
+    print(f"Visit order: {visit_order}")
+    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
+    print(f"{'='*60}")
+
+    return {
+        "ok": all(r.get("ok", True) for r in per_ball_results),
+        "balls_gripped": n_gripped,
+        "balls_delivered": n_delivered,
+        "n_balls": n_balls,
+        "visit_order": visit_order,
+        "total_steps": total_steps,
+        "total_time": total_time,
+        "per_ball": per_ball_results,
+    }
+
+
+def run_sequential_pick_and_place_sim(args, target_ee_positions, device,
+                                       split_mode, single_mode,
+                                       drop_zone=None,
+                                       sel_model=None, sel_mean=None, sel_std=None,
+                                       use_expert_selector=False,
+                                       **policy_kwargs):
+    """Run sequential pick-and-place: pick ball_i, carry to ball_{i+1}, last to drop zone.
+
+    Uses learned (or expert) selector for visit ordering, then executes the
+    chain using learned base/arm policies.
+    """
+    from robotnik_arm_task import (
+        build_selector_scene, setup_simulation, setup_kinematics, add_target_visual,
+    )
+    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
+
+    if drop_zone is None:
+        drop_zone = DROP_ZONE_DEFAULT.copy()
+    else:
+        drop_zone = np.array(drop_zone)
+
+    n_balls = len(target_ee_positions)
+    all_targets = np.array(target_ee_positions)
+
+    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+    target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array([0.1]*6))
+
+    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
+        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+    ee_link_id = find_ee_link_id(client, rid)
+    grip_states = []
+    for i, t in enumerate(target_ee_positions):
+        ball_id = spawn_ball(client, t)
+        grip_states.append(GripState(ball_id=ball_id))
+        add_target_visual(client, t)
+    add_drop_zone_visual(client, drop_zone)
+
+    # Determine visit order
+    base_pos = np.array(sim.GetBasePosition())
+    base_ori = np.array(sim.GetBaseOrientation())
+    base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
+
+    if use_expert_selector:
+        _, full_order = shortest_path_expert_sequential(base_pos, all_targets,
+                                                         set(range(n_balls)), drop_zone)
+    else:
+        # Use learned selector to pick first, then re-query after each delivery
+        full_order = []
+        remaining = set(range(n_balls))
+        temp_pos = base_pos.copy()
+        temp_bearing = base_bearing
+        while remaining:
+            scene_obs, slot_order = build_selector_scene(temp_pos, temp_bearing,
+                                                          all_targets, remaining)
+            chosen = predict_selector(sel_model, sel_mean, sel_std,
+                                       scene_obs, slot_order, device)
+            full_order.append(chosen)
+            remaining.remove(chosen)
+            # After picking ball, robot will be near next ball's position
+            if full_order and len(remaining) > 0:
+                temp_pos = all_targets[chosen]
+
+    per_ball_results = []
+    visit_order = full_order[:]
+    total_steps = 0
+    total_time = 0.0
+
+    print(f"\n{'='*60}")
+    print(f"Sequential pick-and-place: {n_balls} balls, drop zone={np.round(drop_zone, 3)}")
+    print(f"Visit order: {full_order}")
+    for i, t in enumerate(target_ee_positions):
+        print(f"  Ball {i}: {np.round(t, 3)}")
+    print(f"{'='*60}")
+
+    for order_idx, chosen_idx in enumerate(full_order):
+        ball_pos = all_targets[chosen_idx]
+        gs = grip_states[chosen_idx]
+
+        if order_idx < n_balls - 1:
+            dest_pos = all_targets[full_order[order_idx + 1]]
+            dest_label = f"ball {full_order[order_idx + 1]}"
+        else:
+            dest_pos = drop_zone
+            dest_label = "drop zone"
+
+        print(f"\n>>> Sequential: pick ball {chosen_idx}, carry to {dest_label} | "
+              f"{n_balls - order_idx - 1} remaining")
+
+        result = _run_pick_and_place_target_inline(
+            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles, target_finger_angles,
+            lower_limits, upper_limits,
+            ball_pos, dest_pos, gs,
+            device, split_mode, single_mode,
+            **policy_kwargs,
+        )
+
+        total_steps += result.get("steps", 0)
+        total_time += result.get("time", 0.0)
+
+        per_ball_results.append({
+            "slot": chosen_idx,
+            "ball_pos": ball_pos.tolist(),
+            "dest_pos": dest_pos.tolist(),
+            "dest_label": dest_label,
+            **result,
+        })
+
+        if not result.get("ok", True):
+            break
+
+    n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
+    n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
+    print(f"\n{'='*60}")
+    print(f"Sequential pick-and-place complete: {n_gripped}/{n_balls} gripped, "
+          f"{n_delivered}/{n_balls} delivered")
+    print(f"Visit order: {visit_order}")
+    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
+    print(f"{'='*60}")
+
+    return {
+        "ok": all(r.get("ok", True) for r in per_ball_results),
+        "balls_gripped": n_gripped,
+        "balls_delivered": n_delivered,
+        "n_balls": n_balls,
+        "visit_order": visit_order,
+        "total_steps": total_steps,
+        "total_time": total_time,
+        "per_ball": per_ball_results,
+    }
+
+
+def run_multi_drop_pick_and_place_sim(args, target_ee_positions, device,
+                                       split_mode, single_mode,
+                                       drop_zones=None,
+                                       ball_zone_assignments=None,
+                                       sel_model=None, sel_mean=None, sel_std=None,
+                                       use_expert_selector=False,
+                                       **policy_kwargs):
+    """Run a multi-drop-zone pick-and-place episode.
+
+    Each ball is assigned to one of the drop zones. The selector picks which ball
+    to visit next. After delivering a ball to its assigned zone, the robot starts
+    the next pick from that zone.
+    """
+    from robotnik_arm_task import (
+        setup_simulation, setup_kinematics, add_target_visual,
+        MAX_TARGETS,
+    )
+    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
+    import pybullet as p
+
+    if drop_zones is None:
+        drop_zones = [np.array(dz) for dz in DROP_ZONES_DEFAULT]
+    else:
+        drop_zones = [np.array(dz) for dz in drop_zones]
+
+    n_balls = len(target_ee_positions)
+    all_targets = np.array(target_ee_positions)
+
+    if ball_zone_assignments is None:
+        rng = np.random.default_rng(args.multi_target_seed)
+        ball_zone_assignments = [int(rng.integers(0, len(drop_zones))) for _ in range(n_balls)]
+
+    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+    target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array([0.1]*6))
+
+    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
+        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+    # Spawn balls color-coded by zone
+    ee_link_id = find_ee_link_id(client, rid)
+    grip_states = []
+    for i, t in enumerate(target_ee_positions):
+        color = DROP_ZONE_COLORS[ball_zone_assignments[i]]
+        ball_id = spawn_ball(client, t, color=color)
+        grip_states.append(GripState(ball_id=ball_id, drop_zone_idx=ball_zone_assignments[i]))
+        add_target_visual(client, t)
+
+    # Spawn drop zone visuals
+    for zi, dz in enumerate(drop_zones):
+        color = DROP_ZONE_COLORS[zi]
+        vis = client.createVisualShape(p.GEOM_SPHERE, radius=0.08,
+                                        rgbaColor=[color[0], color[1], color[2], 0.5])
+        client.createMultiBody(baseMass=0, baseVisualShapeIndex=vis, basePosition=dz.tolist())
+
+    remaining = set(range(n_balls))
+    per_ball_results = []
+    visit_order = []
+    total_steps = 0
+    total_time = 0.0
+
+    print(f"\n{'='*60}")
+    print(f"Multi-drop-zone PnP: {n_balls} balls, {len(drop_zones)} zones")
+    for i, t in enumerate(target_ee_positions):
+        print(f"  Ball {i}: {np.round(t, 3)} -> zone {ball_zone_assignments[i]}")
+    for zi, dz in enumerate(drop_zones):
+        print(f"  Zone {zi}: {np.round(dz, 3)}")
+    print(f"{'='*60}")
+
+    while remaining:
+        base_pos = np.array(sim.GetBasePosition())
+        base_ori = np.array(sim.GetBaseOrientation())
+        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
+
+        if use_expert_selector:
+            chosen_idx, full_order = shortest_path_expert_multi_drop(
+                base_pos, all_targets, remaining, drop_zones, ball_zone_assignments)
+        else:
+            scene_obs, slot_order = build_selector_scene_multi_drop(
+                base_pos, base_bearing, all_targets, remaining,
+                drop_zones, ball_zone_assignments)
+            chosen_idx = predict_selector(sel_model, sel_mean, sel_std,
+                                           scene_obs, slot_order, device)
+
+        ball_pos = all_targets[chosen_idx]
+        assigned_drop = drop_zones[ball_zone_assignments[chosen_idx]]
+        remaining.remove(chosen_idx)
+        visit_order.append(chosen_idx)
+
+        print(f"\n>>> Selector chose ball {chosen_idx} ({np.round(ball_pos, 3)}) "
+              f"-> zone {ball_zone_assignments[chosen_idx]} | {len(remaining)} remaining")
+
+        # Pick up ball
+        result_pick = _run_pick_and_place_target_inline(
+            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+            init_joint_angles, target_finger_angles,
+            lower_limits, upper_limits,
+            ball_pos, assigned_drop, grip_states[chosen_idx],
+            device, split_mode, single_mode,
+            **policy_kwargs,
+        )
+
+        total_steps += result_pick.get("steps", 0)
+        total_time += result_pick.get("time", 0.0)
+
+        per_ball_results.append({
+            "slot": chosen_idx,
+            "ball_pos": ball_pos.tolist(),
+            "drop_zone_idx": ball_zone_assignments[chosen_idx],
+            "drop_zone_pos": assigned_drop.tolist(),
+            **result_pick,
+        })
+
+        if not result_pick.get("ok", True):
+            break
+
+    # Summary
+    n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
+    n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
+    print(f"\n{'='*60}")
+    print(f"Multi-drop-zone PnP complete: {n_gripped}/{n_balls} gripped, "
+          f"{n_delivered}/{n_balls} delivered")
+    print(f"Visit order: {visit_order}")
+
+    # Per-zone delivery counts
+    zone_counts = {}
+    for r in per_ball_results:
+        zi = r.get("drop_zone_idx", 0)
+        zone_counts.setdefault(zi, {"total": 0, "delivered": 0})
+        zone_counts[zi]["total"] += 1
+        if r.get("delivered", False):
+            zone_counts[zi]["delivered"] += 1
+    for zi in sorted(zone_counts):
+        zc = zone_counts[zi]
+        print(f"  Zone {zi}: {zc['delivered']}/{zc['total']} delivered")
+
+    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
+    print(f"{'='*60}")
+
+    return {
+        "ok": all(r.get("ok", True) for r in per_ball_results),
+        "balls_gripped": n_gripped,
+        "balls_delivered": n_delivered,
+        "n_balls": n_balls,
+        "visit_order": visit_order,
+        "ball_zone_assignments": ball_zone_assignments,
+        "total_steps": total_steps,
+        "total_time": total_time,
+        "per_ball": per_ball_results,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run BC policy in simulation")
     # Single-model mode
@@ -956,6 +1456,20 @@ def main():
                         help="Random seed for generating multi-target positions (default: 42)")
     parser.add_argument("--per_target_max_steps", type=int, default=100000,
                         help="Max simulation steps per individual target in multi-target mode (default: 100000)")
+    # Pick-and-place mode
+    parser.add_argument("--pick_and_place", action="store_true",
+                        help="Enable pick-and-place mode: grip balls and carry to drop zone")
+    parser.add_argument("--drop_zone", type=float, nargs=3, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Drop zone position (default: 0.0 0.0 0.5)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Sequential pick-and-place: pick ball_i, carry to ball_{i+1}, "
+                             "last ball goes to drop zone")
+    parser.add_argument("--multi_drop_zone", action="store_true",
+                        help="Multi-drop-zone mode: balls assigned to 3 different drop zones")
+    parser.add_argument("--drop_zones", type=float, nargs=9, default=None,
+                        metavar=tuple(f"{c}{i}" for i in range(3) for c in "XYZ"),
+                        help="9 floats for 3 drop zone positions (default: triangle layout)")
     args = parser.parse_args()
 
     # Determine mode
@@ -1031,13 +1545,91 @@ def main():
         targets = [np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
                     for _ in range(n)]
 
-        result = run_multi_target_sim(
-            args, targets   ,
-            split_mode=split_mode, single_mode=single_mode,
-            sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-            use_expert_selector=use_expert_selector,
-            **policy_kwargs,
-        )
+        if args.multi_drop_zone:
+            # Parse drop zones (explicit or randomized)
+            if args.drop_zones:
+                dz_flat = args.drop_zones
+                mdz_zones = [np.array(dz_flat[i*3:(i+1)*3]) for i in range(3)]
+            else:
+                rng_dz = np.random.default_rng(args.multi_target_seed + 1000)
+                mdz_zones = generate_random_drop_zones(rng_dz)
+
+            # Generate zone assignments
+            rng_mdz = np.random.default_rng(args.multi_target_seed + 2000)
+            ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones))) for _ in range(n)]
+
+            result = run_multi_drop_pick_and_place_sim(
+                args, targets,
+                split_mode=split_mode, single_mode=single_mode,
+                drop_zones=mdz_zones,
+                ball_zone_assignments=ball_zone_assignments,
+                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                use_expert_selector=use_expert_selector,
+                **policy_kwargs,
+            )
+            return
+
+        if args.sequential or args.pick_and_place:
+            drop_zone = np.array(args.drop_zone) if args.drop_zone else None
+
+            # If no real policy checkpoints were provided, use expert controllers
+            has_policy = (split_mode and not single_mode) or \
+                         (single_mode and args.checkpoint != "bc_policy_100.pt")
+            if not has_policy:
+                from robotnik_arm_task import (
+                    run_pick_and_place_loop, run_sequential_pick_and_place_loop,
+                    setup_simulation, setup_kinematics, add_target_visual,
+                    FIXED_FINGER_ANGLES,
+                )
+                from robotnik_arm_control import configure_gripper_fingers
+                print("No policy checkpoints — using expert controllers")
+
+                sim, client, rid, conf_file_name, cur_dir = setup_simulation()
+                target_finger_angles = configure_gripper_fingers(sim, client, rid,
+                                                                  FIXED_FINGER_ANGLES)
+                dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
+                    lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
+
+                loop_fn = run_sequential_pick_and_place_loop if args.sequential \
+                    else run_pick_and_place_loop
+                combined, selector_samples, per_ball = loop_fn(
+                    sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                    init_joint_angles, target_finger_angles,
+                    lower_limits, upper_limits,
+                    target_ee_positions=targets,
+                    drop_zone=drop_zone,
+                )
+                return
+
+            # Use learned policies
+            if args.sequential:
+                result = run_sequential_pick_and_place_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    drop_zone=drop_zone,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
+            else:
+                result = run_multi_target_pick_and_place_sim(
+                    args, targets,
+                    split_mode=split_mode, single_mode=single_mode,
+                    drop_zone=drop_zone,
+                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                    use_expert_selector=use_expert_selector,
+                    **policy_kwargs,
+                )
+            return
+
+        else:
+            result = run_multi_target_sim(
+                args, targets,
+                split_mode=split_mode, single_mode=single_mode,
+                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+                use_expert_selector=use_expert_selector,
+                **policy_kwargs,
+            )
         return
 
     target_ee_pos = np.array(args.target)
