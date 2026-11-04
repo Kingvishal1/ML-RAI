@@ -12,6 +12,9 @@ import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -111,7 +114,7 @@ def main():
         out_file = f"sweep_results/scale_{scale:.2f}.json"
         log_file = f"sweep_results/scale_{scale:.2f}.log"
         cmd = [
-            sys.executable, "evaluate.py",
+            sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval", "evaluate.py"),
             "--base_checkpoint", args.base_checkpoint,
             "--arm_checkpoint", args.arm_checkpoint,
             "--threshold_scale", str(scale),

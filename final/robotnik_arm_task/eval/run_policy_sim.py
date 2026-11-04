@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Run a trained BC policy in PyBullet simulation to reach a target endpoint.
 
-Supports two modes:
-  1. Single-model mode (--checkpoint): one policy predicts all 11 outputs.
-  2. Split-model mode (--base_checkpoint + --arm_checkpoint): base policy navigates,
-     then arm policy reaches, with expert PD arm-hold during base navigation.
+Split-model mode: base policy navigates, then arm policy reaches,
+with expert PD arm-hold during base navigation.
 """
 
 import argparse
 import os
 import sys
 import time
-from cmath import phase
+
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _root)
 
 # Parse --headless early so the env var is set before module-level reads in robotnik_arm_task
 if "--headless" in sys.argv:
@@ -24,13 +24,12 @@ from simulation_and_control import pb, MotorCommands
 from robotnik_arm_task import (
     setup_simulation, setup_kinematics, add_target_visual,
     FIXED_FINGER_ANGLES, REACH_TOLERANCE, ARM_REACH_LIMIT,
-    GRIP_TOLERANCE, DROP_ZONE_DEFAULT, GripState,
-    NUM_DROP_ZONES, DROP_ZONES_DEFAULT, DROP_ZONE_COLORS,
-    spawn_ball, add_drop_zone_visual, find_ee_link_id,
+    GRIP_TOLERANCE, GripState,
+    DROP_ZONES_DEFAULT, DROP_ZONE_COLORS,
+    spawn_ball, find_ee_link_id,
     auto_grip, auto_release,
-    shortest_path_expert_sequential,
-    shortest_path_expert_multi_drop,
-    build_selector_scene_multi_drop,
+    shortest_path_expert,
+    build_selector_scene,
     generate_random_drop_zones,
 )
 from robotnik_arm_control import (
@@ -38,29 +37,6 @@ from robotnik_arm_control import (
 )
 from run_policy import load_policy, predict
 from regressors import build_mlp
-from activations import LEGACY_ACTIVATION
-
-
-def load_gravity_comp(path, device="cpu"):
-    """Load gravity compensation network from checkpoint."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    hidden_dim = ckpt["hidden_dim"]
-    num_layers = ckpt["num_layers"]
-    activation = ckpt.get("activation", LEGACY_ACTIVATION)
-    model = build_mlp(7, 7, hidden_dim, num_layers, activation)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
-    return model, ckpt["q_mean"], ckpt["q_std"], ckpt["tau_mean"], ckpt["tau_std"]
-
-
-def predict_gravity(grav_model, q_mean, q_std, tau_mean, tau_std, q_arm, device="cpu"):
-    """Predict gravity compensation torques from joint angles."""
-    q_norm = (q_arm - q_mean) / q_std
-    x = torch.tensor(q_norm, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        pred = grav_model(x).cpu().numpy()[0]
-    return pred * tau_std + tau_mean
 
 # Wheel kinematic constants (from BaseControllerParams)
 WHEEL_RADIUS = 0.11
@@ -197,10 +173,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             base_label_mean=None, base_label_std=None, base_feature_names=None,
             has_base_phases=False,
             arm_model=None, arm_mean=None, arm_std=None,
-            arm_label_mean=None, arm_label_std=None, arm_feature_names=None,
-            # gravity compensation
-            grav_model=None, grav_q_mean=None, grav_q_std=None,
-            grav_tau_mean=None, grav_tau_std=None):
+            arm_label_mean=None, arm_label_std=None, arm_feature_names=None):
     """Run one simulation attempt. Returns True if finished normally, False if crashed."""
 
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
@@ -406,12 +379,6 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            # Add gravity compensation if using learned gravity network
-            if grav_model is not None:
-                tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
-                                           grav_tau_mean, grav_tau_std,
-                                           q_mes[4:11], device=device)
-                raw_torque = raw_torque + tau_grav
             if args.arm_damping > 0:
                 raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
             torque_arm = np.clip(raw_torque, -20.0, 20.0)
@@ -571,126 +538,6 @@ def compute_base_threshold_for_target(target_ee_pos):
     return 0.3
 
 
-def run_multi_target_sim(args, target_ee_positions, device,
-                         split_mode, single_mode,
-                         sel_model=None, sel_mean=None, sel_std=None,
-                         use_expert_selector=False,
-                         **policy_kwargs):
-    """Run a multi-target episode using learned (or expert) selector + base/arm policies.
-
-    Args:
-        target_ee_positions: list of target positions (any length)
-        sel_model, sel_mean, sel_std: selector policy (None if use_expert_selector)
-        use_expert_selector: if True, use nearest-neighbor expert instead of learned selector
-        **policy_kwargs: forwarded to _run_single_target_inline()
-
-    Returns:
-        dict with per-target results and episode-level metrics
-    """
-    from robotnik_arm_task import (
-        shortest_path_expert,
-        setup_simulation, setup_kinematics, add_target_visual,
-    )
-    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
-
-    n_targets = len(target_ee_positions)
-    all_targets = np.array(target_ee_positions)  # (N, 3)
-
-    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
-    target_finger_angles = configure_gripper_fingers(sim, client, rid,
-                                                      np.array([0.1]*6))
-
-    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
-        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
-
-    for t in target_ee_positions:
-        add_target_visual(client, t)
-
-    remaining = set(range(n_targets))
-    per_target_results = []
-    visit_order = []
-    total_steps = 0
-    total_time = 0.0
-
-    import pinocchio as pin
-    from simulation_and_control import MotorCommands
-
-    print(f"\n{'='*60}")
-    print(f"Multi-target episode: {n_targets} targets")
-    for i, t in enumerate(target_ee_positions):
-        print(f"  Slot {i}: {np.round(t, 3)}")
-    print(f"{'='*60}")
-    episode_ok = True
-
-    while remaining:
-        # --- Decision point: pick next target ---
-        base_pos = np.array(sim.GetBasePosition())
-        base_ori = np.array(sim.GetBaseOrientation())
-        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-        if use_expert_selector:
-            chosen_idx, full_order = shortest_path_expert(base_pos, all_targets, remaining)
-            print(f"    Optimal order: {full_order} (total dist: shortest path)")
-        else:
-            from robotnik_arm_task import build_selector_scene
-            scene_obs, slot_order = build_selector_scene(base_pos, base_bearing, all_targets, remaining)
-            chosen_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
-
-        current_target = all_targets[chosen_idx]
-        remaining.remove(chosen_idx)
-        visit_order.append(chosen_idx)
-
-        print(f"\n>>> Selector chose slot {chosen_idx} ({np.round(current_target, 3)}) | "
-              f"{len(remaining)} remaining")
-
-        # --- Compute base threshold for this target ---
-        args.base_threshold = compute_base_threshold_for_target(current_target)
-
-        # --- Run single-target control loop ---
-        result = _run_single_target_inline(
-            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            init_joint_angles, target_finger_angles,
-            lower_limits, upper_limits,
-            current_target, device, split_mode, single_mode,
-            **policy_kwargs,
-        )
-
-        total_steps += result.get("steps", 0)
-        total_time += result.get("time", 0.0)
-
-        per_target_results.append({
-            "slot": chosen_idx,
-            "target": current_target.tolist(),
-            **result,
-        })
-
-        reached = result.get("reached", False)
-        print(f"    Slot {chosen_idx}: final_err={result.get('final_err', float('inf')):.4f}m  "
-              f"reached={reached}")
-
-        if not result.get("ok", True):
-            episode_ok = False
-            break
-
-    # --- Episode summary ---
-    reached_count = sum(1 for r in per_target_results if r.get("reached", False))
-    print(f"\n{'='*60}")
-    print(f"Episode complete: {reached_count}/{n_targets} targets reached")
-    print(f"Visit order: {visit_order}")
-    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
-    print(f"{'='*60}")
-
-    return {
-        "ok": episode_ok,
-        "targets_reached": reached_count,
-        "n_targets": n_targets,
-        "visit_order": visit_order,
-        "total_steps": total_steps,
-        "total_time": total_time,
-        "per_target": per_target_results,
-    }
-
-
 def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
                                init_joint_angles, target_finger_angles,
                                lower_limits, upper_limits,
@@ -747,12 +594,6 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
     arm_label_std = policy_kwargs.get("arm_label_std")
     arm_feature_names = policy_kwargs.get("arm_feature_names")
 
-    grav_model = policy_kwargs.get("grav_model")
-    grav_q_mean = policy_kwargs.get("grav_q_mean")
-    grav_q_std = policy_kwargs.get("grav_q_std")
-    grav_tau_mean = policy_kwargs.get("grav_tau_mean")
-    grav_tau_std = policy_kwargs.get("grav_tau_std")
-
     per_target_max_steps = getattr(args, "per_target_max_steps", args.max_steps)
 
     while step < per_target_max_steps:
@@ -799,16 +640,7 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
                     break
                 phase = "arm"
 
-        # Compute action
-        if phase == "single":
-            obs = build_observation(base_pos, base_bearing, base_lin_vel, base_ang_vel,
-                                    q_mes, qd_mes, ee_pos, target_ee_pos, tau_gravity_arm)
-            action = predict(model, mean, std, obs, device=device,
-                             label_mean=label_mean, label_std=label_std)
-            wheel_cmds = np.clip(action[:4], -0.25 / WHEEL_RADIUS, 0.25 / WHEEL_RADIUS)
-            torque_arm = np.clip(action[4:], -30.0, 30.0)
-
-        elif phase == "base":
+        if phase == "base":
             obs_feature_names = [n for n in base_feature_names if n != "phase"] \
                 if has_base_phases else base_feature_names
             obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
@@ -864,11 +696,6 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
             raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                  device=device,
                                  label_mean=arm_label_mean, label_std=arm_label_std)
-            if grav_model is not None:
-                tau_grav = predict_gravity(grav_model, grav_q_mean, grav_q_std,
-                                           grav_tau_mean, grav_tau_std,
-                                           q_mes[4:11], device=device)
-                raw_torque = raw_torque + tau_grav
             if args.arm_damping > 0:
                 raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
             torque_arm = np.clip(raw_torque, -20.0, 20.0)
@@ -1019,253 +846,7 @@ def _run_pick_and_place_target_inline(args, sim, dyn_model, ee_frame_id, shoulde
     }
 
 
-def run_multi_target_pick_and_place_sim(args, target_ee_positions, device,
-                                         split_mode, single_mode,
-                                         drop_zone=None,
-                                         sel_model=None, sel_mean=None, sel_std=None,
-                                         use_expert_selector=False,
-                                         **policy_kwargs):
-    """Run a multi-ball pick-and-place episode using learned (or expert) selector.
-
-    Spawns balls at each target position. For each ball: navigate, grip, carry to
-    drop zone, release. Selector picks which ball to visit next.
-    """
-    from robotnik_arm_task import (
-        shortest_path_expert_pnp, build_selector_scene,
-        setup_simulation, setup_kinematics, add_target_visual,
-    )
-    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
-
-    if drop_zone is None:
-        drop_zone = DROP_ZONE_DEFAULT.copy()
-    else:
-        drop_zone = np.array(drop_zone)
-
-    n_balls = len(target_ee_positions)
-    all_targets = np.array(target_ee_positions)
-
-    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
-    target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array([0.1]*6))
-
-    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
-        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
-
-    # Spawn balls and drop zone
-    ee_link_id = find_ee_link_id(client, rid)
-    grip_states = []
-    for i, t in enumerate(target_ee_positions):
-        ball_id = spawn_ball(client, t)
-        grip_states.append(GripState(ball_id=ball_id))
-        add_target_visual(client, t)
-    add_drop_zone_visual(client, drop_zone)
-
-    remaining = set(range(n_balls))
-    per_ball_results = []
-    visit_order = []
-    total_steps = 0
-    total_time = 0.0
-
-    print(f"\n{'='*60}")
-    print(f"Pick-and-place episode: {n_balls} balls, drop zone={np.round(drop_zone, 3)}")
-    for i, t in enumerate(target_ee_positions):
-        print(f"  Ball {i}: {np.round(t, 3)}")
-    print(f"{'='*60}")
-
-    while remaining:
-        base_pos = np.array(sim.GetBasePosition())
-        base_ori = np.array(sim.GetBaseOrientation())
-        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-        if use_expert_selector:
-            chosen_idx, full_order = shortest_path_expert_pnp(base_pos, all_targets, remaining, drop_zone)
-        else:
-            scene_obs, slot_order = build_selector_scene(base_pos, base_bearing, all_targets, remaining)
-            chosen_idx = predict_selector(sel_model, sel_mean, sel_std, scene_obs, slot_order, device)
-
-        ball_pos = all_targets[chosen_idx]
-        remaining.remove(chosen_idx)
-        visit_order.append(chosen_idx)
-
-        print(f"\n>>> Selector chose ball {chosen_idx} ({np.round(ball_pos, 3)}) | "
-              f"{len(remaining)} remaining")
-
-        result = _run_pick_and_place_target_inline(
-            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            init_joint_angles, target_finger_angles,
-            lower_limits, upper_limits,
-            ball_pos, drop_zone, grip_states[chosen_idx],
-            device, split_mode, single_mode,
-            **policy_kwargs,
-        )
-
-        total_steps += result.get("steps", 0)
-        total_time += result.get("time", 0.0)
-
-        per_ball_results.append({
-            "slot": chosen_idx,
-            "ball_pos": ball_pos.tolist(),
-            **result,
-        })
-
-        if not result.get("ok", True):
-            break
-
-    # Summary
-    n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
-    n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
-    print(f"\n{'='*60}")
-    print(f"Pick-and-place complete: {n_gripped}/{n_balls} gripped, "
-          f"{n_delivered}/{n_balls} delivered")
-    print(f"Visit order: {visit_order}")
-    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
-    print(f"{'='*60}")
-
-    return {
-        "ok": all(r.get("ok", True) for r in per_ball_results),
-        "balls_gripped": n_gripped,
-        "balls_delivered": n_delivered,
-        "n_balls": n_balls,
-        "visit_order": visit_order,
-        "total_steps": total_steps,
-        "total_time": total_time,
-        "per_ball": per_ball_results,
-    }
-
-
-def run_sequential_pick_and_place_sim(args, target_ee_positions, device,
-                                       split_mode, single_mode,
-                                       drop_zone=None,
-                                       sel_model=None, sel_mean=None, sel_std=None,
-                                       use_expert_selector=False,
-                                       **policy_kwargs):
-    """Run sequential pick-and-place: pick ball_i, carry to ball_{i+1}, last to drop zone.
-
-    Uses learned (or expert) selector for visit ordering, then executes the
-    chain using learned base/arm policies.
-    """
-    from robotnik_arm_task import (
-        build_selector_scene, setup_simulation, setup_kinematics, add_target_visual,
-    )
-    from robotnik_arm_control import quaternion2bearing, configure_gripper_fingers
-
-    if drop_zone is None:
-        drop_zone = DROP_ZONE_DEFAULT.copy()
-    else:
-        drop_zone = np.array(drop_zone)
-
-    n_balls = len(target_ee_positions)
-    all_targets = np.array(target_ee_positions)
-
-    sim, client, rid, conf_file_name, cur_dir = setup_simulation()
-    target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array([0.1]*6))
-
-    dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
-        lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
-
-    ee_link_id = find_ee_link_id(client, rid)
-    grip_states = []
-    for i, t in enumerate(target_ee_positions):
-        ball_id = spawn_ball(client, t)
-        grip_states.append(GripState(ball_id=ball_id))
-        add_target_visual(client, t)
-    add_drop_zone_visual(client, drop_zone)
-
-    # Determine visit order
-    base_pos = np.array(sim.GetBasePosition())
-    base_ori = np.array(sim.GetBaseOrientation())
-    base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-    if use_expert_selector:
-        _, full_order = shortest_path_expert_sequential(base_pos, all_targets,
-                                                         set(range(n_balls)), drop_zone)
-    else:
-        # Use learned selector to pick first, then re-query after each delivery
-        full_order = []
-        remaining = set(range(n_balls))
-        temp_pos = base_pos.copy()
-        temp_bearing = base_bearing
-        while remaining:
-            scene_obs, slot_order = build_selector_scene(temp_pos, temp_bearing,
-                                                          all_targets, remaining)
-            chosen = predict_selector(sel_model, sel_mean, sel_std,
-                                       scene_obs, slot_order, device)
-            full_order.append(chosen)
-            remaining.remove(chosen)
-            # After picking ball, robot will be near next ball's position
-            if full_order and len(remaining) > 0:
-                temp_pos = all_targets[chosen]
-
-    per_ball_results = []
-    visit_order = full_order[:]
-    total_steps = 0
-    total_time = 0.0
-
-    print(f"\n{'='*60}")
-    print(f"Sequential pick-and-place: {n_balls} balls, drop zone={np.round(drop_zone, 3)}")
-    print(f"Visit order: {full_order}")
-    for i, t in enumerate(target_ee_positions):
-        print(f"  Ball {i}: {np.round(t, 3)}")
-    print(f"{'='*60}")
-
-    for order_idx, chosen_idx in enumerate(full_order):
-        ball_pos = all_targets[chosen_idx]
-        gs = grip_states[chosen_idx]
-
-        if order_idx < n_balls - 1:
-            dest_pos = all_targets[full_order[order_idx + 1]]
-            dest_label = f"ball {full_order[order_idx + 1]}"
-        else:
-            dest_pos = drop_zone
-            dest_label = "drop zone"
-
-        print(f"\n>>> Sequential: pick ball {chosen_idx}, carry to {dest_label} | "
-              f"{n_balls - order_idx - 1} remaining")
-
-        result = _run_pick_and_place_target_inline(
-            args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            init_joint_angles, target_finger_angles,
-            lower_limits, upper_limits,
-            ball_pos, dest_pos, gs,
-            device, split_mode, single_mode,
-            **policy_kwargs,
-        )
-
-        total_steps += result.get("steps", 0)
-        total_time += result.get("time", 0.0)
-
-        per_ball_results.append({
-            "slot": chosen_idx,
-            "ball_pos": ball_pos.tolist(),
-            "dest_pos": dest_pos.tolist(),
-            "dest_label": dest_label,
-            **result,
-        })
-
-        if not result.get("ok", True):
-            break
-
-    n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
-    n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
-    print(f"\n{'='*60}")
-    print(f"Sequential pick-and-place complete: {n_gripped}/{n_balls} gripped, "
-          f"{n_delivered}/{n_balls} delivered")
-    print(f"Visit order: {visit_order}")
-    print(f"Total steps: {total_steps}  Total time: {total_time:.2f}s")
-    print(f"{'='*60}")
-
-    return {
-        "ok": all(r.get("ok", True) for r in per_ball_results),
-        "balls_gripped": n_gripped,
-        "balls_delivered": n_delivered,
-        "n_balls": n_balls,
-        "visit_order": visit_order,
-        "total_steps": total_steps,
-        "total_time": total_time,
-        "per_ball": per_ball_results,
-    }
-
-
-def run_multi_drop_pick_and_place_sim(args, target_ee_positions, device,
+def run_pick_and_place_sim(args, target_ee_positions, device,
                                        split_mode, single_mode,
                                        drop_zones=None,
                                        ball_zone_assignments=None,
@@ -1339,10 +920,10 @@ def run_multi_drop_pick_and_place_sim(args, target_ee_positions, device,
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
 
         if use_expert_selector:
-            chosen_idx, full_order = shortest_path_expert_multi_drop(
+            chosen_idx, full_order = shortest_path_expert(
                 base_pos, all_targets, remaining, drop_zones, ball_zone_assignments)
         else:
-            scene_obs, slot_order = build_selector_scene_multi_drop(
+            scene_obs, slot_order = build_selector_scene(
                 base_pos, base_bearing, all_targets, remaining,
                 drop_zones, ball_zone_assignments)
             chosen_idx = predict_selector(sel_model, sel_mean, sel_std,
@@ -1418,24 +999,19 @@ def run_multi_drop_pick_and_place_sim(args, target_ee_positions, device,
 
 def main():
     parser = argparse.ArgumentParser(description="Run BC policy in simulation")
-    # Single-model mode
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to trained .pt checkpoint (single-model mode)")
-    # Split-model mode
+    # Split-model mode (base + arm)
     parser.add_argument("--base_checkpoint", type=str, default=None,
-                        help="Path to base policy .pt checkpoint (split mode)")
+                        help="Path to base policy .pt checkpoint")
     parser.add_argument("--arm_checkpoint", type=str, default=None,
-                        help="Path to arm policy .pt checkpoint (split mode)")
+                        help="Path to arm policy .pt checkpoint")
     # Common args
     parser.add_argument("--target", type=float, nargs=3, default=[0.0, 1.1, 0.5],
                         metavar=("X", "Y", "Z"),
                         help="Target end-effector position (default: 0.0 1.1 0.5)")
     parser.add_argument("--max_steps", type=int, default=400000,
                         help="Maximum simulation steps")
-    parser.add_argument("--gravity_comp", type=str, default=None,
-                        help="Path to gravity compensation network checkpoint (adds predicted gravity torques to arm output)")
     parser.add_argument("--arm_damping", type=float, default=0.0,
-                        help="Velocity damping coefficient for arm joints (default: 0, e.g. 5.0)")
+                        help="Velocity damping coefficient for arm joints (default: 0)")
     parser.add_argument("--headless", action="store_true",
                         help="Skip visualizer updates and sleep for fast evaluation")
     parser.add_argument("--mps", action="store_true",
@@ -1443,45 +1019,32 @@ def main():
     parser.add_argument("--retries", type=int, default=0,
                         help="Number of times to restart simulation on crash (default: 0)")
     parser.add_argument("--heading_threshold", type=float, default=0.15,
-                        help="Heading error (rad) for rotate/drive sub-phase transition "
-                             "(only used when base checkpoint has 'phase' feature, default: 0.15)")
-    # Multi-target mode
+                        help="Heading error (rad) for rotate/drive sub-phase transition (default: 0.15)")
+    # Pick-and-place mode (multi-drop-zone)
+    parser.add_argument("--pick_and_place", action="store_true",
+                        help="Enable pick-and-place mode (multi-drop-zone)")
     parser.add_argument("--multi_target", action="store_true",
-                        help="Run multi-target episode instead of single target")
+                        help="Run multi-target episode")
     parser.add_argument("--num_targets_per_episode", type=int, default=3,
-                        help="Number of targets in a multi-target episode (default: 3)")
+                        help="Number of targets per episode (default: 3)")
     parser.add_argument("--selector_checkpoint", type=str, default=None,
-                        help="Path to trained selector .pt checkpoint (if omitted, uses expert nearest-neighbor)")
+                        help="Path to trained selector .pt checkpoint (if omitted, uses expert)")
     parser.add_argument("--multi_target_seed", type=int, default=42,
                         help="Random seed for generating multi-target positions (default: 42)")
     parser.add_argument("--per_target_max_steps", type=int, default=100000,
-                        help="Max simulation steps per individual target in multi-target mode (default: 100000)")
-    # Pick-and-place mode
-    parser.add_argument("--pick_and_place", action="store_true",
-                        help="Enable pick-and-place mode: grip balls and carry to drop zone")
-    parser.add_argument("--drop_zone", type=float, nargs=3, default=None,
-                        metavar=("X", "Y", "Z"),
-                        help="Drop zone position (default: 0.0 0.0 0.5)")
-    parser.add_argument("--sequential", action="store_true",
-                        help="Sequential pick-and-place: pick ball_i, carry to ball_{i+1}, "
-                             "last ball goes to drop zone")
-    parser.add_argument("--multi_drop_zone", action="store_true",
-                        help="Multi-drop-zone mode: balls assigned to 3 different drop zones")
+                        help="Max simulation steps per target (default: 100000)")
+    parser.add_argument("--expert", action="store_true",
+                        help="Use expert controllers instead of learned policies for PnP")
     parser.add_argument("--drop_zones", type=float, nargs=9, default=None,
                         metavar=tuple(f"{c}{i}" for i in range(3) for c in "XYZ"),
-                        help="9 floats for 3 drop zone positions (default: triangle layout)")
+                        help="9 floats for 3 drop zone positions (default: randomized)")
     args = parser.parse_args()
 
     # Determine mode
     split_mode = args.base_checkpoint is not None and args.arm_checkpoint is not None
-    single_mode = args.checkpoint is not None
-    if not split_mode and not single_mode:
-        args.checkpoint = "bc_policy_100.pt"
-        single_mode = True
-    if split_mode and single_mode:
-        parser.error("Specify either --checkpoint OR (--base_checkpoint + --arm_checkpoint), not both.")
+    single_mode = False
 
-    # --- Load policy/policies (once, reused across retries) ---
+    # --- Load device ---
     if args.mps and torch.backends.mps.is_available():
         device = "mps"
     elif torch.cuda.is_available():
@@ -1491,166 +1054,83 @@ def main():
 
     policy_kwargs = dict(device=device)
 
-    if single_mode:
-        model, mean, std, label_mean, label_std, _ = load_policy(args.checkpoint, device=device)
-        print(f"Loaded policy from {args.checkpoint}  device={device}")
-        policy_kwargs.update(model=model, mean=mean, std=std,
-                             label_mean=label_mean, label_std=label_std)
-    else:
-        base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
-            load_policy(args.base_checkpoint, device=device)
-        arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
-            load_policy(args.arm_checkpoint, device=device)
-        # Detect phase-as-input model (has 'phase' in feature names)
-        has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
-        base_desc = args.base_checkpoint
-        if has_base_phases:
-            phase_desc = f"  phases=input (thr={args.heading_threshold:.3f})"
-        else:
-            phase_desc = "  phases=no"
-        print(f"Split mode: base={base_desc}  arm={args.arm_checkpoint}  "
-              f"device={device}"
-              f"{phase_desc}")
-        policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
-                             base_label_mean=base_lm, base_label_std=base_ls,
-                             base_feature_names=base_fnames,
-                             has_base_phases=has_base_phases,
-                             arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
-                             arm_label_mean=arm_lm, arm_label_std=arm_ls,
-                             arm_feature_names=arm_fnames)
+    base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
+        load_policy(args.base_checkpoint, device=device)
+    arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
+        load_policy(args.arm_checkpoint, device=device)
+    has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
+    phase_desc = f"  phases=input (thr={args.heading_threshold:.3f})" if has_base_phases \
+        else "  phases=no"
+    print(f"Split mode: base={args.base_checkpoint}  arm={args.arm_checkpoint}  "
+          f"device={device}{phase_desc}")
+    policy_kwargs.update(base_model=base_model, base_mean=base_mean, base_std=base_std,
+                         base_label_mean=base_lm, base_label_std=base_ls,
+                         base_feature_names=base_fnames,
+                         has_base_phases=has_base_phases,
+                         arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
+                         arm_label_mean=arm_lm, arm_label_std=arm_ls,
+                         arm_feature_names=arm_fnames)
 
-    # Load gravity compensation network if provided
-    if args.gravity_comp:
-        grav_model, grav_q_mean, grav_q_std, grav_tau_mean, grav_tau_std = \
-            load_gravity_comp(args.gravity_comp, device=device)
-        print(f"Gravity comp: {args.gravity_comp}")
-        policy_kwargs.update(grav_model=grav_model, grav_q_mean=grav_q_mean,
-                             grav_q_std=grav_q_std, grav_tau_mean=grav_tau_mean,
-                             grav_tau_std=grav_tau_std)
-
-    # --- Multi-target mode ---
-    if args.multi_target:
-        # Load selector if checkpoint provided
+    # --- Pick-and-place multi-target mode ---
+    if args.pick_and_place and args.multi_target:
         sel_model = sel_mean = sel_std = None
         use_expert_selector = args.selector_checkpoint is None
         if args.selector_checkpoint:
             sel_model, sel_mean, sel_std = load_selector(args.selector_checkpoint, device=device)
             print(f"Selector policy: {args.selector_checkpoint}")
         else:
-            print("Selector: expert (nearest-neighbor)")
+            print("Selector: expert (shortest-path)")
 
-        # Generate random targets
         rng = np.random.default_rng(args.multi_target_seed)
         n = args.num_targets_per_episode
         targets = [np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
                     for _ in range(n)]
 
-        if args.multi_drop_zone:
-            # Parse drop zones (explicit or randomized)
-            if args.drop_zones:
-                dz_flat = args.drop_zones
-                mdz_zones = [np.array(dz_flat[i*3:(i+1)*3]) for i in range(3)]
-            else:
-                rng_dz = np.random.default_rng(args.multi_target_seed + 1000)
-                mdz_zones = generate_random_drop_zones(rng_dz)
-
-            # Generate zone assignments
-            rng_mdz = np.random.default_rng(args.multi_target_seed + 2000)
-            ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones))) for _ in range(n)]
-
-            result = run_multi_drop_pick_and_place_sim(
-                args, targets,
-                split_mode=split_mode, single_mode=single_mode,
-                drop_zones=mdz_zones,
-                ball_zone_assignments=ball_zone_assignments,
-                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-                use_expert_selector=use_expert_selector,
-                **policy_kwargs,
-            )
-            return
-
-        if args.sequential or args.pick_and_place:
-            drop_zone = np.array(args.drop_zone) if args.drop_zone else None
-
-            # If no real policy checkpoints were provided, use expert controllers
-            has_policy = (split_mode and not single_mode) or \
-                         (single_mode and args.checkpoint != "bc_policy_100.pt")
-            if not has_policy:
-                from robotnik_arm_task import (
-                    run_pick_and_place_loop, run_sequential_pick_and_place_loop,
-                    setup_simulation, setup_kinematics, add_target_visual,
-                    FIXED_FINGER_ANGLES,
-                )
-                from robotnik_arm_control import configure_gripper_fingers
-                print("No policy checkpoints — using expert controllers")
-
-                sim, client, rid, conf_file_name, cur_dir = setup_simulation()
-                target_finger_angles = configure_gripper_fingers(sim, client, rid,
-                                                                  FIXED_FINGER_ANGLES)
-                dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, _, \
-                    lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)
-
-                loop_fn = run_sequential_pick_and_place_loop if args.sequential \
-                    else run_pick_and_place_loop
-                combined, selector_samples, per_ball = loop_fn(
-                    sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                    init_joint_angles, target_finger_angles,
-                    lower_limits, upper_limits,
-                    target_ee_positions=targets,
-                    drop_zone=drop_zone,
-                )
-                return
-
-            # Use learned policies
-            if args.sequential:
-                result = run_sequential_pick_and_place_sim(
-                    args, targets,
-                    split_mode=split_mode, single_mode=single_mode,
-                    drop_zone=drop_zone,
-                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-                    use_expert_selector=use_expert_selector,
-                    **policy_kwargs,
-                )
-            else:
-                result = run_multi_target_pick_and_place_sim(
-                    args, targets,
-                    split_mode=split_mode, single_mode=single_mode,
-                    drop_zone=drop_zone,
-                    sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-                    use_expert_selector=use_expert_selector,
-                    **policy_kwargs,
-                )
-            return
-
+        # Parse or generate drop zones
+        if args.drop_zones:
+            dz_flat = args.drop_zones
+            mdz_zones = [np.array(dz_flat[i*3:(i+1)*3]) for i in range(3)]
         else:
-            result = run_multi_target_sim(
-                args, targets,
-                split_mode=split_mode, single_mode=single_mode,
-                sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
-                use_expert_selector=use_expert_selector,
-                **policy_kwargs,
-            )
+            rng_dz = np.random.default_rng(args.multi_target_seed + 1000)
+            mdz_zones = generate_random_drop_zones(rng_dz)
+
+        rng_mdz = np.random.default_rng(args.multi_target_seed + 2000)
+        ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones))) for _ in range(n)]
+
+        run_pick_and_place_sim(
+            args, targets, device=device,
+            split_mode=split_mode, single_mode=single_mode,
+            drop_zones=mdz_zones,
+            ball_zone_assignments=ball_zone_assignments,
+            sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,
+            use_expert_selector=use_expert_selector,
+            **policy_kwargs,
+        )
         return
+
+    # --- Single-target mode ---
+    if not split_mode:
+        parser.error("Provide --base_checkpoint and --arm_checkpoint (or use --pick_and_place --multi_target --expert)")
 
     target_ee_pos = np.array(args.target)
 
-    # Compute base_threshold from arm geometry (Pythagorean: horizontal reach given vertical offset)
-    if split_mode:
-        dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
-        if dz < ARM_REACH_LIMIT:
-            base_threshold = 0.75 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
-        else:
-            base_threshold = 0.3  # target z beyond arm reach, get as close as possible
-        args.base_threshold = base_threshold
-        print(f"Base threshold: {base_threshold:.2f}m "
-              f"(arm={ARM_REACH_LIMIT}m, dz={dz:.2f}m)")
+    # Compute base_threshold from arm geometry
+    dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
+    if dz < ARM_REACH_LIMIT:
+        base_threshold = 0.75 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
+    else:
+        base_threshold = 0.3
+    args.base_threshold = base_threshold
+    print(f"Base threshold: {base_threshold:.2f}m "
+          f"(arm={ARM_REACH_LIMIT}m, dz={dz:.2f}m)")
 
     # --- Run with retries ---
     max_attempts = 1 + args.retries
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
             print(f"\n>>> Restarting simulation (attempt {attempt}/{max_attempts}) <<<\n")
-        result = run_sim(args, target_ee_pos, split_mode=split_mode, single_mode=single_mode,
+        result = run_sim(args, target_ee_pos, device=device,
+                         split_mode=split_mode, single_mode=single_mode,
                          **policy_kwargs)
         if result["ok"]:
             break

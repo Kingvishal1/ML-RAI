@@ -8,6 +8,9 @@ here; the training loop itself is delegated to the regressor in regressors.py.
 import argparse
 import glob
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import re
 import time as _time
 
