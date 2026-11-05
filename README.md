@@ -1,5 +1,6 @@
 # 🤖 Behavioral Cloning for Multi-Object Mobile Pick and Drop Robot
 
+
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
 ![PyBullet](https://img.shields.io/badge/PyBullet-RoboEnv-1E88E5)
@@ -7,11 +8,13 @@
 ![Robot](https://img.shields.io/badge/Robot-Robotnik%20Summit%20XL-F57C00)
 ![Optuna](https://img.shields.io/badge/Optuna-tuning-2C3E8F)
 
-## Project Overview
-
 Behavioral Cloning (BC) investigates how a mobile manipulator can learn navigation and arm-control behaviour from expert demonstrations. Built around the **Robotnik Summit XL** mobile base, a **7-DoF robotic arm**, and a **three-finger gripper**, the project combines data-driven robot control with simulation-based testing and multi-target task planning.
 
 Instead of manually specifying every navigation and reaching action, the project records expert state–action trajectories and uses **behaviour cloning** to train separate neural policies for the **mobile base** and **robot arm**. A further learned **target-selection policy** chooses which object to attempt next in a scene containing multiple balls and assigned drop zones. These components execute in a closed-loop RoboEnv/PyBullet simulation, with Pinocchio providing robot kinematics.
+
+## ⚡ How It Works (TL;DR)
+
+**Expert Robotnik control** generates state/action demonstrations → **behaviour cloning** trains base and arm policies → a separate **neural selector** learns the next-target ordering → **RoboEnv/PyBullet** runs closed-loop reaching and multi-ball tasks.
 
 ## ⚙️ Tech Stack
 
@@ -153,7 +156,7 @@ pixi shell -e ml
 cd ../ML-RAI/final/robotnik_arm_task
 ```
 
-### 6. ▶️ Run the main simulation — Multi-Target Pick-and-Place
+### 6. ▶️ Run the main simulation - Multi-Target Pick-and-Place
 
 From `ML-RAI/final/robotnik_arm_task`, inside the pixi shell:
 
@@ -163,7 +166,7 @@ python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json
 
 Default checkpoints: `060_bc_base_gelu_e70_h512_l3_16min_working.pt` (base), `051_bc_arm_gelu_e70_h512_l3_3min_working.pt` (arm), and `084_selector_gelu_e300_h128_l3.pt` (selector).
 
-The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-place logic. Add `--headless` to run without the PyBullet GUI (much faster).
+The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-place logic. Add `--headless` to run without the PyBullet GUI (much faster), especially for macbook.
 
 **Example configuration:** `eval/example_config.json`
 
@@ -174,73 +177,41 @@ The example scene configures **three balls, three drop zones and one assigned de
   "assignments": [0, 1, 2]
 }
 ```
+## 🏋️ Training Your Own Policies
 
-*The output reports selected ball order and per-ball task results. A launched simulation does not by itself imply every placement succeeded; inspect the printed results.*
+Run from `ML-RAI/final/robotnik_arm_task` inside the pixi shell. Tuned hyperparameters are used by default.
 
-### Optional: training and hyperparameter tuning
-
-**GPU training on Windows.** By default PyPI ships a CPU-only PyTorch for Windows. To use an NVIDIA GPU, add the CUDA wheel index to `RoboEnv/pixi.toml` and reinstall:
-
-```toml
-[feature.ml.pypi-options]
-extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
-```
-
+**1. Collect expert demonstrations (base + arm)**
 ```bash
-cd RoboEnv
-pixi install -e ml
+python training/collect_data.py --mode random --num_targets 1000 --xy_range 5 --vary_init --noise_std 1.0 --workers 8 --seed 42
 ```
 
-**Hyperparameter tuning** (`experiments/optuna_tune.py`) additionally needs Optuna:
-
+**2. Split into base and arm datasets**
 ```bash
-cd RoboEnv
-pixi add --feature ml --pypi optuna
+python training/split_dataset.py --data data/<dataset_file_name>.npz --out_dir data/split --arm_full_torque
 ```
 
-## 🧪 Additional Workflows
-
-The **main demo command above is the recommended starting point**. These separate commands are for specific experiments and do not need to be run first.
-
-**Single-target learned reaching**
-
+**3. Train the base policy**
 ```bash
-python eval/run_policy_sim.py --target 0.0 1.1 0.5
+python training/train_regressor.py --data data/split/dataset_base.npz
 ```
 
-**Reference expert reaching**
-
+**4. Train the arm policy**
 ```bash
-python robotnik_arm_task.py
+python training/train_regressor.py --data data/split/dataset_arm.npz
 ```
 
-**Headless multi-target evaluation**
-
+**5. Collect selector data**
 ```bash
-python eval/evaluate.py --pick_and_place --headless \
-  --num_episodes 10 --num_targets_per_episode 3 --multi_target_seed 42
+python training/collect_selector_data.py --num_episodes 10000 --max_targets 3 --seed 42
 ```
 
-**Training your own models (optional).** The training entry points are `training/collect_data.py`, `training/split_dataset.py`, `training/train_regressor.py`, `training/collect_selector_data.py` and `training/train_selector.py`. They require generated `.npz` datasets and are **not required** when using the provided checkpoints. Review each script's `--help` options before training and retain the observation schema and normalisation metadata expected at inference.
+**6. Train the selector**
+```bash
+python training/train_selector.py --data data/<selector_dataset_file_name>.npz
+```
 
-## 🛠️ Troubleshooting
-
-| Issue | Resolution |
-|---|---|
-| `ModuleNotFoundError: torch` | Activate `mlrai`; confirm `python` belongs to that environment. |
-| `ModuleNotFoundError: simulation_and_control` | Install the compatible external RoboEnv distribution; it is not supplied by PyBullet. |
-| `ModuleNotFoundError: pinocchio` | Install `pinocchio` from Conda Forge inside the active environment. |
-| Missing `.pt` checkpoint | Run commands from `final/robotnik_arm_task/` and check the listed filenames. |
-| URDF/configuration cannot be found | Confirm `models/` and `configs/` are present and compatible with the RoboEnv search paths. |
-| GUI/display problem | Use a desktop graphics session or add `--headless` to supported evaluation/rollout commands. |
-| Policy/feature mismatch | Use matching checkpoints and the normalisation/feature metadata saved during training. |
-
-## ⚡ How It Works (TL;DR)
-
-**Expert Robotnik control** generates state/action demonstrations → **behaviour cloning** trains base and arm policies → a separate **neural selector** learns the next-target ordering → **RoboEnv/PyBullet** runs closed-loop reaching and multi-ball tasks → **evaluation scripts** report results.
-
----
-
-### Distribution note
-
-Documentation and command examples were checked against the uploaded repository snapshot. Ensure the `main` branch retains the stated paths and checkpoints when publishing. The project also depends on the compatible external RoboEnv `simulation_and_control` package, which must be available to readers.
+**7. Run your trained policies**
+```bash
+python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json --base_checkpoint <base>.pt --arm_checkpoint <arm>.pt --selector_checkpoint <selector>.pt
+```
