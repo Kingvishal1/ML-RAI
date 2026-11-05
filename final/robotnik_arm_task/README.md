@@ -29,3 +29,8 @@ python run_policy_sim.py --target -1 -1 0.6 --headless --base_threshold 0.75 --g
 python evaluate.py --base_checkpoint 040_bc_base_gelu_e70_h512_l3_15min.pt \
     --arm_checkpoint 041_bc_arm_gelu_e70_h512_l3_6min.pt \
     --num_targets 10 --headless --base_threshold 0.75
+
+python eval/evaluate.py --pick_and_place --multi_target \
+    --base_checkpoint 060_bc_base_gelu_e70_h512_l3_16min_working.pt --arm_checkpoint 085_bc_arm_gelu_e80_h512_l3_4min.pt \
+    --selector_checkpoint 084_selector_gelu_e300_h128_l3.pt \
+    --num_episodes 20 --num_targets_per_episode 3 --headless

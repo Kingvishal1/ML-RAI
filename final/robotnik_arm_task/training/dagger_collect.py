@@ -307,7 +307,7 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
             else:
                 torque_arm = expert_torque
 
-            wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
+            wheel_cmds = np.clip(-200.0 * (q_mes[0:4] - wheel_lock_pos), -20.0, 20.0)
 
         # ---- Send commands ----
         torque_fingers = np.zeros(6)
