@@ -1,9 +1,0 @@
-BASE/ARM PRETRAINED CHECKPOINTS ARE NOT CONTAINED IN THE SOURCE ZIP.
-
-- 060_bc_base_gelu_e70_h512_l3_16min_working.pt
-- 051_bc_arm_gelu_e70_h512_l3_3min_working.pt
-
-On your Ubuntu project run:
-python ~/Downloads/robotnik_pick_place_teammate_handoff/build_complete_zip_on_ubuntu.py "$PWD"
-
-Do not substitute dummy weights. The V4 grasp checkpoint is included.
