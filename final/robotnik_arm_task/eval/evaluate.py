@@ -218,12 +218,12 @@ def main():
     # --- Multi-target evaluation ---
     if args.pick_and_place:
         sel_model = sel_mean = sel_std = None
-        use_expert_selector = args.selector_checkpoint is None
+        use_expert_selector = not args.selector_checkpoint
         if args.selector_checkpoint:
             sel_model, sel_mean, sel_std = load_selector(args.selector_checkpoint, device=device)
             print(f"Selector: {args.selector_checkpoint}")
         else:
-            print("Selector: expert (nearest-neighbor)")
+            print("Selector: expert (shortest-path)")
 
         rng = np.random.default_rng(args.seed)
         all_results = []
@@ -324,10 +324,35 @@ def main():
             print_buckets("drop_dist", all_drop_dists,
                           thresholds=(0.05, 0.08, 0.1, 0.2, 0.5))
 
-        # Distance overhead vs optimal (selector evaluation)
-        if not use_expert_selector:
-            print(f"\n--- SELECTOR QUALITY ---")
-            print(f"(Compare visit order distance vs optimal multi-drop TSP)")
+        # EE accuracy (pick and drop phases)
+        pick_best_errs = [pb["pick_best_err"] for r in all_results
+                          for pb in r.get("per_ball", []) if pb.get("pick_best_err") is not None]
+        pick_final_errs = [pb["pick_final_err"] for r in all_results
+                           for pb in r.get("per_ball", []) if pb.get("pick_final_err") is not None]
+        drop_best_errs = [pb["drop_best_err"] for r in all_results
+                          for pb in r.get("per_ball", []) if pb.get("drop_best_err") is not None]
+        drop_final_errs = [pb["drop_final_err"] for r in all_results
+                           for pb in r.get("per_ball", []) if pb.get("drop_final_err") is not None]
+        if pick_best_errs:
+            print(f"\n--- EE ACCURACY ---")
+            print_stats("Pick best EE err", pick_best_errs)
+            print_stats("Pick final EE err", pick_final_errs)
+            print_stats("Drop best EE err", drop_best_errs)
+            print_stats("Drop final EE err", drop_final_errs)
+
+        # Selector distance vs expert optimal
+        sel_dists = [r["selector_dist"] for r in all_results if "selector_dist" in r]
+        exp_dists = [r["expert_dist"] for r in all_results if "expert_dist" in r]
+        overheads = [r["dist_overhead_pct"] for r in all_results if "dist_overhead_pct" in r]
+        if sel_dists:
+            print(f"\n--- SELECTOR vs EXPERT (travel distance) ---")
+            print_stats("Selector dist", sel_dists)
+            print_stats("Expert dist", exp_dists)
+            print_stats("Overhead %", overheads)
+            order_match = sum(1 for r in all_results
+                              if r.get("visit_order") == r.get("expert_order"))
+            print(f"  Exact order match: {order_match}/{len(all_results)} "
+                  f"({100*order_match/max(len(all_results),1):.1f}%)")
 
         print(f"{'='*70}")
 
@@ -356,6 +381,13 @@ def main():
             "delivered_per_ep": delivered_per_ep,
             "time_per_ep": time_per_ep,
             "steps_per_ep": steps_per_ep,
+            "pick_best_errs": pick_best_errs,
+            "pick_final_errs": pick_final_errs,
+            "drop_best_errs": drop_best_errs,
+            "drop_final_errs": drop_final_errs,
+            "selector_dists": sel_dists,
+            "expert_dists": exp_dists,
+            "dist_overheads_pct": overheads,
             "per_episode": [],
         }
         for ep_i, r in enumerate(all_results):
@@ -367,6 +399,10 @@ def main():
                 "total_time": r.get("total_time", 0.0),
                 "total_steps": r.get("total_steps", 0),
                 "visit_order": r.get("visit_order", []),
+                "expert_order": r.get("expert_order", []),
+                "selector_dist": r.get("selector_dist"),
+                "expert_dist": r.get("expert_dist"),
+                "dist_overhead_pct": r.get("dist_overhead_pct"),
                 "per_ball": r.get("per_ball", []),
             })
 

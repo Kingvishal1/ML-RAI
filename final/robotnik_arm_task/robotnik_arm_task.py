@@ -571,7 +571,8 @@ def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                                         drop_zones=None,
                                         ball_zone_assignments=None,
                                         torque_noise_factory=None,
-                                        per_target_timeout=None):
+                                        per_target_timeout=None,
+                                        init_ee_pos=None):
     """Expert multi-drop-zone pick-and-place episode.
 
     Each ball is assigned to one of NUM_DROP_ZONES drop zones. After delivering
@@ -709,14 +710,33 @@ def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         if per_target_timeout is not None:
             os.environ["ROBOENV_MAX_STEPS"] = str(old_max)
 
+        # Compute EE accuracy from trajectory data
+        pick_ee_errs = np.linalg.norm(data_nav_ball["ee_error"], axis=1) if len(data_nav_ball["ee_error"]) else np.array([])
+        pick_best_err = float(pick_ee_errs.min()) if len(pick_ee_errs) else None
+        pick_final_err = float(pick_ee_errs[-1]) if len(pick_ee_errs) else None
+
+        drop_best_err = drop_final_err = drop_dist_val = None
+        delivered = False
+        if data_nav_drop is not None:
+            drop_ee_errs = np.linalg.norm(data_nav_drop["ee_error"], axis=1) if len(data_nav_drop["ee_error"]) else np.array([])
+            drop_best_err = float(drop_ee_errs.min()) if len(drop_ee_errs) else None
+            drop_final_err = float(drop_ee_errs[-1]) if len(drop_ee_errs) else None
+            drop_dist_val = drop_dist
+            delivered = drop_dist < GRIP_TOLERANCE
+
         per_ball_results.append({
             "slot": chosen_idx,
             "ball_pos": ball_pos.tolist(),
             "drop_zone_idx": ball_zone_assignments[chosen_idx],
             "drop_zone_pos": assigned_drop.tolist(),
             "gripped": gripped,
-            "delivered": gs.is_delivered,
+            "delivered": delivered,
             "grip_dist": grip_dist,
+            "drop_dist": drop_dist_val,
+            "pick_best_err": pick_best_err,
+            "pick_final_err": pick_final_err,
+            "drop_best_err": drop_best_err,
+            "drop_final_err": drop_final_err,
             "nav_ball_time": data_nav_ball["final_time"],
             "nav_drop_time": data_nav_drop["final_time"] if data_nav_drop else 0.0,
         })
@@ -725,7 +745,40 @@ def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         if data_nav_drop is not None:
             all_target_data.append(data_nav_drop)
 
-        print(f"    Ball {chosen_idx}: gripped={gripped}  delivered={gs.is_delivered}")
+        print(f"    Ball {chosen_idx}: gripped={gripped}  delivered={delivered}")
+
+        # --- Arm reset: move arm back to home EE position between targets ---
+        if remaining and init_ee_pos is not None:
+            base_pos_now = np.array(sim.GetBasePosition())
+            base_ori_now = np.array(sim.GetBaseOrientation())
+            bearing_now = quaternion2bearing(base_ori_now[3], base_ori_now[0],
+                                            base_ori_now[1], base_ori_now[2])
+            c, s = np.cos(bearing_now), np.sin(bearing_now)
+            home_ee = base_pos_now.copy()
+            home_ee[0] += c * init_ee_pos[0] - s * init_ee_pos[1]
+            home_ee[1] += s * init_ee_pos[0] + c * init_ee_pos[1]
+            home_ee[2] = init_ee_pos[2]
+            print(f"    Resetting arm to home EE: {np.round(home_ee, 3)}")
+
+            old_max_reset = int(os.environ.get("ROBOENV_MAX_STEPS", "40000"))
+            os.environ["ROBOENV_MAX_STEPS"] = "5000"
+            import robotnik_arm_task as _self
+            _orig_max = _self.max_steps
+            _self.max_steps = 5000
+
+            data_reset = run_simulation_loop(
+                sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                np.array(sim.GetMotorAngles(0)), target_finger_angles,
+                lower_limits, upper_limits,
+                target_ee_pos=home_ee,
+            )
+            episode_time += data_reset["final_time"]
+
+            _self.max_steps = _orig_max
+            os.environ["ROBOENV_MAX_STEPS"] = str(old_max_reset)
+
+            reset_err = np.linalg.norm(data_reset["final_ee_pos"] - home_ee)
+            print(f"    Arm reset done (err={reset_err:.4f}m)")
 
     # --- Combine trajectory data ---
     combined_data = _combine_trajectory_data(all_target_data)

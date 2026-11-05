@@ -600,6 +600,10 @@ def _pick_and_place_one_ball(sim, dyn_model, ee_frame_id, shoulder_frame_id,
         "ok": result_drop.get("ok", True),
         "gripped": True, "delivered": delivered,
         "grip_dist": grip_dist, "drop_dist": drop_dist,
+        "pick_best_err": result_ball.get("best_err"),
+        "pick_final_err": result_ball.get("final_err"),
+        "drop_best_err": result_drop.get("best_err"),
+        "drop_final_err": result_drop.get("final_err"),
         "steps": total_steps, "time": total_time,
     }
 
@@ -661,6 +665,7 @@ def run_pick_and_place_sim(args, target_ee_positions, device,
     visit_order = []
     total_steps = 0
     total_time = 0.0
+    robot_start_pos = read_sensors(sim)["base_pos"]
 
     while remaining:
         # Select next ball
@@ -713,9 +718,30 @@ def run_pick_and_place_sim(args, target_ee_positions, device,
     # Summary
     n_gripped = sum(1 for r in per_ball_results if r.get("gripped", False))
     n_delivered = sum(1 for r in per_ball_results if r.get("delivered", False))
+
+    # Selector travel distance: sum of XY hops for actual visit order
+    def _travel_distance(order, start_pos):
+        dist = 0.0
+        pos = np.array(start_pos[:2])
+        for idx in order:
+            dist += np.linalg.norm(pos - all_targets[idx, :2])
+            dz = drop_zones[ball_zone_assignments[idx]]
+            dist += np.linalg.norm(all_targets[idx, :2] - dz[:2])
+            pos = dz[:2].copy()
+        return dist
+
+    selector_dist = _travel_distance(visit_order, robot_start_pos)
+    _, expert_order = shortest_path_expert(
+        robot_start_pos, all_targets, set(range(n_balls)),
+        drop_zones, ball_zone_assignments)
+    expert_dist = _travel_distance(expert_order, robot_start_pos)
+    dist_overhead = 100.0 * (selector_dist - expert_dist) / max(expert_dist, 1e-6)
+
     print(f"\n{'='*60}")
     print(f"PnP complete: {n_gripped}/{n_balls} gripped, {n_delivered}/{n_balls} delivered")
-    print(f"Visit order: {visit_order}")
+    print(f"Visit order: {visit_order}  (expert: {expert_order})")
+    print(f"Selector travel: {selector_dist:.2f}m  Expert: {expert_dist:.2f}m  "
+          f"Overhead: {dist_overhead:+.1f}%")
     zone_counts = {}
     for r in per_ball_results:
         zi = r.get("drop_zone_idx", 0)
@@ -735,7 +761,11 @@ def run_pick_and_place_sim(args, target_ee_positions, device,
         "balls_delivered": n_delivered,
         "n_balls": n_balls,
         "visit_order": visit_order,
+        "expert_order": expert_order,
         "ball_zone_assignments": ball_zone_assignments,
+        "selector_dist": selector_dist,
+        "expert_dist": expert_dist,
+        "dist_overhead_pct": dist_overhead,
         "total_steps": total_steps,
         "total_time": total_time,
         "per_ball": per_ball_results,
@@ -824,7 +854,7 @@ def main():
     # --- Multi-target pick-and-place ---
     if args.pick_and_place:
         sel_model = sel_mean = sel_std = None
-        use_expert_selector = args.selector_checkpoint is None
+        use_expert_selector = not args.selector_checkpoint
         if args.selector_checkpoint:
             sel_model, sel_mean, sel_std = load_selector(args.selector_checkpoint, device=device)
             print(f"Selector: {args.selector_checkpoint}")
