@@ -1,8 +1,0 @@
-{
-  "type": "source_only_handoff",
-  "working_baseline": "expert approach/grasp/carry with guarded ground-place source update; rollout pending",
-  "student_policy": "old at-height release flow; not ground-placement ready; weights require real Ubuntu training",
-  "collision": "LiDAR teammate implements risk detection and avoidance commands; arbitration contract included",
-  "base_arm_pretrained_weights_in_source_zip": false,
-  "grasp_pretrained_weights_in_source_zip": true
-}
