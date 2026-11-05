@@ -197,6 +197,69 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, FIXED_FINGER_ANGLES)
     add_target_visual(client, target_ee_pos)
+        # ============================================
+    # PHYSICAL BALL AT THE TARGET POSITION
+    # ============================================
+
+    p = sim.GetPyBulletClient()
+
+    ball_radius = 0.03       # 3 cm radius
+    ball_mass = 0.05         # 50 grams
+    ball_position = target_ee_pos.tolist()
+
+    # Thin support so the ball stays at the target height
+    support_height = ball_position[2] - ball_radius
+
+    support_collision = p.createCollisionShape(
+        p.GEOM_CYLINDER,
+        radius=0.012,
+        height=support_height
+    )
+
+    support_visual = p.createVisualShape(
+        p.GEOM_CYLINDER,
+        radius=0.012,
+        length=support_height,
+        rgbaColor=[0.5, 0.5, 0.5, 1]
+    )
+
+    p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=support_collision,
+        baseVisualShapeIndex=support_visual,
+        basePosition=[
+            ball_position[0],
+            ball_position[1],
+            support_height / 2
+        ]
+    )
+
+    # Create the red ball
+    ball_collision = p.createCollisionShape(
+        p.GEOM_SPHERE,
+        radius=ball_radius
+    )
+
+    ball_visual = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=ball_radius,
+        rgbaColor=[1, 0, 0, 1]
+    )
+
+    ball_id = p.createMultiBody(
+        baseMass=ball_mass,
+        baseCollisionShapeIndex=ball_collision,
+        baseVisualShapeIndex=ball_visual,
+        basePosition=ball_position
+    )
+
+    p.changeDynamics(
+        ball_id,
+        -1,
+        lateralFriction=1.2
+    )
+
+    print(f"Red ball created at {ball_position}")
 
     dyn_model, ee_frame_id, shoulder_frame_id, init_joint_angles, init_ee_pos, \
         lower_limits, upper_limits = setup_kinematics(sim, conf_file_name, cur_dir)

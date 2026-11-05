@@ -37,6 +37,7 @@ from activations import LEGACY_ACTIVATION
 from candidate_bc_policy import CandidatePolicy
 from learned_release_student import LearnedReleaseStudent
 from placement_policy import placement_features
+from learned_return_home_policy import LearnedReturnHomePolicy
 from ground_placement_control import BallCartesianLoweringPlanner
 from reachability_feedback import select_base_adjustment, wheel_command_for_displacement
 from drop_zone_control import CircularDropZone, draw_drop_zone
@@ -319,6 +320,12 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     print("Task guards, joint tracking and physical success checks remain programmed.")
     print("New candidate policies require successful closed-loop evaluation.")
 
+    return_home_policy = (LearnedReturnHomePolicy.load(args.return_home_checkpoint)
+                          if args.return_home_controller == "bc" else None)
+    print(f"RETURN_HOME_CONTROLLER={args.return_home_controller} "
+          f"checkpoint={args.return_home_checkpoint if return_home_policy else 'none'}")
+    return_home_demo_obs = []
+    return_home_demo_actions = []
     sim, client, rid, conf_file_name, cur_dir = setup_simulation()
     target_finger_angles = configure_gripper_fingers(sim, client, rid, np.array(FIXED_FINGER_ANGLES, dtype=float, copy=True))
     # V4.1: DO NOT add_target_visual here. V4 created a second target-marker
@@ -1049,9 +1056,27 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                         ground_last_servo_update = current_time
                 arm_hold_target = ground_lower_target_q
             elif grasp_state == "return_home":
-                # Only after ball detachment and stable physical ground support.
-                # Closed-loop joint servo; do not reset/teleport joint states.
-                arm_hold_target = original_arm_home_q
+                # Only after ball detachment and verified stable ground support.
+                # In BC mode, the neural policy supplies every homeward setpoint.
+                # Home configuration is a GOAL observation, not a scripted action.
+                if return_home_policy is not None:
+                    return_home_delta = return_home_policy.predict_delta(
+                        q_mes[4:11], qd_mes[4:11], original_arm_home_q)
+                    arm_hold_target = q_mes[4:11] + return_home_delta
+                    if step % 500 == 0:
+                        print(f"V21_LEARNED_RETURN_ACTION t={current_time:.2f}s "
+                              f"network_delta={np.round(return_home_delta,3).tolist()} "
+                              "teacher_override=False", flush=True)
+                else:
+                    arm_hold_target = original_arm_home_q
+                if args.return_home_record_npz:
+                    # Explicit expert-only collection; never mix student actions
+                    # into an expert-labelled dataset.
+                    if return_home_policy is None and step % 5 == 0:
+                        return_home_demo_obs.append(np.concatenate([
+                            original_arm_home_q - q_mes[4:11], qd_mes[4:11]]))
+                        return_home_demo_actions.append(np.clip(
+                            original_arm_home_q - q_mes[4:11], -0.15, 0.15))
             elif (grasp_state == "release_open" and args.place_on_ground
                   and ground_lower_target_q is not None):
                 # Keep the wrist fixed at the verified placement pose until
@@ -1076,7 +1101,8 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                           f"mean_joint_speed={np.mean(np.abs(qd_mes[4:11])):.4f} "
                           f"force_limit_Nm={args.placement_servo_force:.1f} "
                           f"position_gain={args.placement_servo_position_gain:.2f} "
-                          "arm_setpoints=LEARNED network_source=TRUE", flush=True)
+                          f"arm_setpoints={'LEARNED' if grasp_state != 'return_home' or return_home_policy is not None else 'EXPERT'} "
+                          f"network_source={grasp_state != 'return_home' or return_home_policy is not None}", flush=True)
             else:
                 torque_arm = np.clip(
                     torque_arm + 18.0 * (arm_hold_target - q_mes[4:11]) - 2.5 * qd_mes[4:11],
@@ -1853,7 +1879,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                       f"max_joint_error_rad={joint_error:.3f} "
                       f"max_joint_speed_rad_s={joint_speed:.3f} "
                       f"joint_error_vector_rad={np.round(q_mes[4:11]-original_arm_home_q,3).tolist()} "
-                      "motor_mode=POSITION_SERVO")
+                      f"motor_mode=POSITION_SERVO source={args.return_home_controller}")
             if current_time-return_home_started_at >= args.return_home_timeout:
                 print(f"V19_ARM_RETURN_TIMEOUT max_joint_error_rad={joint_error:.3f}; "
                       "ball release result remains independently verified")
@@ -2037,6 +2063,20 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
     print(f"Carry failure reason: {carry_fail_reason}")
     print(f"Release failure reason: {release_failure_reason}")
     print("Policy outputs are tracked by programmed joint control and guarded by physics checks.")
+    if args.return_home_record_npz:
+        if return_home_policy is not None:
+            raise RuntimeError("Cannot record expert return-home labels from a learned rollout")
+        record_path = Path(args.return_home_record_npz)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        with record_path.open('xb') as output:
+            np.savez_compressed(output,
+                obs=np.asarray(return_home_demo_obs, dtype=np.float32).reshape(-1, 14),
+                action_delta=np.asarray(return_home_demo_actions, dtype=np.float32).reshape(-1, 7),
+                source=np.asarray('EXPERT_RETURN_HOME_SERVO'),
+                successful=np.asarray(return_home_success))
+        print(f"V21_RETURN_HOME_EXPERT_RECORD path={record_path} "
+              f"samples={len(return_home_demo_obs)} "
+              f"verified_success={return_home_success}")
     if args.record_expert_npz and args.carry_controller == 'expert':
         with Path(args.record_expert_npz).open('xb') as output:
             np.savez_compressed(output,
@@ -2227,6 +2267,12 @@ def main():
                         help="Minimum ball height allowing a physical base correction during placement")
     parser.add_argument("--reach_base_adjust_timeout", type=float, default=18.0,
                         help="Timeout for each short base correction (s)")
+    parser.add_argument("--return_home_controller", choices=["expert", "bc"], default="expert",
+                        help="Expert only for collecting demonstration; bc runs trained neural policy")
+    parser.add_argument("--return_home_checkpoint", default=None,
+                        help="Trained neural return-home checkpoint; required for bc")
+    parser.add_argument("--return_home_record_npz", default=None,
+                        help="Record expert return-home states/actions for subsequent training; never BC")
     parser.add_argument("--return_home_timeout", type=float, default=24.0,
                         help="Maximum time to return arm to its recorded initial joint posture (s)")
     parser.add_argument("--return_home_joint_tolerance", type=float, default=0.075,
@@ -2348,6 +2394,10 @@ def main():
         parser.error('--carry_controller bc requires --carry_checkpoint')
     if args.placement_controller == 'bc' and (not args.placement_checkpoint or not args.place_on_ground):
         parser.error('--placement_controller bc requires --placement_checkpoint and --place_on_ground')
+    if args.return_home_controller == 'bc' and not args.return_home_checkpoint:
+        parser.error('--return_home_controller bc requires --return_home_checkpoint')
+    if args.return_home_record_npz and args.return_home_controller != 'expert':
+        parser.error('Expert demonstrations cannot be recorded from a learned return-home policy')
     if args.record_expert_npz and args.placement_controller != 'expert':
         parser.error('Student predictions cannot be recorded as expert labels')
     if args.record_expert_npz and args.carry_controller != "expert":
