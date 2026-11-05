@@ -118,6 +118,11 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
     arm_step = 0
     rng = np.random.RandomState()
 
+    # Stop once target is reached and held for 1s
+    HOLD_TIME = 1.0
+    REACH_THRESH = 0.01  # m
+    in_goal_since = None
+
     while step < args.max_steps:
         # ---- Sense ----
         try:
@@ -317,6 +322,16 @@ def collect_dagger_episode(args, target_ee_pos, target_id,
 
         current_time += time_step
         step += 1
+
+        # Stop early once target is reached and held
+        if phase == "arm" and ee_dist_error < REACH_THRESH:
+            if in_goal_since is None:
+                in_goal_since = current_time
+            elif current_time - in_goal_since >= HOLD_TIME:
+                print(f"  Target reached and held at t={current_time:.2f}s (err={ee_dist_error:.4f}m)")
+                break
+        else:
+            in_goal_since = None
 
         if step % 2000 == 0:
             print(f"  t={current_time:.2f}s [{phase}] ee_err={ee_dist_error:.4f}m  "

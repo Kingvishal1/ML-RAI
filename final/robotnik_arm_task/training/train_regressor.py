@@ -69,6 +69,8 @@ def main():
                         help="Number of epochs without improvement before early stopping (default: 20)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
+    parser.add_argument("--finetune", type=str, default=None,
+                        help="Path to existing .pt checkpoint to fine-tune from (loads weights before training)")
     args = parser.parse_args()
 
     # --- Load data ---
@@ -93,13 +95,21 @@ def main():
     print(f"Train: {X_train.shape[0]}  Val: {X_val.shape[0]}")
 
     # --- Normalisation (input + output) ---
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0) + 1e-8
+    # When fine-tuning, use the pretrained model's normalization stats
+    if args.finetune:
+        finetune_ckpt = torch.load(args.finetune, map_location="cpu", weights_only=False)
+        mean = np.array(finetune_ckpt["input_mean"])
+        std = np.array(finetune_ckpt["input_std"])
+        label_mean = np.array(finetune_ckpt["label_mean"])
+        label_std = np.array(finetune_ckpt["label_std"])
+        print(f"Using normalization stats from pretrained checkpoint")
+    else:
+        mean = X_train.mean(axis=0)
+        std = X_train.std(axis=0) + 1e-8
+        label_mean = y_train.mean(axis=0)
+        label_std = y_train.std(axis=0) + 1e-8
     X_train_norm = (X_train - mean) / std
     X_val_norm = (X_val - mean) / std
-
-    label_mean = y_train.mean(axis=0)
-    label_std = y_train.std(axis=0) + 1e-8
     y_train_norm = (y_train - label_mean) / label_std
     y_val_norm = (y_val - label_mean) / label_std
     print(f"Label stats: mean={np.round(label_mean, 4)}  std={np.round(label_std, 4)}")
@@ -234,6 +244,13 @@ def main():
 
     # --- Training (shared trainer in regressors.py) ---
     regressor = get_regressor(args.model)()
+
+    # Load pretrained weights for fine-tuning
+    pretrained_state = None
+    if args.finetune:
+        pretrained_state = finetune_ckpt["model_state_dict"]
+        print(f"Fine-tuning from: {args.finetune}")
+
     metrics = regressor.fit(
         X_train_norm, y_train_norm, X_val_norm, y_val_norm,
         epochs=args.epochs,
@@ -250,6 +267,7 @@ def main():
         num_workers=args.num_workers,
         device=device,
         on_epoch=on_epoch,
+        pretrained_state=pretrained_state,
     )
 
     # Print param count from the actual trained model

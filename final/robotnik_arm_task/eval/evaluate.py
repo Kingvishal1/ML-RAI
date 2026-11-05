@@ -17,8 +17,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
+import time as _time
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _root)
@@ -40,11 +42,11 @@ from robotnik_arm_task import (
 )
 
 
-def generate_targets(n, seed=42):
+def generate_targets(n, seed=50):
     rng = np.random.default_rng(seed)
     xs = rng.uniform(-5, 5, n)
     ys = rng.uniform(-5, 5, n)
-    zs = rng.uniform(0.2, 1.0, n)
+    zs = rng.uniform(0.5, 1.0, n)
     return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
 
 
@@ -76,7 +78,8 @@ def main():
                         help="Max sim steps (default: 100000 ≈ 100s at 1ms timestep)")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--mps", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (default: random)")
     parser.add_argument("--base_only", action="store_true",
                         help="Only evaluate base phase (stop at phase switch)")
     parser.add_argument("--arm_only", action="store_true",
@@ -100,15 +103,26 @@ def main():
                         help="Evaluate pick-and-place mode (multi-drop-zone)")
     parser.add_argument("--xy_range", type=float, default=5.0,
                         help="XY workspace half-extent for target/zone generation (default: 5.0)")
-    parser.add_argument("--multi_target_seed", type=int, default=42,
+    parser.add_argument("--multi_target_seed", type=int, default=52,
                         help="Random seed for target generation (default: 42)")
+    parser.add_argument("--expert", action="store_true",
+                        help="Use expert controllers instead of learned policies (no checkpoints needed)")
     args = parser.parse_args()
+
+    if args.seed is None:
+        args.seed = int(np.random.default_rng().integers(0, 2**31))
+    print(f"Seed: {args.seed}")
 
     # Determine mode
     split_mode = args.base_checkpoint is not None and args.arm_checkpoint is not None
     single_mode = False
     base_only = args.base_only
     arm_only = args.arm_only
+
+    if args.expert:
+        # Expert mode doesn't need checkpoints; set split_mode so the plumbing works
+        split_mode = True
+        print("Mode: EXPERT controllers (no learned policies)")
 
     if base_only and not args.base_checkpoint:
         parser.error("--base_only requires --base_checkpoint")
@@ -126,8 +140,8 @@ def main():
         if not args.base_checkpoint:
             args.base_checkpoint = None
 
-    if not split_mode and not args.selector_only:
-        parser.error("Specify --base_checkpoint and --arm_checkpoint")
+    if not split_mode and not args.selector_only and not args.expert:
+        parser.error("Specify --base_checkpoint and --arm_checkpoint (or use --expert)")
 
     # Load policies
     import torch
@@ -138,9 +152,9 @@ def main():
     else:
         device = "cpu"
 
-    policy_kwargs = dict(device=device)
+    policy_kwargs = {}
 
-    if split_mode:
+    if split_mode and not args.expert:
         if args.base_checkpoint:
             base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
                 load_policy(args.base_checkpoint, device=device)
@@ -181,7 +195,7 @@ def main():
 
         for ep in range(args.num_episodes):
             targets = np.array([[rng.uniform(-xy_r, xy_r), rng.uniform(-xy_r, xy_r),
-                                 rng.uniform(0.2, 1.0)]
+                                 rng.uniform(0.5, 1.0)]
                                 for _ in range(n_per_ep)])
 
             robot_pos = np.array([0.0, 0.0, 0.0])
@@ -280,8 +294,14 @@ def main():
 
         for ep in range(args.num_episodes):
             n = args.num_targets_per_episode
-            targets = [np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
-                        for _ in range(n)]
+            MIN_TARGET_DIST = 1.5  # m, minimum XY distance from origin
+            targets = []
+            for _ in range(n):
+                while True:
+                    t = np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.5, 1.0)])
+                    if np.linalg.norm(t[:2]) >= MIN_TARGET_DIST:
+                        break
+                targets.append(t)
             print(f"\n[Episode {ep+1}/{args.num_episodes}]")
 
             mdz_zones = generate_random_drop_zones(rng)
@@ -373,6 +393,123 @@ def main():
                 print(f"(Compare visit order distance vs optimal multi-drop TSP)")
 
             print(f"{'='*70}")
+
+            # --- Save metrics to JSON ---
+            timestamp = _time.strftime("%Y%m%d_%H%M%S")
+            out_dir = os.path.join(os.path.dirname(__file__), "results")
+            os.makedirs(out_dir, exist_ok=True)
+            json_path = os.path.join(out_dir, f"pnp_eval_{timestamp}.json")
+
+            summary = {
+                "timestamp": timestamp,
+                "seed": args.seed,
+                "num_episodes": args.num_episodes,
+                "num_targets_per_episode": args.num_targets_per_episode,
+                "base_checkpoint": args.base_checkpoint,
+                "arm_checkpoint": args.arm_checkpoint,
+                "expert": args.expert,
+                "grip_rate": total_gripped / max(total_balls, 1),
+                "delivery_rate": total_delivered / max(total_balls, 1),
+                "full_delivery_rate": full_deliver / max(args.num_episodes, 1),
+                "total_gripped": total_gripped,
+                "total_delivered": total_delivered,
+                "total_balls": total_balls,
+                "grip_dists": all_grip_dists,
+                "drop_dists": all_drop_dists,
+                "gripped_per_ep": gripped_per_ep,
+                "delivered_per_ep": delivered_per_ep,
+                "time_per_ep": time_per_ep,
+                "steps_per_ep": steps_per_ep,
+                "per_episode": [],
+            }
+            for ep_i, r in enumerate(all_results):
+                summary["per_episode"].append({
+                    "episode": ep_i,
+                    "balls_gripped": r.get("balls_gripped", 0),
+                    "balls_delivered": r.get("balls_delivered", 0),
+                    "n_balls": r.get("n_balls", 0),
+                    "total_time": r.get("total_time", 0.0),
+                    "total_steps": r.get("total_steps", 0),
+                    "visit_order": r.get("visit_order", []),
+                    "per_ball": r.get("per_ball", []),
+                })
+
+            with open(json_path, "w") as f:
+                json.dump(summary, f, indent=2, default=float)
+            print(f"\nMetrics saved to: {json_path}")
+
+            # --- Generate chart ---
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+                fig.suptitle(f"Pick-and-Place Evaluation  ({args.num_episodes} episodes, "
+                             f"{total_balls} balls)", fontsize=14, fontweight="bold")
+
+                # 1. Success rates
+                ax = axes[0]
+                grip_pct = 100 * total_gripped / max(total_balls, 1)
+                del_pct = 100 * total_delivered / max(total_balls, 1)
+                full_pct = 100 * full_deliver / max(args.num_episodes, 1)
+                bars = ax.bar(["Grip", "Delivery", "Full Episode"],
+                              [grip_pct, del_pct, full_pct],
+                              color=["steelblue", "seagreen", "mediumpurple"],
+                              edgecolor="white", width=0.5)
+                for bar, val in zip(bars, [grip_pct, del_pct, full_pct]):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                            f"{val:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=12)
+                ax.set_ylim(0, 110)
+                ax.set_ylabel("Success Rate (%)")
+                ax.set_title("Success Rates")
+                mean_del = np.mean(delivered_per_ep) if delivered_per_ep else 0
+                ax.text(0.5, -0.12,
+                        f"Mean delivered/ep: {mean_del:.2f}/{args.num_targets_per_episode}",
+                        ha="center", transform=ax.transAxes, fontsize=10)
+
+                # 2. Distance summary (grip & drop mean/p90/max)
+                ax = axes[1]
+                labels, vals, colors = [], [], []
+                if all_grip_dists:
+                    ga = np.array(all_grip_dists)
+                    labels += ["Grip\nmean", "Grip\np90"]
+                    vals += [ga.mean(), np.percentile(ga, 90)]
+                    colors += ["steelblue"] * 2
+                if all_drop_dists:
+                    da = np.array(all_drop_dists)
+                    labels += ["Drop\nmean", "Drop\np90"]
+                    vals += [da.mean(), np.percentile(da, 90)]
+                    colors += ["seagreen"] * 2
+                if vals:
+                    bars = ax.bar(labels, vals, color=colors, edgecolor="white", width=0.5)
+                    for bar, val in zip(bars, vals):
+                        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
+                                f"{val:.3f}", ha="center", va="bottom", fontsize=9)
+                    ax.set_ylabel("Distance (m)")
+                    ax.set_title("Grip & Drop Distance")
+
+                # 3. Timing summary
+                ax = axes[2]
+                if time_per_ep:
+                    ta = np.array(time_per_ep)
+                    t_labels = ["Mean", "Median", "P90", "Max"]
+                    t_vals = [ta.mean(), np.median(ta), np.percentile(ta, 90), ta.max()]
+                    bars = ax.bar(t_labels, t_vals, color="coral", edgecolor="white", width=0.5)
+                    for bar, val in zip(bars, t_vals):
+                        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                                f"{val:.1f}s", ha="center", va="bottom", fontsize=9)
+                    ax.set_ylabel("Time (s)")
+                    ax.set_title("Episode Time")
+
+                plt.tight_layout()
+                chart_path = os.path.join(out_dir, f"pnp_eval_{timestamp}.png")
+                plt.savefig(chart_path, dpi=150)
+                plt.close()
+                print(f"Charts saved to: {chart_path}")
+            except ImportError:
+                print("matplotlib not available, skipping charts")
+
             return
 
         print(f"{'='*70}")

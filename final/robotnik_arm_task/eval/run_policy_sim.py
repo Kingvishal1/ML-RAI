@@ -6,6 +6,7 @@ with expert PD arm-hold during base navigation.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -291,19 +292,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 switch_time = current_time
                 base_xy_at_switch = base_pos[:2].copy()
                 wheel_lock_pos = q_mes[0:4].copy()
-                # TODO: Remove base lock constraint — no controller code allowed in final version.
-                #       For now, used to test arm policy without base drift.
-                _p = sim.GetPyBulletClient()
-                _base_pos_ori = _p.getBasePositionAndOrientation(sim.bot[0].bot_pybullet)
-                base_lock_cid = _p.createConstraint(
-                    sim.bot[0].bot_pybullet, -1, -1, -1, _p.JOINT_FIXED,
-                    [0, 0, 0], [0, 0, 0], list(_base_pos_ori[0]),
-                    parentFrameOrientation=[0, 0, 0, 1],
-                    childFrameOrientation=list(_base_pos_ori[1]))
                 print(f">>> Phase switch: base -> arm at t={current_time:.2f}s  {switch_reason}")
-                if arm_model is None:
-                    # No arm policy (base_only mode) — stop here
-                    break
                 phase = "arm"
 
         # ---- Compute action based on mode/phase ----
@@ -383,7 +372,7 @@ def run_sim(args, target_ee_pos, device, split_mode, single_mode,
                 raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
             torque_arm = np.clip(raw_torque, -20.0, 20.0)
 
-            wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
+            wheel_cmds = np.clip(-200.0 * (q_mes[0:4] - wheel_lock_pos), -20.0, 20.0)
             # Track arm phase metrics
             if ee_dist_error < arm_best_ee:
                 arm_best_ee = ee_dist_error
@@ -546,10 +535,14 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
     """Run one target within a multi-target episode (no sim reset).
 
     This is a simplified version of run_sim() that doesn't create a new sim.
+    When args.expert is set, uses the expert base_controller + arm_controller
+    instead of learned policies.
     """
     import pinocchio as pin
     from simulation_and_control import MotorCommands
     from robotnik_arm_control import quaternion2bearing
+
+    use_expert = getattr(args, "expert", False)
 
     time_step = sim.GetTimeStep()
     current_time = 0.0
@@ -557,44 +550,71 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
 
     best_ee_error = np.inf
     step = 0
-    phase = "base" if split_mode else "single"
     phase_switched = False
     wheel_lock_pos = None
     base_lock_cid = None
 
     HOLD_TIME = 1.0
+    STALL_WINDOW = 10.0       # s with error not changing → stop early
+    STALL_EPSILON = 3e-3      # m, change smaller than this over STALL_WINDOW = stalled
     in_goal_since = None
     held = False
-
-    base_sub_phase = "rotate"
+    arm_phase_start_time = None
+    stall_snapshot_time = None
+    stall_snapshot_error = None
+    base_stall_snapshot_time = None
+    base_stall_snapshot_error = None
+    BASE_STALL_WINDOW = 5.0   # s
+    BASE_STALL_EPSILON = 0.05 # m, base should move at least this much in the window
 
     ee_pos = np.zeros(3)
     ee_dist_error = np.inf
     base_pos = np.array(sim.GetBasePosition())
 
-    # Extract policy components from kwargs
-    model = policy_kwargs.get("model")
-    mean = policy_kwargs.get("mean")
-    std = policy_kwargs.get("std")
-    label_mean = policy_kwargs.get("label_mean")
-    label_std = policy_kwargs.get("label_std")
-
-    base_model = policy_kwargs.get("base_model")
-    base_mean = policy_kwargs.get("base_mean")
-    base_std = policy_kwargs.get("base_std")
-    base_label_mean = policy_kwargs.get("base_label_mean")
-    base_label_std = policy_kwargs.get("base_label_std")
-    base_feature_names = policy_kwargs.get("base_feature_names")
-    has_base_phases = policy_kwargs.get("has_base_phases", True)
-
-    arm_model = policy_kwargs.get("arm_model")
-    arm_mean = policy_kwargs.get("arm_mean")
-    arm_std = policy_kwargs.get("arm_std")
-    arm_label_mean = policy_kwargs.get("arm_label_mean")
-    arm_label_std = policy_kwargs.get("arm_label_std")
-    arm_feature_names = policy_kwargs.get("arm_feature_names")
-
     per_target_max_steps = getattr(args, "per_target_max_steps", args.max_steps)
+
+    if use_expert:
+        from robotnik_arm_control import (
+            base_controller, BaseControllerParams, BaseNavState,
+            arm_controller, ArmControllerParams,
+        )
+        from robotnik_arm_task import compute_base_goal
+
+        base_goal_pos, base_goal_bearing = compute_base_goal(target_ee_pos)
+        base_state = BaseNavState()
+        base_params = BaseControllerParams(nav_timeout=per_target_max_steps * time_step)
+        arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
+        q_init_arm = init_joint_angles[4:11].copy()
+        q_des_arm = q_init_arm.copy()
+        qd_des_arm = np.zeros(7)
+        arm_lower = np.array(lower_limits[4:11])
+        arm_upper = np.array(upper_limits[4:11])
+        phase = "expert"
+    else:
+        phase = "base" if split_mode else "single"
+        base_sub_phase = "rotate"
+
+        # Extract policy components from kwargs
+        model = policy_kwargs.get("model")
+        mean = policy_kwargs.get("mean")
+        std = policy_kwargs.get("std")
+        label_mean = policy_kwargs.get("label_mean")
+        label_std = policy_kwargs.get("label_std")
+
+        base_model = policy_kwargs.get("base_model")
+        base_mean = policy_kwargs.get("base_mean")
+        base_std = policy_kwargs.get("base_std")
+        base_label_mean = policy_kwargs.get("base_label_mean")
+        base_label_std = policy_kwargs.get("base_label_std")
+        base_feature_names = policy_kwargs.get("base_feature_names")
+        has_base_phases = policy_kwargs.get("has_base_phases", True)
+
+        arm_model = policy_kwargs.get("arm_model")
+        arm_mean = policy_kwargs.get("arm_mean")
+        arm_std = policy_kwargs.get("arm_std")
+        arm_label_mean = policy_kwargs.get("arm_label_mean")
+        arm_label_std = policy_kwargs.get("arm_label_std")
+        arm_feature_names = policy_kwargs.get("arm_feature_names")
 
     while step < per_target_max_steps:
         try:
@@ -617,89 +637,114 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
         ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
         ee_dist_error = np.linalg.norm(target_ee_pos - ee_pos)
 
-        tau_gravity_arm = np.zeros(7)
-
         if ee_dist_error < best_ee_error:
             best_ee_error = ee_dist_error
 
-        # Phase transition (split mode)
-        if phase == "base":
-            base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
-            if base_xy_dist < args.base_threshold:
-                phase_switched = True
-                wheel_lock_pos = q_mes[0:4].copy()
-                _p = sim.GetPyBulletClient()
-                _base_pos_ori = _p.getBasePositionAndOrientation(sim.bot[0].bot_pybullet)
-                base_lock_cid = _p.createConstraint(
-                    sim.bot[0].bot_pybullet, -1, -1, -1, _p.JOINT_FIXED,
-                    [0, 0, 0], [0, 0, 0], list(_base_pos_ori[0]),
-                    parentFrameOrientation=[0, 0, 0, 1],
-                    childFrameOrientation=list(_base_pos_ori[1]))
-                print(f"    Phase switch: base -> arm at t={current_time:.2f}s  xy_dist={base_xy_dist:.4f}")
-                if arm_model is None:
-                    break
-                phase = "arm"
+        if phase == "expert":
+            # Expert controllers: simultaneous base nav + arm reach
+            wheel_cmds = base_controller(
+                base_state, base_pos, base_bearing,
+                base_goal_pos, base_goal_bearing, current_time, base_params,
+            )
+            torque_arm, q_des_arm, qd_des_arm = arm_controller(
+                dyn_model, q_pin, q_mes[4:11], qd_mes[4:11],
+                q_des_arm, q_init_arm, target_ee_pos, ee_pos,
+                ee_frame_id, shoulder_frame_id, arm_lower, arm_upper,
+                time_step, arm_params, reach_active=base_state.done,
+            )
+            if base_state.done and arm_phase_start_time is None:
+                arm_phase_start_time = current_time
+                stall_snapshot_time = current_time
+                stall_snapshot_error = ee_dist_error
 
-        if phase == "base":
-            obs_feature_names = [n for n in base_feature_names if n != "phase"] \
-                if has_base_phases else base_feature_names
-            obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
-                                              base_ang_vel, target_ee_pos,
-                                              feature_names=obs_feature_names)
-            if has_base_phases:
-                delta_base = target_ee_pos[:2] - base_pos[:2]
-                heading_to_target = np.arctan2(delta_base[1], delta_base[0])
-                heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
-                                         np.cos(heading_to_target - base_bearing))
-                abs_herr = abs(heading_err)
-                if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
-                    base_sub_phase = "drive"
-                elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
-                    base_sub_phase = "rotate"
-                phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
-                obs_base = np.append(obs_base, phase_val)
+        else:
+            # --- Learned policy path ---
+            tau_gravity_arm = np.zeros(7)
 
-            vw = predict(base_model, base_mean, base_std, obs_base,
-                         device=device,
-                         label_mean=base_label_mean, label_std=base_label_std)
+            # Phase transition (split mode)
+            if phase == "base":
+                base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
+                delta_to_target = target_ee_pos[:2] - base_pos[:2]
+                heading_to_target = np.arctan2(delta_to_target[1], delta_to_target[0])
+                heading_err_switch = abs(np.arctan2(
+                    np.sin(heading_to_target - base_bearing),
+                    np.cos(heading_to_target - base_bearing)))
+                HEADING_TOL_SWITCH = 0.15  # rad (~8.6°)
+                # Skip heading check when target is very close (e.g. arm reset to home)
+                heading_ok = heading_err_switch < HEADING_TOL_SWITCH or base_xy_dist < 0.1
+                if base_xy_dist < args.base_threshold and heading_ok:
+                    phase_switched = True
+                    wheel_lock_pos = q_mes[0:4].copy()
+                    print(f"    Phase switch: base -> arm at t={current_time:.2f}s  xy_dist={base_xy_dist:.4f}  heading_err={np.degrees(heading_err_switch):.1f}°")
+                    if arm_model is None:
+                        break
+                    phase = "arm"
+                    arm_phase_start_time = current_time
+                    stall_snapshot_time = current_time
+                    stall_snapshot_error = ee_dist_error
 
-            if has_base_phases:
-                if base_sub_phase == "rotate":
-                    v_cmd, w_cmd = 0.0, vw[1]
+            if phase == "base":
+                obs_feature_names = [n for n in base_feature_names if n != "phase"] \
+                    if has_base_phases else base_feature_names
+                obs_base = build_base_observation(base_pos, base_bearing, base_lin_vel,
+                                                  base_ang_vel, target_ee_pos,
+                                                  feature_names=obs_feature_names)
+                if has_base_phases:
+                    delta_base = target_ee_pos[:2] - base_pos[:2]
+                    heading_to_target = np.arctan2(delta_base[1], delta_base[0])
+                    heading_err = np.arctan2(np.sin(heading_to_target - base_bearing),
+                                             np.cos(heading_to_target - base_bearing))
+                    abs_herr = abs(heading_err)
+                    if base_sub_phase == "rotate" and abs_herr < args.heading_threshold:
+                        base_sub_phase = "drive"
+                    elif base_sub_phase == "drive" and abs_herr >= args.heading_threshold * 2:
+                        base_sub_phase = "rotate"
+                    phase_val = 0.0 if base_sub_phase == "rotate" else 1.0
+                    obs_base = np.append(obs_base, phase_val)
+
+                vw = predict(base_model, base_mean, base_std, obs_base,
+                             device=device,
+                             label_mean=base_label_mean, label_std=base_label_std)
+
+                if has_base_phases:
+                    if base_sub_phase == "rotate":
+                        v_cmd, w_cmd = 0.0, vw[1]
+                    else:
+                        # Allow gentle steering while driving (like the expert base_controller)
+                        v_cmd = max(vw[0], 0.0)
+                        w_cmd = np.clip(1.5 * heading_err, -0.3, 0.3)
                 else:
-                    v_cmd, w_cmd = max(vw[0], 0.0), 0.0
-            else:
-                v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
-                w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
+                    v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
+                    w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
 
-            v_cmd = np.clip(v_cmd, -0.25, 0.25)
-            w_cmd = np.clip(w_cmd, -1.0, 1.0)
-            lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-            rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
-            wheel_cmds = np.array([rw, lw, lw, rw])
+                v_cmd = np.clip(v_cmd, -0.25, 0.25)
+                w_cmd = np.clip(w_cmd, -1.0, 1.0)
+                lw = (v_cmd - w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+                rw = (v_cmd + w_cmd * WHEEL_BASE_WIDTH / 2) / WHEEL_RADIUS
+                wheel_cmds = np.array([rw, lw, lw, rw])
 
-            if arm_model is not None:
-                obs_arm_hold = build_arm_observation(q_mes, qd_mes, ee_pos, ee_pos,
-                                                     base_pos=base_pos, base_bearing=base_bearing,
-                                                     feature_names=arm_feature_names)
-                torque_arm = predict(arm_model, arm_mean, arm_std, obs_arm_hold,
+                if arm_model is not None:
+                    obs_arm_hold = build_arm_observation(q_mes, qd_mes, ee_pos, ee_pos,
+                                                         base_pos=base_pos, base_bearing=base_bearing,
+                                                         feature_names=arm_feature_names)
+                    torque_arm = predict(arm_model, arm_mean, arm_std, obs_arm_hold,
+                                         device=device,
+                                         label_mean=arm_label_mean, label_std=arm_label_std)
+                    torque_arm = np.clip(torque_arm, -20.0, 20.0)
+                else:
+                    torque_arm = np.zeros(7)
+
+            elif phase == "arm":
+                obs_arm = build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
+                                                base_pos=base_pos, base_bearing=base_bearing,
+                                                feature_names=arm_feature_names)
+                raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
                                      device=device,
                                      label_mean=arm_label_mean, label_std=arm_label_std)
-                torque_arm = np.clip(torque_arm, -20.0, 20.0)
-            else:
-                torque_arm = np.zeros(7)
-
-        elif phase == "arm":
-            obs_arm = build_arm_observation(q_mes, qd_mes, ee_pos, target_ee_pos,
-                                            base_pos=base_pos, base_bearing=base_bearing,
-                                            feature_names=arm_feature_names)
-            raw_torque = predict(arm_model, arm_mean, arm_std, obs_arm,
-                                 device=device,
-                                 label_mean=arm_label_mean, label_std=arm_label_std)
-            if args.arm_damping > 0:
-                raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
-            torque_arm = np.clip(raw_torque, -20.0, 20.0)
-            wheel_cmds = np.clip(-50.0 * (q_mes[0:4] - wheel_lock_pos), -5.0, 5.0)
+                if args.arm_damping > 0:
+                    raw_torque = raw_torque - args.arm_damping * qd_mes[4:11]
+                torque_arm = np.clip(raw_torque, -20.0, 20.0)
+                wheel_cmds = np.clip(-200.0 * (q_mes[0:4] - wheel_lock_pos), -20.0, 20.0)
 
         # Send commands
         torque_fingers = np.zeros(6)
@@ -714,7 +759,8 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
                     "reached": False, "steps": step, "time": current_time}
 
         # Check target reached with hold
-        in_goal = ee_dist_error < REACH_TOLERANCE and current_time > 3.0
+        arm_min_time = (arm_phase_start_time or 0.0) + 4.0
+        in_goal = ee_dist_error < GRIP_TOLERANCE and current_time > arm_min_time
         if in_goal and in_goal_since is None:
             in_goal_since = current_time
         elif not in_goal and in_goal_since is not None:
@@ -723,6 +769,34 @@ def _run_single_target_inline(args, sim, dyn_model, ee_frame_id, shoulder_frame_
             held = True
             print(f"    Target held at t={current_time:.2f}s")
             break
+
+        # Arm stall detection: compare error now vs STALL_WINDOW seconds ago
+        if stall_snapshot_time is not None:
+            if current_time - stall_snapshot_time >= STALL_WINDOW:
+                if abs(ee_dist_error - stall_snapshot_error) < STALL_EPSILON:
+                    print(f"    Arm stalled at t={current_time:.2f}s (best={best_ee_error:.4f}m, "
+                          f"error moved <{STALL_EPSILON*1000:.1f}mm in {STALL_WINDOW:.0f}s)")
+                    break
+                # Reset snapshot for the next window
+                stall_snapshot_time = current_time
+                stall_snapshot_error = ee_dist_error
+
+        # Base stall detection: base XY should move meaningfully over BASE_STALL_WINDOW
+        if phase == "base" and base_sub_phase == "drive":
+            base_xy_dist = np.linalg.norm(base_pos[:2] - target_ee_pos[:2])
+            if base_stall_snapshot_time is None:
+                base_stall_snapshot_time = current_time
+                base_stall_snapshot_error = base_xy_dist
+            elif current_time - base_stall_snapshot_time >= BASE_STALL_WINDOW:
+                if abs(base_xy_dist - base_stall_snapshot_error) < BASE_STALL_EPSILON:
+                    print(f"    Base stalled at t={current_time:.2f}s (xy_dist={base_xy_dist:.4f}m, "
+                          f"moved <{BASE_STALL_EPSILON*100:.0f}cm in {BASE_STALL_WINDOW:.0f}s)")
+                    break
+                base_stall_snapshot_time = current_time
+                base_stall_snapshot_error = base_xy_dist
+        elif phase == "base" and base_sub_phase == "rotate":
+            # Reset stall tracking during rotation — base is turning in place
+            base_stall_snapshot_time = None
 
         if step % 1000 == 0:
             print(f"    t={current_time:.2f}s [{phase}] EE err: {ee_dist_error:.4f}m  best: {best_ee_error:.4f}m")
@@ -950,6 +1024,39 @@ def run_pick_and_place_sim(args, target_ee_positions, device,
         total_steps += result_pick.get("steps", 0)
         total_time += result_pick.get("time", 0.0)
 
+        # --- Arm reset between targets ---
+        # Use the arm policy to move the arm back to its init EE position
+        # so the next target starts from the trained home config.
+        if remaining and result_pick.get("ok", True):
+            _base_pos = np.array(sim.GetBasePosition())
+            _base_ori = np.array(sim.GetBaseOrientation())
+            _bearing = quaternion2bearing(_base_ori[3], _base_ori[0], _base_ori[1], _base_ori[2])
+            # init_ee_pos is the home EE in world frame at sim start (robot at origin, bearing=0).
+            # Rotate it into the current base frame to get the world-frame home target.
+            c, s = np.cos(_bearing), np.sin(_bearing)
+            home_ee_world = _base_pos.copy()
+            home_ee_world[0] += c * init_ee_pos[0] - s * init_ee_pos[1]
+            home_ee_world[1] += s * init_ee_pos[0] + c * init_ee_pos[1]
+            home_ee_world[2] = init_ee_pos[2]
+            print(f"    Resetting arm to home EE: {np.round(home_ee_world, 3)}")
+
+            _saved_max_steps = args.max_steps
+            _saved_base_threshold = getattr(args, "base_threshold", 0.5)
+            args.max_steps = 5000  # limited budget for the reset move
+            args.base_threshold = 999.0  # skip base nav — arm only
+            result_reset = _run_single_target_inline(
+                args, sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                init_joint_angles, target_finger_angles,
+                lower_limits, upper_limits,
+                home_ee_world, device, split_mode, single_mode,
+                **policy_kwargs,
+            )
+            args.max_steps = _saved_max_steps
+            args.base_threshold = _saved_base_threshold
+            total_steps += result_reset.get("steps", 0)
+            total_time += result_reset.get("time", 0.0)
+            print(f"    Arm reset done (err={result_reset.get('best_err', 0):.4f}m)")
+
         per_ball_results.append({
             "slot": chosen_idx,
             "ball_pos": ball_pos.tolist(),
@@ -1029,8 +1136,8 @@ def main():
                         help="Number of targets per episode (default: 3)")
     parser.add_argument("--selector_checkpoint", type=str, default=None,
                         help="Path to trained selector .pt checkpoint (if omitted, uses expert)")
-    parser.add_argument("--multi_target_seed", type=int, default=42,
-                        help="Random seed for generating multi-target positions (default: 42)")
+    parser.add_argument("--multi_target_seed", type=int, default=None,
+                        help="Random seed for generating multi-target positions (default: random)")
     parser.add_argument("--per_target_max_steps", type=int, default=100000,
                         help="Max simulation steps per target (default: 100000)")
     parser.add_argument("--expert", action="store_true",
@@ -1038,6 +1145,10 @@ def main():
     parser.add_argument("--drop_zones", type=float, nargs=9, default=None,
                         metavar=tuple(f"{c}{i}" for i in range(3) for c in "XYZ"),
                         help="9 floats for 3 drop zone positions (default: randomized)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to JSON config file specifying ball positions, drop zones, "
+                             "and assignments (overrides --num_targets_per_episode, --drop_zones, "
+                             "--multi_target_seed)")
     args = parser.parse_args()
 
     # Determine mode
@@ -1052,7 +1163,7 @@ def main():
     else:
         device = "cpu"
 
-    policy_kwargs = dict(device=device)
+    policy_kwargs = {}
 
     base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
         load_policy(args.base_checkpoint, device=device)
@@ -1081,21 +1192,44 @@ def main():
         else:
             print("Selector: expert (shortest-path)")
 
-        rng = np.random.default_rng(args.multi_target_seed)
-        n = args.num_targets_per_episode
-        targets = [np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
-                    for _ in range(n)]
+        seed = args.multi_target_seed if args.multi_target_seed is not None \
+            else np.random.default_rng().integers(0, 2**31)
+        print(f"Multi-target seed: {seed}")
 
-        # Parse or generate drop zones
-        if args.drop_zones:
-            dz_flat = args.drop_zones
-            mdz_zones = [np.array(dz_flat[i*3:(i+1)*3]) for i in range(3)]
+        if args.config:
+            with open(args.config) as f:
+                cfg = json.load(f)
+            targets = [np.array(p) for p in cfg["balls"]]
+            mdz_zones = [np.array(dz) for dz in cfg["zones"]]
+            ball_zone_assignments = cfg.get("assignments")
+            if ball_zone_assignments is None:
+                rng_mdz = np.random.default_rng(seed + 3000)
+                ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones)))
+                                         for _ in range(len(targets))]
+            print(f"Loaded config from {args.config}: "
+                  f"{len(targets)} balls, {len(mdz_zones)} zones")
         else:
-            rng_dz = np.random.default_rng(args.multi_target_seed + 1000)
-            mdz_zones = generate_random_drop_zones(rng_dz)
+            rng = np.random.default_rng(seed)
+            n = args.num_targets_per_episode
+            MIN_TARGET_DIST = 1.5  # m, minimum XY distance from origin
+            targets = []
+            for _ in range(n):
+                while True:
+                    t = np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(0.2, 1.0)])
+                    if np.linalg.norm(t[:2]) >= MIN_TARGET_DIST:
+                        break
+                targets.append(t)
 
-        rng_mdz = np.random.default_rng(args.multi_target_seed + 2000)
-        ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones))) for _ in range(n)]
+            # Parse or generate drop zones
+            if args.drop_zones:
+                dz_flat = args.drop_zones
+                mdz_zones = [np.array(dz_flat[i*3:(i+1)*3]) for i in range(3)]
+            else:
+                rng_dz = np.random.default_rng(seed + 1200)
+                mdz_zones = generate_random_drop_zones(rng_dz)
+
+            rng_mdz = np.random.default_rng(seed + 20030)
+            ball_zone_assignments = [int(rng_mdz.integers(0, len(mdz_zones))) for _ in range(n)]
 
         run_pick_and_place_sim(
             args, targets, device=device,
@@ -1117,7 +1251,7 @@ def main():
     # Compute base_threshold from arm geometry
     dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
     if dz < ARM_REACH_LIMIT:
-        base_threshold = 0.75 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
+        base_threshold = 0.85 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
     else:
         base_threshold = 0.3
     args.base_threshold = base_threshold

@@ -162,6 +162,10 @@ class MLPRegressor(BaseRegressor):
         output_dim = y_train.shape[1]
 
         model = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation).to(device)
+        pretrained_state = kwargs.get("pretrained_state", None)
+        if pretrained_state is not None:
+            model.load_state_dict(pretrained_state)
+            print(f"  Loaded pretrained weights ({sum(p.numel() for p in model.parameters())} params)")
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.MSELoss()
         if loss_weights is None:
