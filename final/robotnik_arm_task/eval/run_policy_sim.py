@@ -3,7 +3,7 @@
 
 Two modes:
   1. Single-target: base navigates to a target, arm reaches it.
-  2. Multi-target pick-and-place: selector chooses ball order,
+  2. Multi-target pick-and-drop: selector chooses ball order,
      base+arm pick each ball and deliver to assigned drop zones.
 """
 
@@ -61,6 +61,8 @@ WHEEL_LOCK_LIMIT = 20.0
 
 # Hold time for target-reached check
 HOLD_TIME = 1.0
+
+BASE_THRESHOLD = 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +158,7 @@ def compute_base_threshold(target_ee_pos):
     """Base XY distance threshold for phase switching given a target height."""
     dz = abs(target_ee_pos[2] - SHOULDER_HEIGHT)
     if dz < ARM_REACH_LIMIT:
-        return 0.85 * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
+        return BASE_THRESHOLD * np.sqrt(ARM_REACH_LIMIT**2 - dz**2)
     return 0.3
 
 
@@ -271,7 +273,7 @@ def run_single_target(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     ee_pos = np.zeros(3)
     ee_dist_error = np.inf
 
-    heading_threshold = getattr(args, "heading_threshold", 0.15)
+    heading_threshold = 0.15
     headless = getattr(args, "headless", True)
 
     # --- Policy setup ---
@@ -281,7 +283,6 @@ def run_single_target(sim, dyn_model, ee_frame_id, shoulder_frame_id,
     base_label_mean = policy_kwargs.get("base_label_mean")
     base_label_std = policy_kwargs.get("base_label_std")
     base_feature_names = policy_kwargs.get("base_feature_names")
-    has_base_phases = policy_kwargs.get("has_base_phases", True)
 
     arm_model = policy_kwargs.get("arm_model")
     arm_mean = policy_kwargs.get("arm_mean")
@@ -350,36 +351,30 @@ def run_single_target(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                 stall_snapshot_error = ee_dist_error
 
             if phase == "base":
-                # Base observation
-                obs_names = ([n for n in base_feature_names if n != "phase"]
-                             if has_base_phases else base_feature_names)
+                # Base observation (without phase feature)
+                obs_names = [n for n in base_feature_names if n != "phase"]
                 obs_base = build_base_observation(
                     base_pos, base_bearing, S["base_lin_vel"], S["base_ang_vel"],
                     target_ee_pos, feature_names=obs_names)
 
                 # Rotate/drive sub-phase
-                if has_base_phases:
-                    h_err_signed = heading_error_to(base_pos, base_bearing, target_ee_pos)
-                    abs_herr = abs(h_err_signed)
-                    if base_sub_phase == "rotate" and abs_herr < heading_threshold:
-                        base_sub_phase = "drive"
-                    elif base_sub_phase == "drive" and abs_herr >= heading_threshold * 2:
-                        base_sub_phase = "rotate"
-                    obs_base = np.append(obs_base, 0.0 if base_sub_phase == "rotate" else 1.0)
+                h_err_signed = heading_error_to(base_pos, base_bearing, target_ee_pos)
+                abs_herr = abs(h_err_signed)
+                if base_sub_phase == "rotate" and abs_herr < heading_threshold:
+                    base_sub_phase = "drive"
+                elif base_sub_phase == "drive" and abs_herr >= heading_threshold * 2:
+                    base_sub_phase = "rotate"
+                obs_base = np.append(obs_base, 0.0 if base_sub_phase == "rotate" else 1.0)
 
                 vw = predict(base_model, base_mean, base_std, obs_base,
                              device=device, label_mean=base_label_mean, label_std=base_label_std)
 
                 # Output masking
-                if has_base_phases:
-                    if base_sub_phase == "rotate":
-                        v_cmd, w_cmd = 0.0, vw[1]
-                    else:
-                        v_cmd = max(vw[0], 0.0)
-                        w_cmd = np.clip(1.5 * h_err_signed, -0.3, 0.3)
+                if base_sub_phase == "rotate":
+                    v_cmd, w_cmd = 0.0, vw[1]
                 else:
-                    v_cmd = vw[0] if abs(vw[0]) > 0.02 else 0.0
-                    w_cmd = vw[1] if abs(vw[1]) > 0.05 else 0.0
+                    v_cmd = max(vw[0], 0.0)
+                    w_cmd = np.clip(1.5 * h_err_signed, -0.3, 0.3)
 
                 v_cmd = np.clip(v_cmd, -0.25, 0.25)
                 w_cmd = np.clip(w_cmd, -1.0, 1.0)
@@ -534,9 +529,9 @@ def run_sim(args, target_ee_pos, device, **policy_kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Pick-and-place: single ball cycle
+# Pick-and-drop: single ball cycle
 # ---------------------------------------------------------------------------
-def _pick_and_place_one_ball(sim, dyn_model, ee_frame_id, shoulder_frame_id,
+def _pick_and_drop_one_ball(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                              init_joint_angles, lower_limits, upper_limits,
                              ball_pos, drop_zone, grip_state,
                              device, policy_kwargs, args):
@@ -609,14 +604,14 @@ def _pick_and_place_one_ball(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
 
 # ---------------------------------------------------------------------------
-# Multi-target pick-and-place episode
+# Multi-target pick-and-drop episode
 # ---------------------------------------------------------------------------
-def run_pick_and_place_sim(args, target_ee_positions, device,
+def run_pick_and_drop_sim(args, target_ee_positions, device,
                            drop_zones=None,
                            ball_zone_assignments=None,
                            sel_model=None, sel_mean=None, sel_std=None,
                            use_expert_selector=False, **policy_kwargs):
-    """Run a full multi-ball pick-and-place episode."""
+    """Run a full multi-ball pick-and-drop episode."""
     import pybullet as p
 
     if drop_zones is None:
@@ -688,8 +683,8 @@ def run_pick_and_place_sim(args, target_ee_positions, device,
         print(f"\n>>> Selector chose ball {chosen_idx} ({np.round(ball_pos, 3)}) "
               f"-> zone {ball_zone_assignments[chosen_idx]} | {len(remaining)} remaining")
 
-        # Pick and place this ball
-        result_pick = _pick_and_place_one_ball(
+        # Pick and drop this ball
+        result_pick = _pick_and_drop_one_ball(
             sim, dyn_model, ee_frame_id, shoulder_frame_id,
             init_joint_angles, lower_limits, upper_limits,
             ball_pos, assigned_drop, grip_states[chosen_idx],
@@ -813,10 +808,10 @@ def main():
     parser.add_argument("--max_steps", type=int, default=400000)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--mps", action="store_true")
-    parser.add_argument("--heading_threshold", type=float, default=0.15)
-    # Pick-and-place
-    parser.add_argument("--pick_and_place", action="store_true",
-                        help="Multi-target pick-and-place mode")
+
+    # Pick-and-drop
+    parser.add_argument("--pick_and_drop", action="store_true",
+                        help="Multi-target pick-and-drop mode")
     parser.add_argument("--num_targets_per_episode", type=int, default=3)
     parser.add_argument("--selector_checkpoint", type=str,
                         default="final_selector_policy.pt")
@@ -838,21 +833,18 @@ def main():
         load_policy(args.base_checkpoint, device=device)
     arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
         load_policy(args.arm_checkpoint, device=device)
-    has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
-
-    print(f"Base: {args.base_checkpoint}  Arm: {args.arm_checkpoint}  device={device}  "
-          f"phases={'yes' if has_base_phases else 'no'}")
+    print(f"Base: {args.base_checkpoint}  Arm: {args.arm_checkpoint}  device={device}")
 
     policy_kwargs = dict(
         base_model=base_model, base_mean=base_mean, base_std=base_std,
         base_label_mean=base_lm, base_label_std=base_ls,
-        base_feature_names=base_fnames, has_base_phases=has_base_phases,
+        base_feature_names=base_fnames,
         arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
         arm_label_mean=arm_lm, arm_label_std=arm_ls, arm_feature_names=arm_fnames,
     )
 
-    # --- Multi-target pick-and-place ---
-    if args.pick_and_place:
+    # --- Multi-target pick-and-drop ---
+    if args.pick_and_drop:
         sel_model = sel_mean = sel_std = None
         use_expert_selector = not args.selector_checkpoint
         if args.selector_checkpoint:
@@ -884,7 +876,7 @@ def main():
             zones = [dz.tolist() for dz in
                      generate_random_drop_zones(np.random.default_rng(seed + 1200))]
 
-            rng_assign = np.random.default_rng(seed + 20030)
+            rng_assign = np.random.default_rng(seed + 2000)
             cfg = {
                 "balls": balls,
                 "zones": zones,
@@ -899,7 +891,7 @@ def main():
             ball_zone_assignments = [int(rng_a.integers(0, len(mdz_zones)))
                                      for _ in range(len(targets))]
 
-        run_pick_and_place_sim(
+        run_pick_and_drop_sim(
             args, targets, device=device,
             drop_zones=mdz_zones, ball_zone_assignments=ball_zone_assignments,
             sel_model=sel_model, sel_mean=sel_mean, sel_std=sel_std,

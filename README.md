@@ -44,12 +44,12 @@ Demonstrations are processed into base-navigation and arm-reaching examples by `
 | **Arm BC**          | Reaching control of the seven-joint arm            | `final_manipulation_policy.pt`   |
 | **Target selector** | Next-ball choice from a multi-target scene         | `final_selector_policy.pt`             |
 
-### 4. 🎯 Multi-Target Selection and Pick-and-Place
+### 4. 🎯 Multi-Target Selection and Pick-and-Drop
 
 `eval/run_policy_sim.py` implements the main rollout. In multi-target mode it reads `balls`, `zones`, and `assignments` from JSON (or generates a random scene), spawns physical ball objects and zone markers, and repeatedly:
 
 1. Forms the current scene observation and chooses a remaining ball via the trained selector (or expert shortest-path ordering when selected).
-2. Uses the base/arm controller to approach the selected ball and execute the task-specific pick-and-place routine.
+2. Uses the base/arm controller to approach the selected ball and execute the task-specific pick-and-drop routine.
 3. Attempts to return the arm towards its home pose before proceeding to another target.
 4. Records the visit order, grasp/delivery outcomes and task statistics.
 
@@ -103,7 +103,7 @@ ML-RAI/
 
 ## 🚀 Getting Started
 
-The **multi-target pick-and-place demonstration** is the primary project entry point. The repository contains the required pretrained checkpoints, so retraining is not required for this demonstration.
+The **multi-target pick-and-drop demonstration** is the primary project entry point. The repository contains the required pretrained checkpoints, so retraining is not required for this demonstration.
 
 ### 1. Prerequisites
 
@@ -173,17 +173,17 @@ python eval/run_policy_sim.py --target 2 2 1.0
 
 This drives the base towards the target at (2, 2, 1.0) m and then reaches with the arm. Add `--headless` to run without the GUI.
 
-### 6. ▶️ Multi-Target Pick-and-Place
+### 6. ▶️ Multi-Target Pick-and-Drop
 
 From `ML-RAI/final/robotnik_arm_task`, inside the pixi shell:
 
 ```bash
-python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json
+python eval/run_policy_sim.py --pick_and_drop --config eval/example_config.json
 ```
 
 Default checkpoints: `final_navigation_policy.pt` (base), `final_manipulation_policy.pt` (arm), and `final_selector_policy.pt` (selector).
 
-The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-place logic. Add `--headless` to run without the PyBullet GUI (much faster), especially for MacBook.
+The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-drop logic. Add `--headless` to run without the PyBullet GUI (much faster), especially for MacBook.
 
 **Example configuration:** `eval/example_config.json`
 
@@ -205,7 +205,7 @@ python training/collect_data.py --mode random --num_targets 1000 --xy_range 5 --
 
 **2. Split into base and arm datasets**
 ```bash
-python training/split_dataset.py --data data/<dataset_file_name>.npz --out_dir data/split --arm_full_torque
+python training/split_dataset.py --data data/<dataset_file_name>.npz --out_dir data/split
 ```
 
 **3. Train the base policy**
@@ -230,7 +230,7 @@ python training/train_selector.py --data data/<selector_dataset_file_name>.npz
 
 **7. Run your trained policies**
 ```bash
-python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json --base_checkpoint <base>.pt --arm_checkpoint <arm>.pt --selector_checkpoint <selector>.pt
+python eval/run_policy_sim.py --pick_and_drop --config eval/example_config.json --base_checkpoint <base>.pt --arm_checkpoint <arm>.pt --selector_checkpoint <selector>.pt
 ```
 
 ## 📈 Results

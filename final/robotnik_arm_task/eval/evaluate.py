@@ -5,8 +5,8 @@ Usage:
   # Single target
   python evaluate.py --base_checkpoint base.pt --arm_checkpoint arm.pt --num_targets 20 --headless
 
-  # Pick-and-place
-  python evaluate.py --pick_and_place --num_episodes 10 --headless \
+  # Pick-and-drop
+  python evaluate.py --pick_and_drop --num_episodes 10 --headless \
       --base_checkpoint base.pt --arm_checkpoint arm.pt
 
   # Selector-only (no simulation)
@@ -29,7 +29,7 @@ import numpy as np
 
 from run_policy_sim import (
     run_sim, load_policy, load_selector,
-    run_pick_and_place_sim,
+    run_pick_and_drop_sim,
     REACH_TOLERANCE,
 )
 from robotnik_arm_task import (
@@ -61,9 +61,9 @@ def main():
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: random)")
-    # Multi-target / pick-and-place evaluation
-    parser.add_argument("--pick_and_place", action="store_true",
-                        help="Evaluate multi-target pick-and-place episodes")
+    # Multi-target / pick-and-drop evaluation
+    parser.add_argument("--pick_and_drop", action="store_true",
+                        help="Evaluate multi-target pick-and-drop episodes")
     parser.add_argument("--num_targets_per_episode", type=int, default=3,
                         help="Targets per multi-target episode (default: 3)")
     parser.add_argument("--num_episodes", type=int, default=10,
@@ -75,7 +75,7 @@ def main():
                         help="Evaluate selector decisions only (no simulation)")
     parser.add_argument("--per_target_max_steps", type=int, default=100000,
                         help="Max steps per target in multi-target mode (default: 100000)")
-    parser.add_argument("--heading_threshold", type=float, default=0.15)
+
     parser.add_argument("--xy_range", type=float, default=5.0,
                         help="XY workspace half-extent for target/zone generation (default: 5.0)")
     parser.add_argument("--multi_target_seed", type=int, default=None,
@@ -98,20 +98,17 @@ def main():
     # Load policies
     base_model, base_mean, base_std, base_lm, base_ls, base_fnames = \
         load_policy(args.base_checkpoint, device=device)
-    has_base_phases = base_fnames is not None and "phase" in list(base_fnames)
-
     arm_model, arm_mean, arm_std, arm_lm, arm_ls, arm_fnames = \
         load_policy(args.arm_checkpoint, device=device)
 
     policy_kwargs = dict(
         base_model=base_model, base_mean=base_mean, base_std=base_std,
         base_label_mean=base_lm, base_label_std=base_ls,
-        base_feature_names=base_fnames, has_base_phases=has_base_phases,
+        base_feature_names=base_fnames,
         arm_model=arm_model, arm_mean=arm_mean, arm_std=arm_std,
         arm_label_mean=arm_lm, arm_label_std=arm_ls, arm_feature_names=arm_fnames,
     )
-    print(f"Base: {args.base_checkpoint}  Arm: {args.arm_checkpoint}  "
-          f"device={device}  phases={'yes' if has_base_phases else 'no'}")
+    print(f"Base: {args.base_checkpoint}  Arm: {args.arm_checkpoint}  device={device}")
 
     # --- Selector-only evaluation (no simulation) ---
     if args.selector_only:
@@ -216,7 +213,7 @@ def main():
         return
 
     # --- Multi-target evaluation ---
-    if args.pick_and_place:
+    if args.pick_and_drop:
         sel_model = sel_mean = sel_std = None
         use_expert_selector = not args.selector_checkpoint
         if args.selector_checkpoint:
@@ -228,7 +225,7 @@ def main():
         rng = np.random.default_rng(args.seed)
         all_results = []
 
-        print(f"\nEvaluating {args.num_episodes} pick-and-place episodes "
+        print(f"\nEvaluating {args.num_episodes} pick-and-drop episodes "
               f"({args.num_targets_per_episode} targets each, seed={args.seed})\n")
 
         for ep in range(args.num_episodes):
@@ -245,7 +242,7 @@ def main():
 
             mdz_zones = generate_random_drop_zones(rng)
             ball_zone_assignments = [int(rng.integers(0, len(mdz_zones))) for _ in range(n)]
-            result = run_pick_and_place_sim(
+            result = run_pick_and_drop_sim(
                 args, targets, device=device,
                 drop_zones=mdz_zones,
                 ball_zone_assignments=ball_zone_assignments,
@@ -257,7 +254,7 @@ def main():
 
         # --- Aggregate report ---
         print(f"\n{'='*70}")
-        print(f"PICK-AND-PLACE EVALUATION REPORT  ({args.num_episodes} episodes, "
+        print(f"PICK-AND-DROP EVALUATION REPORT  ({args.num_episodes} episodes, "
               f"{args.num_targets_per_episode} balls each)")
         print(f"{'='*70}")
 
@@ -417,7 +414,7 @@ def main():
             import matplotlib.pyplot as plt
 
             fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-            fig.suptitle(f"Pick-and-Place Evaluation  ({args.num_episodes} episodes, "
+            fig.suptitle(f"Pick-and-Drop Evaluation  ({args.num_episodes} episodes, "
                          f"{total_balls} balls)", fontsize=14, fontweight="bold")
 
             # 1. Success rates
