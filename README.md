@@ -267,3 +267,20 @@ Targets sampled at |x|, |y| in [5, 8] m, beyond the [-5, 5] m training range.
 | Mean time per episode | 145.8 s | 154.8 s |
 
 The learned system maintains consistent performance across all three ball orders (96%, 86%, 88% delivery) while the expert degrades from 90% to 62% on later balls due to starting from non-nominal poses after each delivery.
+
+## 📦 Pretrained Data
+
+Pre-collected expert datasets are available for download if you want to skip the data-collection step:
+
+- **Navigation and manipulation dataset:** [Download (.npz)](https://liveuclac-my.sharepoint.com/:u:/g/personal/ucab434_ucl_ac_uk/IQCfNyR-AqJGQqZqI35xUlb2AVLqzDcsbDTsCVMASHXgOvI?e=IKx7Qi)
+- **Selector dataset:** [Download (.npz)](https://liveuclac-my.sharepoint.com/:u:/g/personal/ucab434_ucl_ac_uk/IQAuO1mXxGdASrmwbERiNiPNAfC8xLm5juV4UKSd3iViSOI?e=aW9jSp)
+
+Place the downloaded files into `final/robotnik_arm_task/data/` and proceed from step 2 (split) in the training instructions above.
+
+## 🔧 External Code Sources
+
+- **RoboEnv** (`simulation_and_control`) — course-provided simulator, used unmodified
+- **Standard libraries:** PyTorch, Pinocchio, PyBullet, NumPy, Matplotlib
+- **Optuna** — used for hyperparameter tuning (learning rate, hidden size, number of layers, activation functions, dropout)
+
+All policies, data pipelines, and evaluation code were written from scratch. No external pre-trained weights or checkpoints were used; all models were trained on self-collected expert demonstrations.
