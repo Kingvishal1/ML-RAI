@@ -2,3 +2,4 @@ numpy
 pin
 matplotlib
 pybullet
+optuna

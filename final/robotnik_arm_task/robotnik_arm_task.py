@@ -30,11 +30,11 @@ BASE_NAV_TIMEOUT = 25.0
 ARM_REACH_LIMIT = 0.85
 STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
-REACH_TOLERANCE = 0.05
+REACH_TOLERANCE = 0.005
 MAX_TARGETS = 5
 
 # Pick-and-place constants
-GRIP_TOLERANCE = 0.08
+GRIP_TOLERANCE = 0.10
 DROP_ZONE_DEFAULT = np.array([0.0, 0.0, 0.5])
 BALL_RADIUS = 0.03
 BALL_MASS = 0.05
@@ -51,7 +51,7 @@ class TorqueNoiseParams:
     trained on the data sees the expert recovering from pushes (braking near the target)
     without learning the noise itself.
     """
-    std: float = 2.0               # N*m, per-joint std of an active noise segment
+    std: float = 1.0               # N*m, per-joint std of an active noise segment
     active_prob: float = 0.5       # chance a segment is noisy; quiet segments let the arm settle
     kick_prob: float = 0.1         # chance an active segment is a larger kick
     kick_scale: float = 3.0        # kick std = std * kick_scale
@@ -158,49 +158,6 @@ def compute_base_goal(target_ee_pos):
     target_bearing = np.arctan2(target_xy[1], target_xy[0]) if np.linalg.norm(target_xy) > 1e-4 else 0.0
     base_goal_pos = target_xy - standoff * np.array([np.cos(target_bearing), np.sin(target_bearing)])
     return base_goal_pos, target_bearing
-
-
-from dataclasses import dataclass, field
-
-
-@dataclass
-class TorqueNoiseParams:
-    """Configuration for DART-style torque perturbation during data collection."""
-    std: float = 1.0              # base noise std (N·m per joint)
-    active_prob: float = 0.5      # probability each segment is noisy vs quiet
-    kick_prob: float = 0.1        # probability an active segment is a larger kick
-    kick_scale: float = 3.0       # kick std = kick_scale * std
-    segment_steps: int = 50       # steps per noise segment
-
-
-class TorqueNoise:
-    """Generates per-step torque perturbation vectors for 7 arm joints."""
-
-    def __init__(self, params: TorqueNoiseParams, rng=None):
-        self.params = params
-        self.rng = rng if rng is not None else np.random.default_rng()
-        self._steps_in_segment = 0
-        self._current_noise = np.zeros(7)
-        self._active = False
-        self._new_segment()
-
-    def _new_segment(self):
-        self._steps_in_segment = 0
-        self._active = self.rng.random() < self.params.active_prob
-        if self._active:
-            scale = self.params.std
-            if self.rng.random() < self.params.kick_prob:
-                scale *= self.params.kick_scale
-            self._current_noise = self.rng.normal(0, scale, size=7)
-        else:
-            self._current_noise = np.zeros(7)
-
-    def sample(self):
-        """Return the noise vector for this step, advancing the segment clock."""
-        self._steps_in_segment += 1
-        if self._steps_in_segment >= self.params.segment_steps:
-            self._new_segment()
-        return self._current_noise
 
 
 def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
@@ -470,343 +427,6 @@ def auto_release(client, grip_state):
     grip_state.is_delivered = True
 
 
-def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                            init_joint_angles, target_finger_angles,
-                            lower_limits, upper_limits,
-                            target_ee_positions,
-                            drop_zone=None,
-                            torque_noise_factory=None,
-                            per_target_timeout=None):
-    """Expert multi-ball pick-and-place episode.
-
-    For each ball (in shortest-path order):
-      1. nav_to_ball — base drives to ball standoff
-      2. reach_ball — arm reaches ball, auto-grip on proximity
-      3. nav_to_drop — base drives to drop zone standoff (ball attached)
-      4. reach_drop — arm reaches drop pos, auto-release on proximity
-
-    Returns (combined_data, selector_samples, per_ball_results).
-    """
-    if drop_zone is None:
-        drop_zone = DROP_ZONE_DEFAULT.copy()
-
-    client = sim.pybullet_client
-    rid = sim.bot[0].bot_pybullet
-    ee_link_id = find_ee_link_id(client, rid)
-
-    n_balls = len(target_ee_positions)
-    all_targets = np.array(target_ee_positions)
-
-    # Spawn balls and drop zone visual
-    grip_states = []
-    for i in range(n_balls):
-        ball_id = spawn_ball(client, all_targets[i])
-        grip_states.append(GripState(ball_id=ball_id))
-    add_drop_zone_visual(client, drop_zone)
-
-    remaining = set(range(n_balls))
-    selector_samples = []
-    per_ball_results = []
-    all_target_data = []
-    episode_time = 0.0
-
-    time_step = sim.GetTimeStep()
-
-    while remaining:
-        # --- Decision point: expert picks next ball ---
-        base_pos = np.array(sim.GetBasePosition())
-        base_ori = np.array(sim.GetBaseOrientation())
-        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-        candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
-        chosen_idx, _ = shortest_path_expert_pnp(base_pos, all_targets, remaining, drop_zone)
-
-        selector_samples.append({
-            "candidates": candidates,
-            "chosen_idx": chosen_idx,
-            "episode_time": episode_time,
-        })
-
-        ball_pos = all_targets[chosen_idx]
-        gs = grip_states[chosen_idx]
-        remaining.remove(chosen_idx)
-        print(f"\n>>> Pick-and-place: ball {chosen_idx} at {ball_pos} | {len(remaining)} remaining")
-
-        # --- Phase 1: nav_to_ball ---
-        noise = torque_noise_factory() if torque_noise_factory else None
-        old_max = max_steps
-        if per_target_timeout is not None:
-            os.environ["ROBOENV_MAX_STEPS"] = str(int(per_target_timeout / time_step))
-
-        data_nav_ball = run_simulation_loop(
-            sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            np.array(sim.GetMotorAngles(0)), target_finger_angles,
-            lower_limits, upper_limits,
-            target_ee_pos=ball_pos,
-            torque_noise=noise,
-        )
-        episode_time += data_nav_ball["final_time"]
-
-        # --- Phase 2: auto-grip check ---
-        ee_pos = data_nav_ball["final_ee_pos"]
-        ball_world_pos, _ = client.getBasePositionAndOrientation(gs.ball_id)
-        grip_dist = np.linalg.norm(ee_pos - np.array(ball_world_pos))
-        gripped = grip_dist < GRIP_TOLERANCE
-        if gripped:
-            auto_grip(client, rid, ee_link_id, gs)
-            print(f"    Gripped ball {chosen_idx} (dist={grip_dist:.4f}m)")
-        else:
-            print(f"    Grip FAILED ball {chosen_idx} (dist={grip_dist:.4f}m)")
-
-        # --- Phase 3: nav_to_drop (only if gripped) ---
-        data_nav_drop = None
-        if gripped:
-            noise2 = torque_noise_factory() if torque_noise_factory else None
-            data_nav_drop = run_simulation_loop(
-                sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                np.array(sim.GetMotorAngles(0)), target_finger_angles,
-                lower_limits, upper_limits,
-                target_ee_pos=drop_zone,
-                torque_noise=noise2,
-            )
-            episode_time += data_nav_drop["final_time"]
-
-            # --- Phase 4: auto-release check ---
-            ee_pos_drop = data_nav_drop["final_ee_pos"]
-            drop_dist = np.linalg.norm(ee_pos_drop - drop_zone)
-            delivered = drop_dist < GRIP_TOLERANCE
-            if delivered:
-                auto_release(client, gs)
-                print(f"    Delivered ball {chosen_idx} (dist={drop_dist:.4f}m)")
-            else:
-                auto_release(client, gs)  # release anyway to avoid carrying
-                print(f"    Drop imprecise ball {chosen_idx} (dist={drop_dist:.4f}m), released anyway")
-
-        if per_target_timeout is not None:
-            os.environ["ROBOENV_MAX_STEPS"] = str(old_max)
-
-        per_ball_results.append({
-            "slot": chosen_idx,
-            "ball_pos": ball_pos.tolist(),
-            "gripped": gripped,
-            "delivered": gs.is_delivered,
-            "grip_dist": grip_dist,
-            "nav_ball_time": data_nav_ball["final_time"],
-            "nav_drop_time": data_nav_drop["final_time"] if data_nav_drop else 0.0,
-        })
-
-        all_target_data.append(data_nav_ball)
-        if data_nav_drop is not None:
-            all_target_data.append(data_nav_drop)
-
-        print(f"    Ball {chosen_idx}: gripped={gripped}  delivered={gs.is_delivered}")
-
-    # --- Combine trajectory data ---
-    combined_data = _combine_trajectory_data(all_target_data)
-    combined_data["episode_time"] = episode_time
-    combined_data["per_ball_results"] = per_ball_results
-
-    # Summary
-    n_gripped = sum(1 for r in per_ball_results if r["gripped"])
-    n_delivered = sum(1 for r in per_ball_results if r["delivered"])
-    print(f"\n>>> Pick-and-place done: {n_gripped}/{n_balls} gripped, "
-          f"{n_delivered}/{n_balls} delivered, {episode_time:.2f}s total")
-
-    return combined_data, selector_samples, per_ball_results
-
-
-def shortest_path_expert_sequential(base_pos, target_positions, remaining_indices, drop_zone):
-    """Solve TSP for sequential pick-and-place: pick at ball_i, drop at ball_{i+1}.
-
-    Travel cost for permutation (b0, b1, ..., bN-1) is:
-      dist(base, b0) + dist(b0, b1) + dist(b1, b2) + ... + dist(bN-1, drop)
-
-    Each leg is a pick-at-source, carry-to-destination trip. The last ball
-    is dropped at *drop_zone*.
-
-    Returns:
-        chosen_idx: int, the first ball to visit
-        full_order: list[int], complete optimal visit sequence
-    """
-    remaining = list(remaining_indices)
-    if len(remaining) == 1:
-        return remaining[0], remaining
-
-    drop_xy = drop_zone[:2]
-    best_dist = np.inf
-    best_order = None
-    for perm in permutations(remaining):
-        # First leg: base → ball_0
-        d = np.linalg.norm(base_pos[:2] - target_positions[perm[0], :2])
-        # Intermediate legs: ball_i → ball_{i+1} (carry from pick to next pick)
-        for i in range(len(perm) - 1):
-            d += np.linalg.norm(target_positions[perm[i], :2] - target_positions[perm[i + 1], :2])
-        # Last leg: last ball → drop zone
-        d += np.linalg.norm(target_positions[perm[-1], :2] - drop_xy)
-        if d < best_dist:
-            best_dist = d
-            best_order = list(perm)
-
-    return best_order[0], best_order
-
-
-def run_sequential_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                                        init_joint_angles, target_finger_angles,
-                                        lower_limits, upper_limits,
-                                        target_ee_positions,
-                                        drop_zone=None,
-                                        torque_noise_factory=None,
-                                        per_target_timeout=None):
-    """Expert sequential pick-and-place: pick ball_i, carry to ball_{i+1}, drop there.
-
-    The last ball is dropped at *drop_zone*.
-
-    For each ball in the visit order:
-      1. nav_to_ball — base drives to ball_i standoff
-      2. reach_ball — arm reaches ball_i, auto-grip on proximity
-      3. nav_to_next — base drives to ball_{i+1} (or drop_zone for last)
-      4. reach_next — arm reaches next position, auto-release on proximity
-
-    Returns (combined_data, selector_samples, per_ball_results).
-    """
-    if drop_zone is None:
-        drop_zone = DROP_ZONE_DEFAULT.copy()
-
-    client = sim.pybullet_client
-    rid = sim.bot[0].bot_pybullet
-    ee_link_id = find_ee_link_id(client, rid)
-
-    n_balls = len(target_ee_positions)
-    all_targets = np.array(target_ee_positions)
-
-    # Spawn balls and drop zone visual
-    grip_states = []
-    for i in range(n_balls):
-        ball_id = spawn_ball(client, all_targets[i])
-        grip_states.append(GripState(ball_id=ball_id))
-    add_drop_zone_visual(client, drop_zone)
-
-    # Determine full visit order up front using sequential TSP
-    base_pos = np.array(sim.GetBasePosition())
-    _, full_order = shortest_path_expert_sequential(base_pos, all_targets, set(range(n_balls)), drop_zone)
-
-    selector_samples = []
-    per_ball_results = []
-    all_target_data = []
-    episode_time = 0.0
-    time_step = sim.GetTimeStep()
-
-    remaining = set(range(n_balls))
-
-    for order_idx, chosen_idx in enumerate(full_order):
-        base_pos = np.array(sim.GetBasePosition())
-        base_ori = np.array(sim.GetBaseOrientation())
-        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-        candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
-        selector_samples.append({
-            "candidates": candidates,
-            "chosen_idx": chosen_idx,
-            "episode_time": episode_time,
-        })
-        remaining.discard(chosen_idx)
-
-        ball_pos = all_targets[chosen_idx]
-        gs = grip_states[chosen_idx]
-
-        # Determine drop destination: next ball's position, or drop_zone for last ball
-        if order_idx < n_balls - 1:
-            dest_pos = all_targets[full_order[order_idx + 1]]
-            dest_label = f"ball {full_order[order_idx + 1]}"
-        else:
-            dest_pos = drop_zone
-            dest_label = "drop zone"
-
-        print(f"\n>>> Sequential: pick ball {chosen_idx} at {ball_pos}, "
-              f"carry to {dest_label} ({dest_pos}) | {len(remaining)} remaining")
-
-        # --- Phase 1: nav to ball ---
-        noise = torque_noise_factory() if torque_noise_factory else None
-        old_max = max_steps
-        if per_target_timeout is not None:
-            os.environ["ROBOENV_MAX_STEPS"] = str(int(per_target_timeout / time_step))
-
-        data_nav_ball = run_simulation_loop(
-            sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            np.array(sim.GetMotorAngles(0)), target_finger_angles,
-            lower_limits, upper_limits,
-            target_ee_pos=ball_pos,
-            torque_noise=noise,
-        )
-        episode_time += data_nav_ball["final_time"]
-
-        # --- Phase 2: auto-grip check ---
-        ee_pos = data_nav_ball["final_ee_pos"]
-        ball_world_pos, _ = client.getBasePositionAndOrientation(gs.ball_id)
-        grip_dist = np.linalg.norm(ee_pos - np.array(ball_world_pos))
-        gripped = grip_dist < GRIP_TOLERANCE
-        if gripped:
-            auto_grip(client, rid, ee_link_id, gs)
-            print(f"    Gripped ball {chosen_idx} (dist={grip_dist:.4f}m)")
-        else:
-            print(f"    Grip FAILED ball {chosen_idx} (dist={grip_dist:.4f}m)")
-
-        # --- Phase 3: nav to destination ---
-        data_nav_dest = None
-        if gripped:
-            noise2 = torque_noise_factory() if torque_noise_factory else None
-            data_nav_dest = run_simulation_loop(
-                sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                np.array(sim.GetMotorAngles(0)), target_finger_angles,
-                lower_limits, upper_limits,
-                target_ee_pos=dest_pos,
-                torque_noise=noise2,
-            )
-            episode_time += data_nav_dest["final_time"]
-
-            # --- Phase 4: auto-release ---
-            ee_pos_dest = data_nav_dest["final_ee_pos"]
-            dest_dist = np.linalg.norm(ee_pos_dest - dest_pos)
-            auto_release(client, gs)
-            delivered = dest_dist < GRIP_TOLERANCE
-            print(f"    Released ball {chosen_idx} at {dest_label} (dist={dest_dist:.4f}m)")
-
-        if per_target_timeout is not None:
-            os.environ["ROBOENV_MAX_STEPS"] = str(old_max)
-
-        per_ball_results.append({
-            "slot": chosen_idx,
-            "ball_pos": ball_pos.tolist(),
-            "dest_pos": dest_pos.tolist(),
-            "dest_label": dest_label,
-            "gripped": gripped,
-            "delivered": gs.is_delivered,
-            "grip_dist": grip_dist,
-            "drop_dist": dest_dist if gripped and data_nav_dest else float("inf"),
-            "nav_ball_time": data_nav_ball["final_time"],
-            "nav_dest_time": data_nav_dest["final_time"] if data_nav_dest else 0.0,
-        })
-
-        all_target_data.append(data_nav_ball)
-        if data_nav_dest is not None:
-            all_target_data.append(data_nav_dest)
-
-    # --- Combine trajectory data ---
-    combined_data = _combine_trajectory_data(all_target_data)
-    combined_data["episode_time"] = episode_time
-    combined_data["per_ball_results"] = per_ball_results
-
-    n_gripped = sum(1 for r in per_ball_results if r["gripped"])
-    n_delivered = sum(1 for r in per_ball_results if r["delivered"])
-    print(f"\n>>> Sequential pick-and-place done: {n_gripped}/{n_balls} gripped, "
-          f"{n_delivered}/{n_balls} delivered, {episode_time:.2f}s total")
-
-    return combined_data, selector_samples, per_ball_results
-
-
-SELECTOR_OBS_DIM = 3  # per-candidate: (in_base_x, in_base_y, z)
-SELECTOR_INPUT_DIM = MAX_TARGETS * SELECTOR_OBS_DIM + MAX_TARGETS  # 5*3 + 5 = 20
-
 # Multi-drop-zone constants
 NUM_DROP_ZONES = 3
 DROP_ZONES_DEFAULT = [
@@ -819,8 +439,8 @@ DROP_ZONE_COLORS = [
     [0.2, 0.6, 1.0, 1.0],   # blue
     [0.2, 1.0, 0.3, 1.0],   # green
 ]
-SELECTOR_OBS_DIM_MDZ = 6  # per-candidate: ball_pos(3) + drop_zone_pos(3) in base frame
-SELECTOR_INPUT_DIM_MDZ = MAX_TARGETS * SELECTOR_OBS_DIM_MDZ + MAX_TARGETS  # 5*6 + 5 = 35
+SELECTOR_OBS_DIM = 6  # per-candidate: ball_pos(3) + drop_zone_pos(3) in base frame
+SELECTOR_INPUT_DIM = MAX_TARGETS * SELECTOR_OBS_DIM + MAX_TARGETS  # 5*6 + 5 = 35
 
 
 def generate_random_drop_zones(rng, n=NUM_DROP_ZONES, xy_range=5.0, z=0.5, min_sep=2.0):
@@ -866,55 +486,9 @@ def target_to_base_frame(base_pos, base_bearing, target_pos):
                      target_pos[2]])       # z
 
 
-def build_selector_candidates(base_pos, base_bearing, target_positions, remaining_indices):
-    """Build per-candidate observations for the target selector.
-
-    Args:
-        base_pos: (3,) robot base position
-        base_bearing: scalar, robot heading (yaw)
-        target_positions: (N, 3) all target positions (world frame)
-        remaining_indices: iterable of valid target slot indices
-    Returns:
-        candidates: dict mapping slot_index -> (3,) observation in base frame
-    """
-    candidates = {}
-    for idx in remaining_indices:
-        candidates[idx] = target_to_base_frame(base_pos, base_bearing, target_positions[idx])
-    return candidates
-
-
-def build_selector_scene(base_pos, base_bearing, target_positions, remaining_indices):
-    """Build a fixed-size scene observation for the target selector.
-
-    Packs all remaining candidates into MAX_TARGETS slots (sorted by slot index)
-    with a validity mask.  Empty slots are zero-padded.
-
-    Args:
-        base_pos: (3,) robot base position
-        base_bearing: scalar, robot heading (yaw)
-        target_positions: (N, 3) all target positions (world frame)
-        remaining_indices: iterable of valid target slot indices
-    Returns:
-        obs: (SELECTOR_INPUT_DIM,) = (MAX_TARGETS*3 + MAX_TARGETS,) flattened
-        slot_order: list of slot indices in the order they appear in obs
-    """
-    remaining = sorted(remaining_indices)
-    obs_block = np.zeros(MAX_TARGETS * SELECTOR_OBS_DIM)
-    mask = np.zeros(MAX_TARGETS)
-    slot_order = []
-
-    for i, idx in enumerate(remaining):
-        bf = target_to_base_frame(base_pos, base_bearing, target_positions[idx])
-        obs_block[i * SELECTOR_OBS_DIM:(i + 1) * SELECTOR_OBS_DIM] = bf
-        mask[i] = 1.0
-        slot_order.append(idx)
-
-    return np.concatenate([obs_block, mask]), slot_order
-
-
-def build_selector_scene_multi_drop(base_pos, base_bearing, target_positions,
+def build_selector_scene(base_pos, base_bearing, target_positions,
                                      remaining_indices, drop_zones, ball_zone_assignments):
-    """Build a fixed-size scene observation for the multi-drop-zone selector.
+    """Build a fixed-size scene observation for the target selector.
 
     Each slot gets 6 dims: ball_pos in base frame (3) + assigned drop zone pos in base frame (3).
 
@@ -926,11 +500,11 @@ def build_selector_scene_multi_drop(base_pos, base_bearing, target_positions,
         drop_zones: list of (3,) drop zone positions
         ball_zone_assignments: dict or list mapping ball index -> drop zone index
     Returns:
-        obs: (SELECTOR_INPUT_DIM_MDZ,) = (MAX_TARGETS*6 + MAX_TARGETS,) flattened
+        obs: (SELECTOR_INPUT_DIM,) = (MAX_TARGETS*6 + MAX_TARGETS,) flattened
         slot_order: list of slot indices in the order they appear in obs
     """
     remaining = sorted(remaining_indices)
-    obs_block = np.zeros(MAX_TARGETS * SELECTOR_OBS_DIM_MDZ)
+    obs_block = np.zeros(MAX_TARGETS * SELECTOR_OBS_DIM)
     mask = np.zeros(MAX_TARGETS)
     slot_order = []
 
@@ -938,7 +512,7 @@ def build_selector_scene_multi_drop(base_pos, base_bearing, target_positions,
         ball_bf = target_to_base_frame(base_pos, base_bearing, target_positions[idx])
         dz_idx = ball_zone_assignments[idx]
         dz_bf = target_to_base_frame(base_pos, base_bearing, drop_zones[dz_idx])
-        start = i * SELECTOR_OBS_DIM_MDZ
+        start = i * SELECTOR_OBS_DIM
         obs_block[start:start + 3] = ball_bf
         obs_block[start + 3:start + 6] = dz_bf
         mask[i] = 1.0
@@ -947,7 +521,7 @@ def build_selector_scene_multi_drop(base_pos, base_bearing, target_positions,
     return np.concatenate([obs_block, mask]), slot_order
 
 
-def shortest_path_expert_multi_drop(base_pos, target_positions, remaining_indices,
+def shortest_path_expert(base_pos, target_positions, remaining_indices,
                                      drop_zones, ball_zone_assignments):
     """Solve TSP for multi-drop-zone pick-and-place.
 
@@ -990,14 +564,15 @@ def shortest_path_expert_multi_drop(base_pos, target_positions, remaining_indice
     return best_order[0], best_order
 
 
-def run_multi_drop_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
+def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                                         init_joint_angles, target_finger_angles,
                                         lower_limits, upper_limits,
                                         target_ee_positions,
                                         drop_zones=None,
                                         ball_zone_assignments=None,
                                         torque_noise_factory=None,
-                                        per_target_timeout=None):
+                                        per_target_timeout=None,
+                                        init_ee_pos=None):
     """Expert multi-drop-zone pick-and-place episode.
 
     Each ball is assigned to one of NUM_DROP_ZONES drop zones. After delivering
@@ -1060,10 +635,10 @@ def run_multi_drop_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_fra
         base_ori = np.array(sim.GetBaseOrientation())
         base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
 
-        candidates_obs, slot_order = build_selector_scene_multi_drop(
+        candidates_obs, slot_order = build_selector_scene(
             base_pos, base_bearing, all_targets, remaining,
             drop_zones, ball_zone_assignments)
-        chosen_idx, _ = shortest_path_expert_multi_drop(
+        chosen_idx, _ = shortest_path_expert(
             base_pos, all_targets, remaining, drop_zones, ball_zone_assignments)
 
         selector_samples.append({
@@ -1135,14 +710,33 @@ def run_multi_drop_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_fra
         if per_target_timeout is not None:
             os.environ["ROBOENV_MAX_STEPS"] = str(old_max)
 
+        # Compute EE accuracy from trajectory data
+        pick_ee_errs = np.linalg.norm(data_nav_ball["ee_error"], axis=1) if len(data_nav_ball["ee_error"]) else np.array([])
+        pick_best_err = float(pick_ee_errs.min()) if len(pick_ee_errs) else None
+        pick_final_err = float(pick_ee_errs[-1]) if len(pick_ee_errs) else None
+
+        drop_best_err = drop_final_err = drop_dist_val = None
+        delivered = False
+        if data_nav_drop is not None:
+            drop_ee_errs = np.linalg.norm(data_nav_drop["ee_error"], axis=1) if len(data_nav_drop["ee_error"]) else np.array([])
+            drop_best_err = float(drop_ee_errs.min()) if len(drop_ee_errs) else None
+            drop_final_err = float(drop_ee_errs[-1]) if len(drop_ee_errs) else None
+            drop_dist_val = drop_dist
+            delivered = drop_dist < GRIP_TOLERANCE
+
         per_ball_results.append({
             "slot": chosen_idx,
             "ball_pos": ball_pos.tolist(),
             "drop_zone_idx": ball_zone_assignments[chosen_idx],
             "drop_zone_pos": assigned_drop.tolist(),
             "gripped": gripped,
-            "delivered": gs.is_delivered,
+            "delivered": delivered,
             "grip_dist": grip_dist,
+            "drop_dist": drop_dist_val,
+            "pick_best_err": pick_best_err,
+            "pick_final_err": pick_final_err,
+            "drop_best_err": drop_best_err,
+            "drop_final_err": drop_final_err,
             "nav_ball_time": data_nav_ball["final_time"],
             "nav_drop_time": data_nav_drop["final_time"] if data_nav_drop else 0.0,
         })
@@ -1151,7 +745,40 @@ def run_multi_drop_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_fra
         if data_nav_drop is not None:
             all_target_data.append(data_nav_drop)
 
-        print(f"    Ball {chosen_idx}: gripped={gripped}  delivered={gs.is_delivered}")
+        print(f"    Ball {chosen_idx}: gripped={gripped}  delivered={delivered}")
+
+        # --- Arm reset: move arm back to home EE position between targets ---
+        if remaining and init_ee_pos is not None:
+            base_pos_now = np.array(sim.GetBasePosition())
+            base_ori_now = np.array(sim.GetBaseOrientation())
+            bearing_now = quaternion2bearing(base_ori_now[3], base_ori_now[0],
+                                            base_ori_now[1], base_ori_now[2])
+            c, s = np.cos(bearing_now), np.sin(bearing_now)
+            home_ee = base_pos_now.copy()
+            home_ee[0] += c * init_ee_pos[0] - s * init_ee_pos[1]
+            home_ee[1] += s * init_ee_pos[0] + c * init_ee_pos[1]
+            home_ee[2] = init_ee_pos[2]
+            print(f"    Resetting arm to home EE: {np.round(home_ee, 3)}")
+
+            old_max_reset = int(os.environ.get("ROBOENV_MAX_STEPS", "40000"))
+            os.environ["ROBOENV_MAX_STEPS"] = "5000"
+            import robotnik_arm_task as _self
+            _orig_max = _self.max_steps
+            _self.max_steps = 5000
+
+            data_reset = run_simulation_loop(
+                sim, dyn_model, ee_frame_id, shoulder_frame_id,
+                np.array(sim.GetMotorAngles(0)), target_finger_angles,
+                lower_limits, upper_limits,
+                target_ee_pos=home_ee,
+            )
+            episode_time += data_reset["final_time"]
+
+            _self.max_steps = _orig_max
+            os.environ["ROBOENV_MAX_STEPS"] = str(old_max_reset)
+
+            reset_err = np.linalg.norm(data_reset["final_ee_pos"] - home_ee)
+            print(f"    Arm reset done (err={reset_err:.4f}m)")
 
     # --- Combine trajectory data ---
     combined_data = _combine_trajectory_data(all_target_data)
@@ -1184,173 +811,6 @@ def nearest_neighbor_expert(base_pos, target_positions, remaining_indices):
             best_dist = dist
             best_idx = idx
     return best_idx
-
-
-def shortest_path_expert(base_pos, target_positions, remaining_indices):
-    """Solve TSP over remaining targets by brute-force to minimise total XY distance.
-
-    Starting from base_pos, evaluate every permutation of remaining targets and
-    return the full visit order (list) plus the first target to visit.
-
-    Args:
-        base_pos: (3,) robot base position
-        target_positions: (N, 3) all target positions
-        remaining_indices: set of valid target slot indices
-    Returns:
-        chosen_idx: int, the first target to visit in the optimal order
-        full_order: list[int], complete optimal visit sequence
-    """
-    remaining = list(remaining_indices)
-    if len(remaining) == 1:
-        return remaining[0], remaining
-
-    best_dist = np.inf
-    best_order = None
-    for perm in permutations(remaining):
-        d = np.linalg.norm(base_pos[:2] - target_positions[perm[0], :2])
-        for i in range(len(perm) - 1):
-            d += np.linalg.norm(target_positions[perm[i], :2] - target_positions[perm[i + 1], :2])
-        if d < best_dist:
-            best_dist = d
-            best_order = list(perm)
-
-    return best_order[0], best_order
-
-
-def shortest_path_expert_pnp(base_pos, target_positions, remaining_indices, drop_zone):
-    """Solve TSP for pick-and-place: robot returns to *drop_zone* between every ball.
-
-    The real travel cost for a permutation (b0, b1, b2, ...) is:
-      dist(base, b0) + dist(b0, drop) + dist(drop, b1) + dist(b1, drop) + ...
-
-    After the first ball, every subsequent leg starts from the drop zone, so
-    inter-ball distance is always dist(drop, b_i) + dist(b_i, drop).
-
-    Args:
-        base_pos: (3,) robot base position (starting point)
-        target_positions: (N, 3) all ball positions
-        remaining_indices: set of valid ball slot indices
-        drop_zone: (3,) drop zone position
-    Returns:
-        chosen_idx: int, the first ball to visit
-        full_order: list[int], complete optimal visit sequence
-    """
-    remaining = list(remaining_indices)
-    if len(remaining) == 1:
-        return remaining[0], remaining
-
-    drop_xy = drop_zone[:2]
-    best_dist = np.inf
-    best_order = None
-    for perm in permutations(remaining):
-        # First leg: base → ball_0 → drop
-        d = np.linalg.norm(base_pos[:2] - target_positions[perm[0], :2])
-        d += np.linalg.norm(target_positions[perm[0], :2] - drop_xy)
-        # Subsequent legs: drop → ball_i → drop
-        for i in range(1, len(perm)):
-            d += np.linalg.norm(drop_xy - target_positions[perm[i], :2])
-            d += np.linalg.norm(target_positions[perm[i], :2] - drop_xy)
-        if d < best_dist:
-            best_dist = d
-            best_order = list(perm)
-
-    return best_order[0], best_order
-
-
-def run_multi_target_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
-                          init_joint_angles, target_finger_angles,
-                          lower_limits, upper_limits,
-                          target_ee_positions,
-                          torque_noise_factory=None,
-                          per_target_timeout=None):
-    """Run an expert multi-target episode: visit each target in nearest-neighbor order.
-
-    Args:
-        sim, dyn_model, ...: same as run_simulation_loop
-        target_ee_positions: list of target (x,y,z) arrays (any length)
-        torque_noise_factory: callable() -> TorqueNoise or None, called per target
-        per_target_timeout: max sim-time per target (seconds). None = use default max_steps.
-
-    Returns:
-        combined_data: dict with concatenated trajectory data from all targets
-        selector_samples: list of dicts, one per decision point.  Each dict has:
-            "candidates": dict mapping slot_idx -> (3,) base-frame observation
-            "chosen_idx": int, the expert's pick (key into candidates)
-            "episode_time": float
-        per_target_results: list of dicts with per-target outcomes
-    """
-    n_targets = len(target_ee_positions)
-    assert n_targets >= 1
-
-    all_targets = np.array(target_ee_positions)  # (N, 3)
-
-    remaining = set(range(n_targets))
-    selector_samples = []
-    per_target_results = []
-    all_target_data = []
-    episode_time = 0.0
-
-    while remaining:
-        # --- Decision point: expert picks nearest target ---
-        base_pos = np.array(sim.GetBasePosition())
-        base_ori = np.array(sim.GetBaseOrientation())
-        base_bearing = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
-
-        candidates = build_selector_candidates(base_pos, base_bearing, all_targets, remaining)
-        chosen_idx, _ = shortest_path_expert(base_pos, all_targets, remaining)
-
-        selector_samples.append({
-            "candidates": candidates,
-            "chosen_idx": chosen_idx,
-            "episode_time": episode_time,
-        })
-
-        current_target = all_targets[chosen_idx]
-        remaining.remove(chosen_idx)
-        print(f"\n>>> Multi-target: visiting slot {chosen_idx} "
-              f"({current_target}) | {len(remaining)} remaining")
-
-        # --- Run single-target loop for this target ---
-        noise = torque_noise_factory() if torque_noise_factory else None
-
-        # Override max_steps for per-target timeout if given
-        old_max_steps = max_steps
-        if per_target_timeout is not None:
-            time_step = sim.GetTimeStep()
-            os.environ["ROBOENV_MAX_STEPS"] = str(int(per_target_timeout / time_step))
-
-        data = run_simulation_loop(
-            sim, dyn_model, ee_frame_id, shoulder_frame_id,
-            np.array(sim.GetMotorAngles(0)), target_finger_angles,
-            lower_limits, upper_limits,
-            target_ee_pos=current_target,
-            torque_noise=noise,
-        )
-
-        if per_target_timeout is not None:
-            os.environ["ROBOENV_MAX_STEPS"] = str(old_max_steps)
-
-        target_time = data["final_time"]
-        episode_time += target_time
-        final_err = np.linalg.norm(current_target - data["final_ee_pos"])
-        reached = final_err < REACH_TOLERANCE
-
-        per_target_results.append({
-            "slot": chosen_idx,
-            "target": current_target.tolist(),
-            "reached": reached,
-            "final_err": final_err,
-            "time": target_time,
-        })
-        all_target_data.append(data)
-        print(f"    Slot {chosen_idx}: err={final_err:.4f}m  reached={reached}  t={target_time:.2f}s")
-
-    # --- Combine trajectory data across targets ---
-    combined_data = _combine_trajectory_data(all_target_data)
-    combined_data["episode_time"] = episode_time
-    combined_data["per_target_results"] = per_target_results
-
-    return combined_data, selector_samples, per_target_results
 
 
 def _combine_trajectory_data(data_list):
