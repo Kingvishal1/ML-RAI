@@ -33,7 +33,7 @@ STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
 REACH_TOLERANCE = 0.005
 MAX_TARGETS = 5
 
-# Pick-and-place constants
+# Pick-and-drop constants
 GRIP_TOLERANCE = 0.10
 DROP_ZONE_DEFAULT = np.array([0.0, 0.0, 0.5])
 BALL_RADIUS = 0.03
@@ -333,7 +333,7 @@ def run_simulation_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 
 
 # ==============================================================================
-# PICK-AND-PLACE PRIMITIVES
+# PICK-AND-DROP PRIMITIVES
 # ==============================================================================
 
 @dataclass
@@ -523,7 +523,7 @@ def build_selector_scene(base_pos, base_bearing, target_positions,
 
 def shortest_path_expert(base_pos, target_positions, remaining_indices,
                                      drop_zones, ball_zone_assignments):
-    """Solve TSP for multi-drop-zone pick-and-place.
+    """Solve TSP for multi-drop-zone pick-and-drop.
 
     After delivering ball_i to its assigned drop zone, the robot starts the next
     pick from that drop zone's position. Cost:
@@ -564,7 +564,7 @@ def shortest_path_expert(base_pos, target_positions, remaining_indices,
     return best_order[0], best_order
 
 
-def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
+def run_pick_and_drop_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                                         init_joint_angles, target_finger_angles,
                                         lower_limits, upper_limits,
                                         target_ee_positions,
@@ -573,7 +573,7 @@ def run_pick_and_place_loop(sim, dyn_model, ee_frame_id, shoulder_frame_id,
                                         torque_noise_factory=None,
                                         per_target_timeout=None,
                                         init_ee_pos=None):
-    """Expert multi-drop-zone pick-and-place episode.
+    """Expert multi-drop-zone pick-and-drop episode.
 
     Each ball is assigned to one of NUM_DROP_ZONES drop zones. After delivering
     ball_i to its zone, the robot starts the next pick from that zone's position.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse pick-and-place evaluation logs and generate metrics + charts.
+"""Parse pick-and-drop evaluation logs and generate metrics + charts.
 
 Usage:
   python parse_eval_log.py eval.txt
@@ -125,7 +125,7 @@ def main():
     all_drop_dists = [b["drop_dist"] for e in episodes for b in e["per_ball"] if b["drop_dist"] is not None]
 
     print(f"{'='*70}")
-    print(f"PICK-AND-PLACE EVALUATION REPORT  ({num_episodes} episodes)")
+    print(f"PICK-AND-DROP EVALUATION REPORT  ({num_episodes} episodes)")
     print(f"{'='*70}")
 
     print(f"\n--- GRIP SUCCESS ---")
@@ -212,7 +212,7 @@ def main():
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        fig.suptitle(f"Pick-and-Place Evaluation  ({num_episodes} episodes, "
+        fig.suptitle(f"Pick-and-Drop Evaluation  ({num_episodes} episodes, "
                      f"{total_balls} balls)", fontsize=14, fontweight="bold")
 
         # 1. Success rates (bar chart)
