@@ -79,7 +79,7 @@ def plot_results(results):
     ax.set_title("Base Phase Duration (mean)")
 
     plt.tight_layout()
-    out_path = "sweep_results/threshold_sweep_5-1.png"
+    out_path = "sweep_results/threshold_scale_sweep.png"
     plt.savefig(out_path, dpi=150)
     print(f"\nChart saved to {out_path}")
     plt.show()

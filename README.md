@@ -38,11 +38,11 @@ The full expert action layout comprises **four wheel commands** and **seven arm 
 
 Demonstrations are processed into base-navigation and arm-reaching examples by `training/split_dataset.py`. MLP regressors are implemented through `regressors.py` and `activations.py`; `training/train_regressor.py` fits the policies. Checkpoints store learned parameters and the feature/normalisation information needed by `run_policy.py` during inference.
 
-| Policy | Responsibility | Default checkpoint |
-|---|---|---|
-| **Base BC** | Navigation commands from robot/target observations | `060_bc_base_gelu_e70_h512_l3_16min_working.pt` |
-| **Arm BC** | Reaching control of the seven-joint arm | `051_bc_arm_gelu_e70_h512_l3_3min_working.pt` |
-| **Target selector** | Next-ball choice from a multi-target scene | `084_selector_gelu_e300_h128_l3.pt` |
+| Policy              | Responsibility                                     | Default checkpoint                              |
+|---------------------|----------------------------------------------------|-------------------------------------------------|
+| **Base BC**         | Navigation commands from robot/target observations | `final_navigation_policy.pt` |
+| **Arm BC**          | Reaching control of the seven-joint arm            | `final_manipulation_policy.pt`   |
+| **Target selector** | Next-ball choice from a multi-target scene         | `final_selector_policy.pt`             |
 
 ### 4. 🎯 Multi-Target Selection and Pick-and-Place
 
@@ -76,19 +76,26 @@ ML-RAI/
         ├── configs/                   # Robot configuration files
         ├── models/                    # Robot URDFs and geometry
         ├── eval/
-        │   ├── run_policy_sim.py       # Main demonstration entry point
+        │   ├── run_policy_sim.py       # Main rollout entry point
         │   ├── evaluate.py            # Repeated quantitative evaluation
+        │   ├── compare_single.py      # Expert vs learned single-target comparison
+        │   ├── compare_runs.py        # Expert vs learned PnP comparison
+        │   ├── make_paper_charts.py   # Paper-ready chart generation
         │   ├── example_config.json    # Fixed multi-ball scene
-        │   ├── parse_eval_log.py       # Evaluation-log processing
-        │   └── utils.py               # Evaluation helpers
+        │   ├── parse_eval_log.py      # Evaluation-log processing
+        │   ├── utils.py              # Evaluation helpers
+        │   └── results/
+        │       ├── final/            # Final evaluation results and charts
+        │       └── archive/          # Older intermediate results
         ├── training/
-        │   ├── collect_data.py         # Expert demonstration collection
-        │   ├── split_dataset.py        # Base/arm dataset preparation
-        │   ├── train_regressor.py      # Behaviour-cloning training
-        │   ├── dagger_collect.py       # Expert-labelled policy-state data
-        │   ├── merge_datasets.py       # Dataset merging
-        │   ├── collect_selector_data.py# Selector training data
-        │   └── train_selector.py       # Target-selection model training
+        │   ├── collect_data.py        # Expert demonstration collection
+        │   ├── split_dataset.py       # Base/arm dataset preparation
+        │   ├── train_regressor.py     # Behaviour-cloning training
+        │   ├── dagger_collect.py      # Expert-labelled policy-state data
+        │   ├── merge_datasets.py      # Dataset merging
+        │   ├── collect_selector_data.py # Selector training data
+        │   └── train_selector.py      # Target-selection model training
+        ├── sweep_results/             # Phase-switching threshold sweep data
         ├── experiments/               # Ablation, activation and scaling studies
         └── metrics/                   # Feature and threshold analyses
 ```
@@ -125,7 +132,7 @@ Clone both side by side in the same workspace folder. **RoboEnv** is the course 
 
 ```bash
 git clone --recurse-submodules https://github.com/VModugno/RoboEnv.git
-git clone --branch main --single-branch https://github.com/Kingvishal1/ML-RAI.git
+git clone https://github.com/Kingvishal1/ML-RAI.git
 ```
 
 Resulting layout:
@@ -156,7 +163,17 @@ pixi shell -e ml
 cd ../ML-RAI/final/robotnik_arm_task
 ```
 
-### 6. ▶️ Run the main simulation - Multi-Target Pick-and-Place
+### 5. ▶️ Single-Target Reaching
+
+From `ML-RAI/final/robotnik_arm_task`, inside the pixi shell:
+
+```bash
+python eval/run_policy_sim.py --target 2 2 1.0
+```
+
+This drives the base towards the target at (2, 2, 1.0) m and then reaches with the arm. Add `--headless` to run without the GUI.
+
+### 6. ▶️ Multi-Target Pick-and-Place
 
 From `ML-RAI/final/robotnik_arm_task`, inside the pixi shell:
 
@@ -164,9 +181,9 @@ From `ML-RAI/final/robotnik_arm_task`, inside the pixi shell:
 python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json
 ```
 
-Default checkpoints: `060_bc_base_gelu_e70_h512_l3_16min_working.pt` (base), `051_bc_arm_gelu_e70_h512_l3_3min_working.pt` (arm), and `084_selector_gelu_e300_h128_l3.pt` (selector).
+Default checkpoints: `final_navigation_policy.pt` (base), `final_manipulation_policy.pt` (arm), and `final_selector_policy.pt` (selector).
 
-The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-place logic. Add `--headless` to run without the PyBullet GUI (much faster), especially for macbook.
+The example scene configures **three balls, three drop zones and one assigned destination per ball**. During a multi-target episode, the neural selector chooses which ball to attempt, and the simulator uses the pretrained base and arm policies with the project's task-level pick-and-place logic. Add `--headless` to run without the PyBullet GUI (much faster), especially for MacBook.
 
 **Example configuration:** `eval/example_config.json`
 
@@ -215,3 +232,38 @@ python training/train_selector.py --data data/<selector_dataset_file_name>.npz
 ```bash
 python eval/run_policy_sim.py --pick_and_place --config eval/example_config.json --base_checkpoint <base>.pt --arm_checkpoint <arm>.pt --selector_checkpoint <selector>.pt
 ```
+
+## 📈 Results
+
+Evaluation results from 200 single-target trials and 50 multi-object pick-and-drop episodes (3 balls each). All results are in `eval/results/final/`.
+
+### Single-Target Reaching (200 targets, 5 mm tolerance)
+
+| Metric | Expert | Learned |
+|---|---|---|
+| Reach rate (< 5 mm) | 6.0% | 85.0% |
+| Mean best EE error | 4.84 mm | 4.29 mm |
+| Median best EE error | 5.00 mm | 3.87 mm |
+| Mean time | 17.0 s | 23.7 s |
+
+The expert stops at a fixed 5 mm threshold, so nearly all trials cluster just outside tolerance. The learned policy converges closer on most targets but lacks the hard stopping rule, producing a wider error distribution.
+
+### Out-of-Distribution Generalisation (50 targets outside training range)
+
+| Metric | In-range (200) | OOD (50) |
+|---|---|---|
+| Reach rate (< 5 mm) | 85.0% | 76.0% |
+| Mean best EE error | 4.29 mm | 3.93 mm |
+
+Targets sampled at |x|, |y| in [5, 8] m, beyond the [-5, 5] m training range.
+
+### Multi-Object Pick-and-Drop (50 episodes, 3 balls each)
+
+| Metric | Expert | Learned |
+|---|---|---|
+| Grip rate | 90.0% | 99.3% |
+| Delivery rate | 72.7% | 90.0% |
+| Full-episode delivery | 36.0% | 70.0% |
+| Mean time per episode | 145.8 s | 154.8 s |
+
+The learned system maintains consistent performance across all three ball orders (96%, 86%, 88% delivery) while the expert degrades from 90% to 62% on later balls due to starting from non-nominal poses after each delivery.
