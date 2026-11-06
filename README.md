@@ -1,4 +1,4 @@
-# 🤖 Behavioral Cloning for Multi-Object Mobile Pick and Drop Robot
+# 🤖 Behavioural Cloning for Mobile Pick-and-Drop with Decoupled Policies
 
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
@@ -198,7 +198,16 @@ The example scene configures **three balls, three drop zones and one assigned de
 
 Run from `ML-RAI/final/robotnik_arm_task` inside the pixi shell. Tuned hyperparameters are used by default.
 
-**1. Collect expert demonstrations (base + arm)**
+**1. Get training data**
+
+Download pre-collected expert datasets, or collect your own:
+
+- **Navigation and manipulation dataset:** [Download (.npz)](https://liveuclac-my.sharepoint.com/:u:/g/personal/ucab434_ucl_ac_uk/IQCfNyR-AqJGQqZqI35xUlb2AVLqzDcsbDTsCVMASHXgOvI?e=IKx7Qi)
+- **Selector dataset:** [Download (.npz)](https://liveuclac-my.sharepoint.com/:u:/g/personal/ucab434_ucl_ac_uk/IQAuO1mXxGdASrmwbERiNiPNAfC8xLm5juV4UKSd3iViSOI?e=aW9jSp)
+
+Place downloaded files into `final/robotnik_arm_task/data/` and skip to step 2.
+
+Or collect your own demonstrations:
 ```bash
 python training/collect_data.py --mode random --num_targets 1000 --xy_range 5 --vary_init --noise_std 1.0 --workers 8 --seed 42
 ```
@@ -267,3 +276,11 @@ Targets sampled at |x|, |y| in [5, 8] m, beyond the [-5, 5] m training range.
 | Mean time per episode | 145.8 s | 154.8 s |
 
 The learned system maintains consistent performance across all three ball orders (96%, 86%, 88% delivery) while the expert degrades from 90% to 62% on later balls due to starting from non-nominal poses after each delivery.
+
+## 🔧 External Code Sources
+
+- **RoboEnv** (`simulation_and_control`) — course-provided simulator, used unmodified
+- **Standard libraries:** PyTorch, Pinocchio, PyBullet, NumPy, Matplotlib
+- **Optuna** — used for hyperparameter tuning (learning rate, hidden size, number of layers, activation functions, dropout)
+
+All policies, data pipelines, and evaluation code were written from scratch. No external pre-trained weights or checkpoints were used; all models were trained on self-collected expert demonstrations.
