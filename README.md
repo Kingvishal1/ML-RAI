@@ -1,4 +1,4 @@
-# 🤖 Behavioral Cloning for Multi-Object Mobile Pick and Drop Robot
+# 🤖 Behavioural Cloning for Mobile Pick-and-Drop with Decoupled Policies
 
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
