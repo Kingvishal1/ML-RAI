@@ -30,7 +30,7 @@ BASE_NAV_TIMEOUT = 25.0
 ARM_REACH_LIMIT = 0.85
 STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
-REACH_TOLERANCE = 0.05
+REACH_TOLERANCE = 0.005
 MAX_TARGETS = 5
 
 # Pick-and-place constants
@@ -51,7 +51,7 @@ class TorqueNoiseParams:
     trained on the data sees the expert recovering from pushes (braking near the target)
     without learning the noise itself.
     """
-    std: float = 2.0               # N*m, per-joint std of an active noise segment
+    std: float = 1.0               # N*m, per-joint std of an active noise segment
     active_prob: float = 0.5       # chance a segment is noisy; quiet segments let the arm settle
     kick_prob: float = 0.1         # chance an active segment is a larger kick
     kick_scale: float = 3.0        # kick std = std * kick_scale

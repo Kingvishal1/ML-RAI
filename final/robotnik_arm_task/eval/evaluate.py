@@ -496,6 +496,7 @@ def main():
 
         result = run_sim(args, target, device=device,
                          **policy_kwargs)
+        result["target"] = target.tolist()
         results.append(result)
 
         # Compute expert standoff goal for this target
@@ -589,6 +590,38 @@ def main():
                   f"({100*improved/len(improvements):.1f}%)")
 
     print(f"{'='*70}")
+
+    # Save single-target results as JSON
+    timestamp = _time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(os.path.dirname(__file__), "results")
+    os.makedirs(out_dir, exist_ok=True)
+    json_path = os.path.join(out_dir, f"single_eval_{timestamp}.json")
+
+    summary = {
+        "timestamp": timestamp,
+        "seed": args.seed,
+        "num_targets": n,
+        "controller": "learned",
+        "base_checkpoint": args.base_checkpoint,
+        "arm_checkpoint": args.arm_checkpoint,
+        "reach_tolerance": REACH_TOLERANCE,
+        "reached_count": reached,
+        "reach_rate": reached / max(len(ok_results), 1),
+        "best_errs": [r["best_err"] for r in ok_results],
+        "final_errs": [r["final_err"] for r in ok_results],
+        "times": [r.get("time", r.get("steps", 0) * 0.001) for r in ok_results],
+        "base_best_errs": [r["base_best_ee"] for r in ok_results if r["base_best_ee"] < np.inf],
+        "base_final_errs": [r["base_final_ee"] for r in ok_results if r["base_final_ee"] < np.inf],
+        "arm_best_errs": [r["arm_best_ee"] for r in ok_results if r["arm_best_ee"] < np.inf],
+        "arm_final_errs": [r["arm_final_ee"] for r in ok_results if r["arm_final_ee"] < np.inf],
+        "base_xy_errs": [r["base_xy_err"] for r in ok_results if r.get("base_xy_err") is not None],
+        "base_bearing_errs": [r["base_bearing_err"] for r in ok_results if r.get("base_bearing_err") is not None],
+        "switch_times": [r["switch_time"] for r in ok_results if r.get("phase_switched")],
+        "per_target": results,
+    }
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2, default=float)
+    print(f"\nResults saved to: {json_path}")
 
 
 if __name__ == "__main__":
