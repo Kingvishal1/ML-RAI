@@ -805,9 +805,9 @@ def _reset_arm_to_home(sim, dyn_model, ee_frame_id, shoulder_frame_id,
 def main():
     parser = argparse.ArgumentParser(description="Run BC policy in simulation")
     parser.add_argument("--base_checkpoint", type=str,
-                        default="060_bc_base_gelu_e70_h512_l3_16min_working.pt")
+                        default="final_navigation_policy.pt")
     parser.add_argument("--arm_checkpoint", type=str,
-                        default="051_bc_arm_gelu_e70_h512_l3_3min_working.pt")
+                        default="final_manipulation_policy.pt")
     parser.add_argument("--target", type=float, nargs=3, default=[0.0, 1.1, 0.5],
                         metavar=("X", "Y", "Z"))
     parser.add_argument("--max_steps", type=int, default=400000)
@@ -819,7 +819,7 @@ def main():
                         help="Multi-target pick-and-place mode")
     parser.add_argument("--num_targets_per_episode", type=int, default=3)
     parser.add_argument("--selector_checkpoint", type=str,
-                        default="084_selector_gelu_e300_h128_l3.pt")
+                        default="final_selector_policy.pt")
     parser.add_argument("--multi_target_seed", type=int, default=None)
     parser.add_argument("--per_target_max_steps", type=int, default=100000)
     parser.add_argument("--config", type=str, default=None)

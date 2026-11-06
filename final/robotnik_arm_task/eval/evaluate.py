@@ -51,9 +51,9 @@ def generate_targets(n, seed=50):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate BC policy across multiple targets")
     parser.add_argument("--base_checkpoint", type=str,
-                        default="060_bc_base_gelu_e70_h512_l3_16min_working.pt")
+                        default="final_navigation_policy.pt")
     parser.add_argument("--arm_checkpoint", type=str,
-                        default="051_bc_arm_gelu_e70_h512_l3_3min_working.pt")
+                        default="final_manipulation_policy.pt")
     parser.add_argument("--num_targets", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=100000,
                         help="Max sim steps (default: 100000 ≈ 100s at 1ms timestep)")
@@ -69,7 +69,7 @@ def main():
     parser.add_argument("--num_episodes", type=int, default=10,
                         help="Number of episodes to evaluate (default: 10)")
     parser.add_argument("--selector_checkpoint", type=str,
-                        default="084_selector_gelu_e300_h128_l3.pt",
+                        default="final_selector_policy.pt",
                         help="Path to selector checkpoint")
     parser.add_argument("--selector_only", action="store_true",
                         help="Evaluate selector decisions only (no simulation)")
