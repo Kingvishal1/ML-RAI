@@ -2,13 +2,16 @@
 """Train a target-selector MLP on expert shortest-path data.
 
 The model takes a fixed-size scene observation (all remaining candidates packed
-into MAX_TARGETS slots with a validity mask, 20-dim total) and outputs one
-score per slot (MAX_TARGETS outputs).  Training uses masked cross-entropy:
-softmax is computed only over valid (mask=1) slots, and the label is the
-slot the expert chose.
+into MAX_TARGETS slots with a validity mask: 5 x 6 positions + 5 mask = 35-dim)
+and outputs one score per slot (MAX_TARGETS outputs).  Training uses masked
+cross-entropy: softmax is computed only over valid (mask=1) slots, and the label
+is the slot the expert chose.
+
+Defaults are the Optuna-tuned settings: 2x128 GELU, Adam lr 1.68e-3, weight decay
+1e-3, dropout 0.1, batch 256, up to 300 epochs.
 
 Usage:
-    python train_selector.py --data data/dataset_selector_*.npz --epochs 100
+    python train_selector.py --data data/dataset_selector_*.npz
 """
 import argparse
 import glob
@@ -25,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from activations import ACTIVATIONS, DEFAULT_ACTIVATION
-from regressors import build_mlp
+from regressors import build_mlp, make_optimizer, strip_dropout
 from robotnik_arm_task import MAX_TARGETS
 
 
@@ -66,14 +69,20 @@ def split_by_episode(metadata, val_frac=0.2, seed=42):
 def main():
     parser = argparse.ArgumentParser(description="Train target-selector (scene-level)")
     parser.add_argument("--data", type=str, required=True, help="Path to dataset_selector_*.npz")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    # Defaults are the Optuna-tuned settings (experiments/optuna_tune.py, run 2026-11-05:
+    # 102 trials, top 5 re-run with 3 seeds; 90.7% validation accuracy vs 85.6% before)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=1.68e-3)
     parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS))
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--activation", type=str, default="gelu", choices=list(ACTIVATIONS))
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"])
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout after each hidden layer (default 0.1)")
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=256,
+                        help="Mini-batch size; 0 = whole training set per step (default 256)")
     parser.add_argument("--out", type=str, default=None, help="Checkpoint save path")
     parser.add_argument("--mps", action="store_true")
     args = parser.parse_args()
@@ -116,10 +125,14 @@ def main():
     # Build model: input_dim auto-sized from data (20 for basic, 35 for multi-drop-zone)
     input_dim = inputs.shape[1]
     output_dim = MAX_TARGETS
-    model = build_mlp(input_dim, output_dim, args.hidden_dim, args.num_layers, args.activation)
+    model = build_mlp(input_dim, output_dim, args.hidden_dim, args.num_layers, args.activation,
+                      args.dropout)
     model.to(device)
+    print(f"Selector: {args.num_layers}x{args.hidden_dim} {args.activation}, lr={args.lr:g}, "
+          f"batch={args.batch_size or 'full'}, {args.optimizer} (wd={args.weight_decay:g}), "
+          f"dropout={args.dropout:g}, epochs={args.epochs}, patience={args.patience}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = make_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
 
     # Tensors
     t_X_train = torch.tensor(X_train_norm, dtype=torch.float32).to(device)
@@ -139,15 +152,25 @@ def main():
 
     try:
         for epoch in range(1, args.epochs + 1):
-            # --- Train ---
+            # --- Train (shuffled mini-batches; batch_size 0 = one full-batch step) ---
             model.train()
-            optimizer.zero_grad()
-            logits = model(t_X_train)  # (N, 5)
-            train_loss, train_correct, train_total = masked_cross_entropy(
-                logits, t_lbl_train, t_m_train)
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            n_train = len(t_X_train)
+            bs = args.batch_size if args.batch_size > 0 else n_train
+            perm = torch.randperm(n_train, device=t_X_train.device)
+            loss_sum, train_correct, train_total = 0.0, 0, 0
+            for i in range(0, n_train, bs):
+                idx = perm[i:i + bs]
+                optimizer.zero_grad()
+                logits = model(t_X_train[idx])  # (B, 5)
+                batch_loss, correct, total = masked_cross_entropy(
+                    logits, t_lbl_train[idx], t_m_train[idx])
+                batch_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                loss_sum += batch_loss.item() * total
+                train_correct += correct
+                train_total += total
+            train_loss = torch.tensor(loss_sum / max(train_total, 1))
             train_acc = 100.0 * train_correct / max(train_total, 1)
 
             # --- Validate ---
@@ -185,6 +208,11 @@ def main():
 
     if best_state:
         model.load_state_dict(best_state)
+    if args.dropout > 0:
+        # Save in the plain build_mlp layout so run_policy_sim.load_selector works unchanged
+        model = strip_dropout(model.cpu(), input_dim, output_dim, args.hidden_dim,
+                              args.num_layers, args.activation)
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     print(f"\nBest epoch: {best_epoch}  val_loss={best_val_loss:.4f}  val_acc={best_val_acc:.1f}%")
 
@@ -212,6 +240,9 @@ def main():
         "best_val_acc": best_val_acc,
         "best_epoch": best_epoch,
         "elapsed_sec": elapsed,
+        "train_settings": dict(lr=args.lr, optimizer=args.optimizer, weight_decay=args.weight_decay,
+                               dropout=args.dropout, batch_size=args.batch_size,
+                               epochs=args.epochs, patience=args.patience),
     }, save_path)
 
     n_params = sum(p.numel() for p in model.parameters())

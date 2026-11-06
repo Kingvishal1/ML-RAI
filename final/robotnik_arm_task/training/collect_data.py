@@ -48,12 +48,12 @@ def generate_grid_targets(n=100):
     return targets[:n]
 
 
-def generate_random_targets(n=100, seed=42):
-    """Uniform random sampling from the workspace volume."""
+def generate_random_targets(n=100, seed=42, xy_range=1.0, z_min=0.2, z_max=1.4):
+    """Uniform random sampling: x, y in [-xy_range, xy_range] m, z in [z_min, z_max] m."""
     rng = np.random.default_rng(seed)
-    xs = rng.uniform(-1, 1, n)
-    ys = rng.uniform(-1, 1, n)
-    zs = rng.uniform(0.2, 1.4, n)
+    xs = rng.uniform(-xy_range, xy_range, n)
+    ys = rng.uniform(-xy_range, xy_range, n)
+    zs = rng.uniform(z_min, z_max, n)
     return [np.array([xs[i], ys[i], zs[i]]) for i in range(n)]
 
 
@@ -340,6 +340,11 @@ def main():
                         help="Target generation mode (default: grid)")
     parser.add_argument("--num_targets", type=int, default=100,
                         help="Number of targets to collect (default: 100)")
+    parser.add_argument("--xy_range", type=float, default=1.0,
+                        help="Random targets: x and y sampled in [-xy_range, xy_range] m (default 1.0; "
+                             "use 5 to match the pick-and-drop evaluation, which uses +/-5 m)")
+    parser.add_argument("--z_min", type=float, default=0.2, help="Random targets: min height (default 0.2 m)")
+    parser.add_argument("--z_max", type=float, default=1.4, help="Random targets: max height (default 1.4 m)")
     parser.add_argument("--vary_init", action="store_true",
                         help="Also randomise initial base pose per trajectory")
     parser.add_argument("--seed", type=int, default=42,
@@ -376,7 +381,10 @@ def main():
     if args.mode == "grid":
         targets = generate_grid_targets(n=args.num_targets)
     else:
-        targets = generate_random_targets(n=args.num_targets, seed=args.seed)
+        targets = generate_random_targets(n=args.num_targets, seed=args.seed,
+                                          xy_range=args.xy_range, z_min=args.z_min, z_max=args.z_max)
+        print(f"Random targets: x, y in [-{args.xy_range}, {args.xy_range}] m, "
+              f"z in [{args.z_min}, {args.z_max}] m")
 
     print(f"Collecting {len(targets)} trajectories (mode={args.mode}, vary_init={args.vary_init}, "
           f"workers={args.workers})")

@@ -24,15 +24,66 @@ from torch.utils.data import TensorDataset, DataLoader
 from activations import DEFAULT_ACTIVATION, LEGACY_ACTIVATION, get_activation
 
 
-def build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation=DEFAULT_ACTIVATION):
+def build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation=DEFAULT_ACTIVATION,
+              dropout=0.0):
+    """MLP: num_layers x (Linear -> activation [-> Dropout]) -> Linear.
+
+    With dropout=0 (the default, and what every checkpoint loader uses) there are no
+    dropout layers, so state_dict keys match all saved checkpoints.
+    """
     layers = []
     prev = input_dim
     for _ in range(num_layers):
         layers.append(nn.Linear(prev, hidden_dim))
         layers.append(get_activation(activation))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
         prev = hidden_dim
     layers.append(nn.Linear(prev, output_dim))
     return nn.Sequential(*layers)
+
+
+def strip_dropout(model, input_dim, output_dim, hidden_dim, num_layers, activation):
+    """Copy a (possibly dropout-trained) MLP into the plain build_mlp layout.
+
+    Dropout has no weights and does nothing at inference, so the result predicts
+    exactly the same values but can be loaded by every existing checkpoint loader.
+    """
+    plain = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation)
+    src = [m for m in model if isinstance(m, nn.Linear)]
+    dst = [m for m in plain if isinstance(m, nn.Linear)]
+    for s, d in zip(src, dst):
+        d.load_state_dict(s.state_dict())
+    return plain
+
+
+def make_optimizer(name, params, lr, weight_decay):
+    if name not in ("adam", "adamw"):
+        raise ValueError(f"Unknown optimizer '{name}' (use adam or adamw)")
+    cls = torch.optim.AdamW if name == "adamw" else torch.optim.Adam
+    return cls(params, lr=lr, weight_decay=weight_decay)
+
+
+def make_scheduler(name, optimizer, epochs):
+    """none, cosine (anneal over all epochs) or plateau (halve LR after 3 flat epochs)."""
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    if name == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
+    if name != "none":
+        raise ValueError(f"Unknown scheduler '{name}' (use none, cosine or plateau)")
+    return None
+
+
+def elementwise_loss(name, pred, target):
+    """Per-element training loss: mae, mse or huber (SmoothL1 with beta=1)."""
+    if name == "mae":
+        return (pred - target).abs()
+    if name == "mse":
+        return (pred - target) ** 2
+    if name == "huber":
+        return nn.functional.smooth_l1_loss(pred, target, reduction="none")
+    raise ValueError(f"Unknown loss '{name}' (use mae, mse or huber)")
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +186,17 @@ class MLPRegressor(BaseRegressor):
         return model
 
     def fit(self, X_train, y_train, X_val, y_val, **kwargs):
-        """Train on MAE (L1), keep the checkpoint with the best validation MSE.
+        """Train with the chosen loss, keep the checkpoint with the best validation MSE.
 
-        Defaults follow the selected settings of the 618-run hyperparameter study.
+        The defaults here are the original ones (MAE, AdamW, no dropout, no schedule),
+        so experiment scripts behave as before. train_regressor.py passes the
+        Optuna-tuned values for each policy.
         Optional kwargs:
+          loss:         mae (default), mse or huber
+          optimizer:    adamw (default) or adam
+          dropout:      dropout after each hidden layer (default 0); the saved
+                        checkpoint is converted to the plain layout, so loaders are unchanged
+          scheduler:    none (default), cosine or plateau
           loss_weights: per-output weights for the training loss (default: all 1)
           on_epoch:     callback(epoch, train_loss, val_loss, val_pred, improved, model)
                         called after every epoch; val_pred is in normalised units
@@ -157,16 +215,26 @@ class MLPRegressor(BaseRegressor):
         num_workers = kwargs.get("num_workers", 0)
         device_name = kwargs.get("device", "cpu")
         on_epoch = kwargs.get("on_epoch", None)
+        loss_name = kwargs.get("loss", "mae")
+        optimizer_name = kwargs.get("optimizer", "adamw")
+        dropout = kwargs.get("dropout", 0.0)
+        scheduler_name = kwargs.get("scheduler", "none")
         device = torch.device(device_name)
         input_dim = X_train.shape[1]
         output_dim = y_train.shape[1]
 
-        model = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation).to(device)
+        model = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation, dropout).to(device)
         pretrained_state = kwargs.get("pretrained_state", None)
         if pretrained_state is not None:
-            model.load_state_dict(pretrained_state)
+            # Checkpoints use the plain layout; copy their weights into this model
+            plain = build_mlp(input_dim, output_dim, hidden_dim, num_layers, activation)
+            plain.load_state_dict(pretrained_state)
+            for s, d in zip([m for m in plain if isinstance(m, nn.Linear)],
+                            [m for m in model if isinstance(m, nn.Linear)]):
+                d.load_state_dict(s.state_dict())
             print(f"  Loaded pretrained weights ({sum(p.numel() for p in model.parameters())} params)")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = make_optimizer(optimizer_name, model.parameters(), lr, weight_decay)
+        scheduler = make_scheduler(scheduler_name, optimizer, epochs)
         criterion = nn.MSELoss()
         if loss_weights is None:
             loss_weights = np.ones(output_dim)
@@ -190,13 +258,13 @@ class MLPRegressor(BaseRegressor):
 
         try:
             for epoch in range(1, epochs + 1):
-                # Train: weighted MAE, gradient clipping
+                # Train: weighted loss (mae/mse/huber), gradient clipping
                 model.train()
                 train_loss = 0.0
                 for xb, yb in train_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     pred = model(xb)
-                    loss = ((pred - yb).abs() * loss_weights).mean()
+                    loss = (elementwise_loss(loss_name, pred, yb) * loss_weights).mean()
                     optimizer.zero_grad()
                     loss.backward()
                     if grad_clip > 0:
@@ -217,6 +285,10 @@ class MLPRegressor(BaseRegressor):
                         if on_epoch is not None:
                             val_pred.append(pred.cpu().numpy())
                 val_loss /= len(val_ds)
+                if scheduler_name == "plateau":
+                    scheduler.step(val_loss)
+                elif scheduler is not None:
+                    scheduler.step()
 
                 if val_loss < best_val - early_stop:
                     epochs_without_improvement = 0
@@ -246,6 +318,10 @@ class MLPRegressor(BaseRegressor):
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_epoch = 0
         model.load_state_dict(best_state)
+        if dropout > 0:
+            # Save in the plain layout so every existing loader (sim, eval) works unchanged
+            model = strip_dropout(model.cpu(), input_dim, output_dim, hidden_dim, num_layers, activation)
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         model.eval()
         model.to(device)
 

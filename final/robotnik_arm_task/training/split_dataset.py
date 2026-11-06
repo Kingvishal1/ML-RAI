@@ -73,18 +73,18 @@ def main():
                         help="Output directory (default: same as input)")
     parser.add_argument("--train", action="store_true",
                         help="Train base and arm policies after splitting")
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Training epochs (used with --train, default: 100)")
-    parser.add_argument("--hidden_dim", type=int, default=512,
-                        help="Hidden layer size (used with --train, default: 512)")
-    parser.add_argument("--num_layers", type=int, default=3,
-                        help="Number of hidden layers (used with --train, default: 3)")
-    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
-                        help=f"Hidden-layer activation (used with --train, default: {DEFAULT_ACTIVATION})")
-    parser.add_argument("--batch_size", type=int, default=2048,
-                        help="Batch size (used with --train, default: 2048)")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate (used with --train, default: 1e-3)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Training epochs (used with --train, default: tuned per policy)")
+    parser.add_argument("--hidden_dim", type=int, default=None,
+                        help="Hidden layer size (used with --train, default: tuned per policy)")
+    parser.add_argument("--num_layers", type=int, default=None,
+                        help="Number of hidden layers (used with --train, default: tuned per policy)")
+    parser.add_argument("--activation", type=str, default=None, choices=list(ACTIVATIONS),
+                        help="Hidden-layer activation (used with --train, default: tuned per policy)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size (used with --train, default: tuned per policy)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate (used with --train, default: tuned per policy)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers (used with --train, default: 0)")
     parser.add_argument("--mps", action="store_true",
@@ -93,10 +93,10 @@ def main():
                         help="Base features to drop (e.g. --drop_base dist_to_target heading_error)")
     parser.add_argument("--drop_arm", type=str, nargs="*", default=[],
                         help="Arm features to drop (e.g. --drop_arm tau_gravity_1 tau_gravity_2)")
-    parser.add_argument("--early_stop", type=float, default=0.0,
-                        help="Val loss improvement threshold (used with --train, default: 0)")
-    parser.add_argument("--patience", type=int, default=20,
-                        help="Epochs without improvement before early stopping (used with --train, default: 20)")
+    parser.add_argument("--early_stop", type=float, default=None,
+                        help="Val loss improvement threshold (used with --train, default: tuned per policy)")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Epochs without improvement before early stopping (used with --train, default: tuned per policy)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     parser.add_argument("--arm_full_torque", action="store_true",
@@ -263,17 +263,13 @@ def main():
 
     # --- Train both policies ---
     train_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_regressor.py")
-    common_args = [
-        "--epochs", str(args.epochs),
-        "--hidden_dim", str(args.hidden_dim),
-        "--num_layers", str(args.num_layers),
-        "--activation", args.activation,
-        "--batch_size", str(args.batch_size),
-        "--lr", str(args.lr),
-        "--num_workers", str(args.num_workers),
-        "--early_stop", str(args.early_stop),
-        "--patience", str(args.patience),
-    ]
+    # Only pass settings given on the command line; train_regressor.py fills in
+    # the tuned defaults for each policy (POLICY_DEFAULTS) for everything else.
+    common_args = ["--num_workers", str(args.num_workers)]
+    for flag in ("epochs", "hidden_dim", "num_layers", "activation", "batch_size",
+                 "lr", "early_stop", "patience"):
+        if getattr(args, flag) is not None:
+            common_args += [f"--{flag}", str(getattr(args, flag))]
     if args.mps:
         common_args.append("--mps")
 

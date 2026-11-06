@@ -21,6 +21,27 @@ from activations import ACTIVATIONS, DEFAULT_ACTIVATION
 from regressors import build_mlp, get_regressor, available_regressors  # noqa: F401  (build_mlp re-exported)
 
 
+# Default hyperparameters per policy. base and arm come from the Optuna study
+# (experiments/optuna_tune.py, run 2026-11-05: 100 trials per policy on 2M samples,
+# top 5 re-run with 3 seeds). "full" (single network for all 11 outputs) keeps the
+# settings of the earlier 618-run study. Any value given on the command line wins.
+POLICY_DEFAULTS = {
+    "base": dict(num_layers=4, hidden_dim=1024, activation="tanh", lr=7.53e-4,
+                 batch_size=1024, loss="mae", optimizer="adam", weight_decay=0.0,
+                 dropout=0.1, scheduler="cosine", grad_clip=5.0,
+                 epochs=40, patience=10, early_stop=0.0),
+    "arm": dict(num_layers=3, hidden_dim=1024, activation="silu", lr=1.23e-3,
+                batch_size=8192, loss="mse", optimizer="adamw", weight_decay=1e-5,
+                dropout=0.1, scheduler="cosine", grad_clip=5.0,
+                epochs=40, patience=10, early_stop=0.0),
+    "full": dict(num_layers=3, hidden_dim=512, activation=DEFAULT_ACTIVATION, lr=1e-3,
+                 batch_size=8192, loss="mae", optimizer="adamw", weight_decay=0.0,
+                 dropout=0.0, scheduler="none", grad_clip=1.0,
+                 epochs=100, patience=40, early_stop=1e-5),
+}
+MODE_BY_OUTPUTS = {2: "base", 7: "arm", 11: "full"}
+
+
 def split_by_trajectory(inputs, labels, metadata, val_frac=0.2, seed=42):
     """Split into train/val by trajectory ID to avoid leakage."""
     traj_ids = np.unique(metadata[:, 0])
@@ -42,18 +63,26 @@ def main():
     parser.add_argument("--model", type=str, default="mlp",
                         choices=available_regressors(),
                         help=f"Model type (default: mlp, available: {available_regressors()})")
-    # Defaults follow the selected settings of the 618-run hyperparameter study
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=8192)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--activation", type=str, default=DEFAULT_ACTIVATION, choices=list(ACTIVATIONS),
-                        help=f"Hidden-layer activation function (default: {DEFAULT_ACTIVATION})")
-    parser.add_argument("--weight_decay", type=float, default=0.0,
-                        help="AdamW weight decay (default: 0)")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                        help="Max gradient norm, 0 to disable (default: 1.0)")
+    # Hyperparameters left unset take the tuned default for the policy (POLICY_DEFAULTS)
+    parser.add_argument("--epochs", type=int, default=None, help="default: 40 base/arm, 100 full")
+    parser.add_argument("--batch_size", type=int, default=None, help="default: 1024 base, 8192 arm/full")
+    parser.add_argument("--lr", type=float, default=None, help="default: 7.53e-4 base, 1.23e-3 arm, 1e-3 full")
+    parser.add_argument("--hidden_dim", type=int, default=None, help="default: 1024 base/arm, 512 full")
+    parser.add_argument("--num_layers", type=int, default=None, help="default: 4 base, 3 arm/full")
+    parser.add_argument("--activation", type=str, default=None, choices=list(ACTIVATIONS),
+                        help="Hidden-layer activation (default: tanh base, silu arm, gelu full)")
+    parser.add_argument("--loss", type=str, default=None, choices=["mae", "mse", "huber"],
+                        help="Training loss (default: mae base/full, mse arm)")
+    parser.add_argument("--optimizer", type=str, default=None, choices=["adam", "adamw"],
+                        help="Optimiser (default: adam base, adamw arm/full)")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Dropout after each hidden layer (default: 0.1 base/arm, 0 full)")
+    parser.add_argument("--scheduler", type=str, default=None, choices=["none", "cosine", "plateau"],
+                        help="Learning-rate schedule (default: cosine base/arm, none full)")
+    parser.add_argument("--weight_decay", type=float, default=None,
+                        help="Weight decay (default: 0 base/full, 1e-5 arm)")
+    parser.add_argument("--grad_clip", type=float, default=None,
+                        help="Max gradient norm, 0 to disable (default: 5 base/arm, 1 full)")
     parser.add_argument("--wheel_weight", type=float, default=0.5,
                         help="Loss weight of wheel outputs vs arm outputs in full mode (default: 0.5)")
     parser.add_argument("--out", type=str, default=None,
@@ -61,12 +90,14 @@ def main():
     parser.add_argument("--mps", action="store_true", help="Use Apple Metal (MPS) GPU if available")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader worker processes for parallel data loading (default: 0)")
-    parser.add_argument("--mode", type=str, default="full", choices=["full", "base", "arm"],
-                        help="Metric display mode: full (4+7 breakdown), base (wheel only), arm (torque only)")
-    parser.add_argument("--early_stop", type=float, default=0.00001,
-                        help="Stop if val loss improvement is below this for --patience epochs (default: 0)")
-    parser.add_argument("--patience", type=int, default=40,
-                        help="Number of epochs without improvement before early stopping (default: 20)")
+    parser.add_argument("--mode", type=str, default=None, choices=["full", "base", "arm"],
+                        help="Which policy: picks its tuned defaults and metric display. "
+                             "Default: detected from the label size (2 base, 7 arm, 11 full)")
+    parser.add_argument("--early_stop", type=float, default=None,
+                        help="Stop if val loss improvement is below this for --patience epochs "
+                             "(default: 0 base/arm, 1e-5 full)")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Epochs without improvement before early stopping (default: 10 base/arm, 40 full)")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Randomly subsample to this many rows before splitting (default: use all)")
     parser.add_argument("--finetune", type=str, default=None,
@@ -89,6 +120,19 @@ def main():
         print(f"Subsampled to {inputs.shape[0]} samples")
 
     ACTION_DIM = labels.shape[1]
+
+    # --- Policy and its tuned defaults (command-line values take priority) ---
+    if args.mode is None:
+        if ACTION_DIM not in MODE_BY_OUTPUTS:
+            sys.exit(f"Cannot tell the policy from {ACTION_DIM} outputs; pass --mode base/arm/full")
+        args.mode = MODE_BY_OUTPUTS[ACTION_DIM]
+    for name, value in POLICY_DEFAULTS[args.mode].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    print(f"Policy: {args.mode}  |  {args.num_layers}x{args.hidden_dim} {args.activation}, "
+          f"lr={args.lr:g}, batch={args.batch_size}, loss={args.loss}, {args.optimizer} "
+          f"(wd={args.weight_decay:g}), dropout={args.dropout:g}, scheduler={args.scheduler}, "
+          f"clip={args.grad_clip:g}, epochs={args.epochs}, patience={args.patience}")
 
     # --- Split by trajectory ---
     X_train, y_train, X_val, y_val = split_by_trajectory(inputs, labels, metadata)
@@ -261,6 +305,10 @@ def main():
         activation=args.activation,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        loss=args.loss,
+        optimizer=args.optimizer,
+        dropout=args.dropout,
+        scheduler=args.scheduler,
         loss_weights=loss_weights,
         early_stop=args.early_stop,
         patience=args.patience,
@@ -285,7 +333,12 @@ def main():
                               batch_size=args.batch_size,
                               lr=args.lr,
                               action_dim=ACTION_DIM,
-                              feature_names=feature_names)
+                              feature_names=feature_names,
+                              policy=args.mode,
+                              train_settings=dict(loss=args.loss, optimizer=args.optimizer,
+                                                  weight_decay=args.weight_decay, dropout=args.dropout,
+                                                  scheduler=args.scheduler, grad_clip=args.grad_clip,
+                                                  patience=args.patience))
 
     total_time = _time.time() - t_start
     total_min = int(total_time // 60)
