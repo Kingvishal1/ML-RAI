@@ -48,7 +48,7 @@ def generate_grid_targets(n=100):
     return targets[:n]
 
 
-def generate_random_targets(n=100, seed=42, xy_range=1.0, z_min=0.2, z_max=1.4):
+def generate_random_targets(n=100, seed=42, xy_range=5.0, z_min=0.2, z_max=1.4):
     """Uniform random sampling: x, y in [-xy_range, xy_range] m, z in [z_min, z_max] m."""
     rng = np.random.default_rng(seed)
     xs = rng.uniform(-xy_range, xy_range, n)
